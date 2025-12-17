@@ -51,3 +51,17 @@ def test_postmortem_dialect_guard_retry_de():
     }
     decision = agent.decide(ctx)
     assert decision["action"] == "retry_data_engineer"
+
+
+def test_postmortem_cleaning_failed_retry_de():
+    agent = PostmortemAgent(api_key=None)
+    ctx = {
+        "execution_output": "",
+        "integrity_issues": [],
+        "error_message": "Sandbox Cleaning Failed: json not serializable",
+        "iteration_count": 0,
+        "restrategize_count": 0,
+        "missing_repeat_count": 0,
+    }
+    decision = agent.decide(ctx)
+    assert decision["action"] == "retry_data_engineer"

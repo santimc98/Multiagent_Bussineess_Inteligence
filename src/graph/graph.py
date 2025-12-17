@@ -59,6 +59,32 @@ def _resolve_required_input_columns(contract: Dict[str, Any], strategy: Dict[str
             return [r.get("name") for r in contract_reqs if isinstance(r, dict) and r.get("source", "input") == "input" and r.get("name")]
     return strategy.get("required_columns", []) if strategy else []
 
+def manifest_dump_missing_default(code: str) -> bool:
+    """
+    Detects json.dump calls without default= to guard manifest serialization.
+    Returns True if a risky call is found.
+    """
+    import ast
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            is_json_dump = False
+            if isinstance(func, ast.Attribute) and func.attr == "dump":
+                if isinstance(func.value, ast.Name) and func.value.id == "json":
+                    is_json_dump = True
+            if isinstance(func, ast.Name) and func.id == "dump":
+                is_json_dump = True
+            if not is_json_dump:
+                continue
+            kw_args = {kw.arg for kw in node.keywords if kw.arg}
+            if "default" not in kw_args:
+                return True
+    return False
+
 def dialect_guard_violations(code: str, csv_sep: str, csv_decimal: str, csv_encoding: str, expected_path: str | None = None) -> List[str]:
     """
     AST-based guard to ensure pd.read_csv (first call or the one reading expected_path) sets sep/decimal/encoding.
@@ -391,6 +417,26 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "cleaned_data_preview": "Error: Generation Failed",
             "error_message": code
         }
+
+    # Manifest serialization guard: ensure json.dump uses default=
+    if manifest_dump_missing_default(code):
+        if not state.get("de_manifest_retry_done"):
+            new_state = dict(state)
+            new_state["de_manifest_retry_done"] = True
+            override = state.get("data_summary", "")
+            try:
+                override += "\n\nMANIFEST_JSON_SAFETY: ensure json.dump(manifest, ..., default=_json_default) to handle numpy/pandas types."
+            except Exception:
+                pass
+            new_state["data_engineer_audit_override"] = override
+            print("Manifest JSON guard triggered: retrying Data Engineer with safety instructions.")
+            return run_data_engineer(new_state)
+        else:
+            return {
+                "cleaning_code": code,
+                "cleaned_data_preview": "Error: Manifest JSON Guard",
+                "error_message": "CRITICAL: Manifest serialization must use json.dump(..., default=_json_default).",
+            }
 
     # Dialect enforcement guard: ensure pd.read_csv uses provided dialect
     dialect_issues = dialect_guard_violations(code, csv_sep, csv_decimal, csv_encoding, expected_path="data/raw.csv")

@@ -55,10 +55,10 @@ class PostmortemAgent:
                 }
             }
 
-        if "missing required columns" in err_msg or "mapping failed" in err_msg or "dialect" in err_msg or "pd.read_csv" in err_msg:
+        if "missing required columns" in err_msg or "mapping failed" in err_msg or "dialect" in err_msg or "pd.read_csv" in err_msg or "cleaning failed" in err_msg or "json" in err_msg:
             if missing_repeat >= 1:
                 return _decision("re_strategize", "Repeated missing input columns; re-strategize.")
-            return _decision("retry_data_engineer", "Missing required columns after cleaning/mapping.")
+            return _decision("retry_data_engineer", "Cleaning/manifest/dialect failure; retry Data Engineer.")
 
         if "traceback" in exec_out.lower() or "execution error" in exec_out.lower():
             action = "retry_ml_engineer"

@@ -105,8 +105,35 @@ class DataEngineerAgent:
                "conversions": {"price": "clean_currency"},
                "conversions_meta": {"price": {"parse_success_rate": 0.97, "reverted": false, "reason": ""}},
                "rows_before": 1000,
-             "rows_after": 950
+            "rows_after": 950
            }
+           - MANIFEST JSON SAFETY (MANDATORY):
+             * Define helper:
+                 def _json_default(o):
+                     import numpy as _np, pandas as _pd
+                     if isinstance(o, _np.generic):
+                         return o.item()
+                     if isinstance(o, (_pd.Timestamp,)):
+                         return o.isoformat()
+                     if hasattr(_pd, "Timedelta") and isinstance(o, _pd.Timedelta):
+                         return o.total_seconds()
+                     if isinstance(o, (set, tuple)):
+                         return list(o)
+                     if o is None:
+                         return None
+                     try:
+                         from math import isnan
+                         if isinstance(o, float) and (o != o or isnan(o)):
+                             return None
+                     except Exception:
+                         pass
+                     try:
+                         if getattr(_pd, "isna", None) and _pd.isna(o):
+                             return None
+                     except Exception:
+                         pass
+                     return str(o)
+             * Save manifest with: json.dump(manifest, f, indent=2, ensure_ascii=False, default=_json_default)
 
         *** NUMERIC CURRENCY INFERENCE (STRICT) ***
         - Only classify a column as numeric_currency if a high fraction of non-null values contain digits AND a sampled parse_success_rate >= 0.9 (sample up to 200 non-null values).
