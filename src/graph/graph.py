@@ -913,9 +913,10 @@ def run_engineer(state: AgentState) -> AgentState:
             kwargs["execution_contract"] = execution_contract
         code = ml_engineer.generate_code(**kwargs)
         return {
-            "selected_strategy": strategy, 
+            "selected_strategy": strategy,
             "generated_code": code,
-            "last_generated_code": code # Update for next patch
+            "last_generated_code": code, # Update for next patch
+            "ml_data_path": data_path,
         }
     except Exception as e:
         msg = f"CRITICAL: ML Engineer crashed in host: {str(e)}"
@@ -1172,7 +1173,9 @@ def execute_code(state: AgentState) -> AgentState:
             sandbox.commands.run("mkdir -p static/plots") # Ensure plots dir exists
             sandbox.commands.run("mkdir -p data") # Ensure data dir exists for outputs
             
-            local_csv = "data/cleaned_data.csv"
+            local_csv = state.get("ml_data_path") or "data/cleaned_data.csv"
+            if not os.path.exists(local_csv) and local_csv != "data/cleaned_data.csv":
+                local_csv = "data/cleaned_data.csv"
             remote_csv = "/home/user/data.csv"
             
             if os.path.exists(local_csv):
@@ -1181,6 +1184,10 @@ def execute_code(state: AgentState) -> AgentState:
                 print(f"Data uploaded to {remote_csv}")
                 
                 # Robust path patching
+                if local_csv:
+                    code = code.replace(local_csv, remote_csv)
+                    if not local_csv.startswith("./"):
+                        code = code.replace(f"./{local_csv}", remote_csv)
                 code = code.replace("data/cleaned_data.csv", remote_csv)
                 code = code.replace("./data/cleaned_data.csv", remote_csv)
                 code = code.replace("data/cleaned_full.csv", remote_csv)

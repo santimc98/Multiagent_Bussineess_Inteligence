@@ -38,6 +38,8 @@ class PostmortemAgent:
         iteration = context.get("iteration_count", 0)
         restrat = context.get("restrategize_count", 0)
         err_msg = (context.get("error_message") or "").lower()
+        feedback_history = context.get("feedback_history", []) or []
+        variance_count = sum(1 for item in feedback_history if "target has no variance" in str(item).lower())
         missing_repeat = context.get("missing_repeat_count", 0) or 0
 
         def _decision(action: str, reason: str) -> Dict[str, Any]:
@@ -54,6 +56,11 @@ class PostmortemAgent:
                     "reset_review_streaks": True,
                 }
             }
+
+        if "target has no variance" in err_msg:
+            if variance_count >= 2 and restrat < 2:
+                return _decision("re_strategize", "Repeated target variance failure; re-strategize.")
+            return _decision("retry_ml_engineer", "Target has no variance; retry ML engineer.")
 
         if "missing required columns" in err_msg or "mapping failed" in err_msg or "dialect" in err_msg or "pd.read_csv" in err_msg or "cleaning failed" in err_msg or "json" in err_msg:
             if missing_repeat >= 1:
