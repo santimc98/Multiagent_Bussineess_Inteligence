@@ -1154,6 +1154,8 @@ def execute_code(state: AgentState) -> AgentState:
                 # Robust path patching
                 code = code.replace("data/cleaned_data.csv", remote_csv)
                 code = code.replace("./data/cleaned_data.csv", remote_csv)
+                code = code.replace("data/cleaned_full.csv", remote_csv)
+                code = code.replace("./data/cleaned_full.csv", remote_csv)
                 
                 # Manifest Round-trip (Upload & Patch)
                 local_manifest = "data/cleaning_manifest.json"
