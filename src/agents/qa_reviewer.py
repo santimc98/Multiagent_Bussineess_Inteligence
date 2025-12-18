@@ -455,3 +455,15 @@ def run_static_qa_checks(code: str) -> Optional[Dict[str, Any]]:
         }
 
     return None
+
+
+def collect_static_qa_facts(code: str) -> Dict[str, bool]:
+    facts = {"variance_guard": False}
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return facts
+    scanner = _StaticQAScanner()
+    scanner.visit(tree)
+    facts["variance_guard"] = scanner.has_variance_guard
+    return facts

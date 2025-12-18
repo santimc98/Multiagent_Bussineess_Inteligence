@@ -70,10 +70,10 @@ DEFAULT_ML_ENGINEER_RUNBOOK: Dict[str, Any] = {
 }
 
 
-def _ensure_list_of_str(val: Any) -> List[str]:
-    if isinstance(val, list) and all(isinstance(x, str) for x in val):
+def _ensure_list_of_str(val: Any, default: List[str]) -> List[str]:
+    if isinstance(val, list) and all(isinstance(x, str) for x in val) and val:
         return val
-    return []
+    return list(default)
 
 
 def ensure_role_runbooks(contract: Dict[str, Any]) -> Dict[str, Any]:
@@ -93,14 +93,17 @@ def ensure_role_runbooks(contract: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(rb, dict):
             return out
         out["version"] = str(rb.get("version", default.get("version", "1")))
-        out["goals"] = _ensure_list_of_str(rb.get("goals", default.get("goals", [])))
-        out["must"] = _ensure_list_of_str(rb.get("must", default.get("must", [])))
-        out["must_not"] = _ensure_list_of_str(rb.get("must_not", default.get("must_not", [])))
-        out["safe_idioms"] = _ensure_list_of_str(rb.get("safe_idioms", default.get("safe_idioms", [])))
-        out["validation_checklist"] = _ensure_list_of_str(rb.get("validation_checklist", default.get("validation_checklist", [])))
-        out["manifest_requirements"] = rb.get("manifest_requirements", default.get("manifest_requirements", {}))
-        out["methodology"] = rb.get("methodology", default.get("methodology", {}))
-        out["outputs"] = rb.get("outputs", default.get("outputs", {}))
+        out["goals"] = _ensure_list_of_str(rb.get("goals"), default.get("goals", []))
+        out["must"] = _ensure_list_of_str(rb.get("must"), default.get("must", []))
+        out["must_not"] = _ensure_list_of_str(rb.get("must_not"), default.get("must_not", []))
+        out["safe_idioms"] = _ensure_list_of_str(rb.get("safe_idioms"), default.get("safe_idioms", []))
+        out["validation_checklist"] = _ensure_list_of_str(rb.get("validation_checklist"), default.get("validation_checklist", []))
+        mr = rb.get("manifest_requirements", default.get("manifest_requirements", {}))
+        out["manifest_requirements"] = mr if isinstance(mr, dict) else copy.deepcopy(default.get("manifest_requirements", {}))
+        meth = rb.get("methodology", default.get("methodology", {}))
+        out["methodology"] = meth if isinstance(meth, dict) else copy.deepcopy(default.get("methodology", {}))
+        outs = rb.get("outputs", default.get("outputs", {}))
+        out["outputs"] = outs if isinstance(outs, dict) else copy.deepcopy(default.get("outputs", {}))
         return out
 
     runbooks["data_engineer"] = _normalize(runbooks.get("data_engineer", {}), DEFAULT_DATA_ENGINEER_RUNBOOK)

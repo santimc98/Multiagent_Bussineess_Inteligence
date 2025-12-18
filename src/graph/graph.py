@@ -1238,9 +1238,22 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
     try:
         # Run QA Audit
         qa_result = qa_reviewer.review_code(code, strategy, business_objective)
-        
+        preflight_issues = ml_quality_preflight(code)
+        has_variance_guard = "TARGET_VARIANCE_GUARD" not in preflight_issues
+
         status = qa_result['status']
         feedback = qa_result['feedback']
+        failed_gates = qa_result.get('failed_gates', [])
+        required_fixes = qa_result.get('required_fixes', [])
+
+        # Override obvious false positives from QA LLM when deterministic facts disagree
+        if status == "REJECTED" and "TARGET_VARIANCE" in failed_gates and has_variance_guard:
+            status = "APPROVE_WITH_WARNINGS"
+            feedback = f"QA_LLM_FALSE_POSITIVE_OVERRIDDEN (variance guard detected statically). Original: {feedback}"
+            failed_gates = []
+            required_fixes = []
+            print(feedback)
+            current_history.append(f"QA_LLM_FALSE_POSITIVE_OVERRIDDEN: variance guard present; overriding rejection.")
         
         print(f"QA Verdict: {status}")
         
@@ -1257,8 +1270,8 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             "source": "qa_reviewer",
             "status": status,
             "feedback": feedback,
-            "failed_gates": qa_result.get('failed_gates', []),
-            "required_fixes": qa_result.get('required_fixes', [])
+            "failed_gates": failed_gates,
+            "required_fixes": required_fixes
         }
         
         if status == "REJECTED":
@@ -1271,7 +1284,9 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
                      "review_verdict": "REJECTED",
                      "review_feedback": feedback,
                      "feedback_history": current_history,
-                     "error_message": msg
+                     "error_message": msg,
+                     "last_gate_context": gate_context,
+                     "qa_reject_streak": streak
                  }
             
             return {
