@@ -69,6 +69,11 @@ class MLEngineerAgent:
         - If determinism is detected, warn/log and optionally drop the offending feature instead of hard-aborting when the task is calibration/optimization; still avoid training a leaking predictor.
         - For perfect/near-perfect metrics (e.g., R2 > 0.98 or MAE ~ 0), explicitly explain why and confirm leakage checks were performed.
 
+        *** DEPENDENCIES ***
+        - Only import from the BASE allowlist: pandas, numpy, scipy, sklearn, matplotlib, seaborn.
+        - EXTENDED dependencies (statsmodels, xgboost, pyarrow, openpyxl) are allowed ONLY if listed in execution_contract.required_dependencies.
+        - Never use fuzzywuzzy or rapidfuzz; use difflib instead.
+
         *** PRICING / BUSINESS OBJECTIVE LOGIC ***
         - If price is a decision variable, prefer modeling P(success | x, price) and run a price sweep to find expected revenue optima. Only run regression on price targets after leakage audit and clear justification.
 

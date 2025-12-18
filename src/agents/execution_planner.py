@@ -88,18 +88,28 @@ class ExecutionPlannerAgent:
                 )
             outputs = ["data/cleaned_data.csv"]
             title_lower = str(strategy.get("title", "")).lower()
+            required_deps: List[str] = []
+            if "xgboost" in title_lower:
+                required_deps.append("xgboost")
+            if "statsmodel" in title_lower or "statsmodels" in title_lower:
+                required_deps.append("statsmodels")
+            if "parquet" in title_lower:
+                required_deps.append("pyarrow")
+            if "excel" in title_lower or "xlsx" in title_lower:
+                required_deps.append("openpyxl")
             if any(tok in title_lower for tok in ["score", "weight", "ranking", "priorit"]):
                 outputs.extend(["data/weights.json", "data/case_summary.csv", "static/plots/*.png"])
             else:
                 outputs.extend(["data/metrics.json", "static/plots/*.png"])
-            return {
+            contract = {
                 "contract_version": 1,
                 "strategy_title": strategy.get("title", ""),
                 "business_objective": business_objective,
                 "required_outputs": outputs,
                 "data_requirements": data_requirements,
+                "required_dependencies": required_deps,
                 "validations": [],
-                    "notes_for_engineers": [
+                "notes_for_engineers": [
                     "Refine roles/ranges using data_summary evidence; adjust in Patch Mode if needed.",
                     "Align cleaning/modeling with this contract; avoid hardcoded business rules.",
                 ],
@@ -115,7 +125,7 @@ class ExecutionPlannerAgent:
 You are a senior execution planner. Produce a JSON contract to guide data cleaning and modeling.
 Requirements:
 - Output JSON ONLY (no markdown/code fences).
-- Include: contract_version, strategy_title, business_objective, required_outputs, data_requirements, validations, notes_for_engineers.
+- Include: contract_version, strategy_title, business_objective, required_outputs, data_requirements, validations, notes_for_engineers, required_dependencies.
         - data_requirements: list of {name, role, expected_range, allowed_null_frac, source}. Roles: target|feature|percentage|probability|categorical|date|risk_score. source: "input" | "derived".
 - Each data_requirement may include source: "input" | "derived" (default input). If role==target and the name is not present in the column inventory from data_summary, mark source="derived" if reasonable.
 - expected_range e.g. [0,1] for probabilities/scores/percentages if implied by the column description.
@@ -124,6 +134,7 @@ Requirements:
 - required_outputs should always include data/cleaned_data.csv. For scoring/weights/ranking strategies, also include data/weights.json, data/case_summary.csv, and at least one plot like static/plots/*.png. For standard classification/regression, include data/metrics.json and one plot.
 - If role == "date", use expected_range=null. Do not mix numeric ranges with null (avoid [0, null]); either null or a full numeric range when appropriate.
         - COLUMN INVENTORY (detected from CSV header) to help decide source input/derived: $column_inventory
+        - required_dependencies is optional; include only if strongly implied by the strategy title or data_summary. Use module names (e.g., "xgboost", "statsmodels", "pyarrow", "openpyxl"). Otherwise use [].
 """
         ).substitute(column_inventory=column_inventory_json)
         user_prompt_template = Template(
@@ -163,6 +174,8 @@ Return the contract JSON.
             contract = json.loads(content)
             if not isinstance(contract, dict) or "data_requirements" not in contract:
                 return _fallback()
+            if "required_dependencies" not in contract:
+                contract["required_dependencies"] = []
             return _apply_inventory_source(contract)
         except Exception:
             return _fallback()

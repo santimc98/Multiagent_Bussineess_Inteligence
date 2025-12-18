@@ -38,6 +38,13 @@ from src.utils.cleaning_validation import (
 )
 from src.utils.integrity_audit import run_integrity_audit
 from src.utils.output_contract import check_required_outputs
+from src.utils.sandbox_deps import (
+    BASE_ALLOWLIST,
+    EXTENDED_ALLOWLIST,
+    BANNED_ALLOWLIST,
+    check_dependency_precheck,
+    get_sandbox_install_packages,
+)
 
 def _norm_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
@@ -1120,6 +1127,23 @@ def execute_code(state: AgentState) -> AgentState:
         print(f"🚫 Security Block: {failure_reason}")
         return {"error_message": failure_reason, "execution_output": failure_reason}
 
+    # Dependency allowlist precheck
+    contract = state.get("execution_contract", {}) or {}
+    required_deps = contract.get("required_dependencies", []) or []
+    dep_result = check_dependency_precheck(code, required_deps)
+    if dep_result.get("banned"):
+        banned = ", ".join(dep_result["banned"])
+        msg = f"EXECUTION ERROR: DEPENDENCY_BLOCKED banned imports: {banned}"
+        fh = list(state.get("feedback_history", []))
+        fh.append(f"DEPENDENCY_BLOCKED: {banned}")
+        return {"error_message": msg, "execution_output": msg, "feedback_history": fh}
+    if dep_result.get("blocked"):
+        blocked = ", ".join(dep_result["blocked"])
+        msg = f"EXECUTION ERROR: DEPENDENCY_BLOCKED imports not in allowlist: {blocked}"
+        fh = list(state.get("feedback_history", []))
+        fh.append(f"DEPENDENCY_BLOCKED: {blocked}")
+        return {"error_message": msg, "execution_output": msg, "feedback_history": fh}
+
     # 0b. Undefined name preflight (avoid sandbox NameError)
     undefined = detect_undefined_names(code)
     if undefined:
@@ -1139,7 +1163,12 @@ def execute_code(state: AgentState) -> AgentState:
         
         with Sandbox.create() as sandbox:
             print("Installing dependencies in Sandbox...")
-            sandbox.commands.run("pip install xgboost seaborn scikit-learn pandas matplotlib codecarbon")
+            pkg_sets = get_sandbox_install_packages(required_deps)
+            base_cmd = "pip install -q " + " ".join(pkg_sets["base"])
+            sandbox.commands.run(base_cmd)
+            if pkg_sets["extra"]:
+                extra_cmd = "pip install -q " + " ".join(pkg_sets["extra"])
+                sandbox.commands.run(extra_cmd)
             sandbox.commands.run("mkdir -p static/plots") # Ensure plots dir exists
             sandbox.commands.run("mkdir -p data") # Ensure data dir exists for outputs
             
