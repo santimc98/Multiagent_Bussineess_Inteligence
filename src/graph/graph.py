@@ -45,6 +45,7 @@ from src.utils.sandbox_deps import (
     check_dependency_precheck,
     get_sandbox_install_packages,
 )
+from src.utils.case_alignment import build_case_alignment_report
 
 def _norm_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
@@ -1635,6 +1636,31 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     if status == "NEEDS_IMPROVEMENT":
         new_history.append(f"RESULT EVALUATION FEEDBACK: {feedback}")
 
+    # Case alignment QA gate (optional if artifacts exist)
+    contract = state.get("execution_contract", {}) or {}
+    data_paths = []
+    if os.path.exists("data/cleaned_full.csv"):
+        data_paths.append("data/cleaned_full.csv")
+    if os.path.exists("data/cleaned_data.csv"):
+        data_paths.append("data/cleaned_data.csv")
+    case_report = build_case_alignment_report(
+        contract=contract,
+        case_summary_path="data/case_summary.csv",
+        weights_path="data/weights.json",
+        data_paths=data_paths,
+    )
+    try:
+        os.makedirs("data", exist_ok=True)
+        with open("data/case_alignment_report.json", "w", encoding="utf-8") as f:
+            json.dump(case_report, f, indent=2)
+    except Exception as err:
+        print(f"Warning: failed to persist case_alignment_report.json: {err}")
+
+    if case_report.get("status") == "FAIL":
+        feedback = f"CASE_ALIGNMENT_GATE_FAILED: {case_report.get('explanation')}"
+        status = "NEEDS_IMPROVEMENT"
+        new_history.append(f"CASE_ALIGNMENT_GATE_FAILED: {case_report.get('failures')}")
+
     # Output contract validation
     output_contract = state.get("execution_contract", {}).get("required_outputs", [])
     oc_report = check_required_outputs(output_contract)
@@ -1651,11 +1677,20 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         feedback = f"{feedback}\n{feedback_missing}" if feedback else feedback_missing
         new_history.append(f"OUTPUT_CONTRACT_MISSING: {miss_text}")
 
+    gate_context = {
+        "source": "case_alignment_gate" if case_report.get("status") == "FAIL" else "result_evaluator",
+        "status": status,
+        "feedback": feedback,
+        "failed_gates": case_report.get("failures", []) if case_report.get("status") == "FAIL" else [],
+        "required_fixes": case_report.get("failures", []) if case_report.get("status") == "FAIL" else [],
+    }
+
     return {
         "review_verdict": status, 
         "execution_feedback": feedback,
         "feedback_history": new_history,
-        "output_contract_report": oc_report
+        "output_contract_report": oc_report,
+        "last_gate_context": gate_context,
     }
 
 def check_execution_status(state: AgentState):

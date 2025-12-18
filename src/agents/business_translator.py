@@ -68,6 +68,7 @@ class BusinessTranslatorAgent:
         integrity_audit = _safe_load_json("data/integrity_audit_report.json") or {}
         postmortem_decision = _safe_load_json("data/postmortem_decision.json") or {}
         output_contract_report = _safe_load_json("data/output_contract_report.json") or {}
+        case_alignment_report = _safe_load_json("data/case_alignment_report.json") or {}
 
         def _summarize_integrity():
             issues = integrity_audit.get("issues", []) if isinstance(integrity_audit, dict) else []
@@ -95,10 +96,19 @@ class BusinessTranslatorAgent:
                 return "No postmortem decision recorded."
             return f"Action={postmortem_decision.get('action')} Reason={postmortem_decision.get('reason')}"
 
+        def _summarize_case_alignment():
+            if not case_alignment_report:
+                return "No case alignment report."
+            status = case_alignment_report.get("status")
+            failures = case_alignment_report.get("failures", [])
+            metrics = case_alignment_report.get("metrics", {})
+            return f"Status={status}; Failures={failures}; KeyMetrics={metrics}"
+
         contract_context = _summarize_contract()
         integrity_context = _summarize_integrity()
         output_contract_context = _summarize_output_contract()
         postmortem_context = _summarize_postmortem()
+        case_alignment_context = _summarize_case_alignment()
 
         # Define Template
         SYSTEM_PROMPT_TEMPLATE = Template("""
@@ -122,6 +132,7 @@ class BusinessTranslatorAgent:
         - Integrity Audit: $integrity_context
         - Output Contract: $output_contract_context
         - Postmortem: $postmortem_context
+        - Case Alignment QA: $case_alignment_context
         
         ERROR CONDITION:
         $error_condition
@@ -139,6 +150,7 @@ class BusinessTranslatorAgent:
         2. Execution: What did the agents do? (Cleaned data, ran $analysis_type model).
         3. Explain the provided charts or results (found in the context below).
         4. Conclusion: Did we validate the hypothesis?
+        If Case Alignment QA failed (Status=FAIL), explicitly state "NO APTO PARA PRODUCCION" and summarize the main failure reasons.
         
         OUTPUT: Markdown format (NO TABLES).
         """)
@@ -155,7 +167,8 @@ class BusinessTranslatorAgent:
             contract_context=contract_context,
             integrity_context=integrity_context,
             output_contract_context=output_contract_context,
-            postmortem_context=postmortem_context
+            postmortem_context=postmortem_context,
+            case_alignment_context=case_alignment_context
         )
         
         # Execution Results

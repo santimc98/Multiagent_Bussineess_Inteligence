@@ -177,6 +177,8 @@ class MLEngineerAgent:
         - Ensure os.makedirs('static/plots', exist_ok=True) before saving plots.
         - Ensure os.makedirs('data', exist_ok=True) before saving outputs.
         - Print a final block: `QA_SELF_CHECK: PASS` and list which checklist items were satisfied.
+        - For ordinal scoring: optimize a ranking-aware loss at case level, and add regularization to avoid degenerate weights (e.g., L2 on weights and/or max-weight penalty). Enforce w>=0 and sum(w)=1.
+        - Report HHI/entropy, max weight, near-zero weights, and ranking violations in stdout; save these metrics into data/weights.json.
 
         *** OUTPUT REQUIREMENTS ***
         - Valid Python Code ONLY.

@@ -63,6 +63,10 @@ class PostmortemAgent:
             return _decision("retry_ml_engineer", f"Last gate failed in {last_source}; retry ML engineer.")
         if last_source in {"data_engineer", "integrity_audit", "column_mapping", "dialect_guard", "cleaning"} or "dialect" in last_source:
             return _decision("retry_data_engineer", f"Last gate failed in {last_source}; retry Data Engineer.")
+        if "case_alignment_gate_failed" in err_msg or "case_alignment_gate_failed" in " ".join(str(x).lower() for x in feedback_history):
+            if restrat >= 1:
+                return _decision("re_strategize", "Case alignment gate failed repeatedly; re-strategize.")
+            return _decision("retry_ml_engineer", "Case alignment gate failed; retry ML with ranking loss + regularization.")
 
         if "target has no variance" in err_msg:
             if variance_count >= 2 and restrat < 2:

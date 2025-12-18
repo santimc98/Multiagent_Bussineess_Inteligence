@@ -173,6 +173,7 @@ class ExecutionPlannerAgent:
                 required_deps.append("openpyxl")
             if any(tok in title_lower for tok in ["score", "weight", "ranking", "priorit"]):
                 outputs.extend(["data/weights.json", "data/case_summary.csv", "static/plots/*.png"])
+                outputs.append("data/case_alignment_report.json")
             else:
                 outputs.extend(["data/metrics.json", "static/plots/*.png"])
             contract = {
@@ -182,6 +183,18 @@ class ExecutionPlannerAgent:
                 "required_outputs": outputs,
                 "data_requirements": data_requirements,
                 "required_dependencies": required_deps,
+                "quality_gates": {
+                    "spearman_min": 0.85,
+                    "violations_max": 0,
+                    "inactive_share_max": 0.01,
+                    "max_weight_max": 0.70,
+                    "hhi_max": 0.60,
+                    "near_zero_max": 1,
+                },
+                "optimization_preferences": {
+                    "regularization": {"l2": 0.05, "concentration_penalty": 0.1},
+                    "ranking_loss": "hinge_pairwise",
+                },
                 "validations": [],
                 "notes_for_engineers": [
                     "Refine roles/ranges using data_summary evidence; adjust in Patch Mode if needed.",
@@ -209,6 +222,7 @@ Requirements:
 - If role == "date", use expected_range=null. Do not mix numeric ranges with null (avoid [0, null]); either null or a full numeric range when appropriate.
         - COLUMN INVENTORY (detected from CSV header) to help decide source input/derived: $column_inventory
         - required_dependencies is optional; include only if strongly implied by the strategy title or data_summary. Use module names (e.g., "xgboost", "statsmodels", "pyarrow", "openpyxl"). Otherwise use [].
+        - Include quality_gates (spearman_min, violations_max, inactive_share_max, max_weight_max, hhi_max, near_zero_max) and optimization_preferences (regularization + ranking_loss).
 """
         ).substitute(column_inventory=column_inventory_json)
         user_prompt_template = Template(
@@ -250,6 +264,20 @@ Return the contract JSON.
                 return _fallback()
             if "required_dependencies" not in contract:
                 contract["required_dependencies"] = []
+            if "quality_gates" not in contract:
+                contract["quality_gates"] = {
+                    "spearman_min": 0.85,
+                    "violations_max": 0,
+                    "inactive_share_max": 0.01,
+                    "max_weight_max": 0.70,
+                    "hhi_max": 0.60,
+                    "near_zero_max": 1,
+                }
+            if "optimization_preferences" not in contract:
+                contract["optimization_preferences"] = {
+                    "regularization": {"l2": 0.05, "concentration_penalty": 0.1},
+                    "ranking_loss": "hinge_pairwise",
+                }
             return enforce_percentage_ranges(_apply_expected_kind(_apply_inventory_source(contract)))
         except Exception:
             return _fallback()
