@@ -166,7 +166,16 @@ class MLEngineerAgent:
         - Headless: `matplotlib.use('Agg')` BEFORE importing pyplot.
         - Fail-Soft: Wrap plots in `try-except`.
         - Guarantee: Save at least one plot (`target_dist.png` or `confusion_matrix.png`).
-        
+
+        *** MANDATORY QA CHECKLIST (IMPLEMENT IN CODE) ***
+        - Add a target variance guard: `if y.nunique() <= 1: raise ValueError("Target has no variance; cannot train meaningful model.")` (or `<2`).
+        - Print a "Mapping Summary" line showing target/feature mapping.
+        - Build X ONLY from feature_cols derived from the execution contract; do NOT use all columns.
+        - Implement a high-cardinality safeguard: either (a) compute/drop high-card columns via nunique/len threshold, or (b) use only feature_cols and ignore extra columns.
+        - Ensure os.makedirs('static/plots', exist_ok=True) before saving plots.
+        - Ensure os.makedirs('data', exist_ok=True) before saving outputs.
+        - Print a final block: `QA_SELF_CHECK: PASS` and list which checklist items were satisfied.
+
         *** OUTPUT REQUIREMENTS ***
         - Valid Python Code ONLY.
         - Save model (optional, pickle).

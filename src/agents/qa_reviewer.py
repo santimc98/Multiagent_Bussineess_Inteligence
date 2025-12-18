@@ -64,6 +64,7 @@ class QAReviewerAgent:
         3. DATA LEAKAGE PREVENTION (Mandatory):
            - Target column must NOT be in X (features).
            - High cardinality columns (IDs) must be excluded unless justified.
+           - If X is explicitly built from contract feature_cols and excludes extra columns, this is sufficient.
            
         4. OUTPUT SAFETY (Mandatory):
            - If saving plots, `os.makedirs('static/plots', exist_ok=True)` MUST be called.
