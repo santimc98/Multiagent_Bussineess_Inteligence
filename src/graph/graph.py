@@ -153,6 +153,159 @@ def manifest_dump_missing_default(code: str) -> bool:
                 return True
     return False
 
+def ml_quality_preflight(code: str) -> List[str]:
+    """
+    Static ML quality checks to prevent QA loops before reviewer/sandbox.
+    Returns list of missing gates.
+    """
+    import ast
+
+    issues: List[str] = []
+    code_lower = code.lower()
+    if "mapping summary" not in code_lower:
+        issues.append("MAPPING_SUMMARY")
+
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return ["AST_PARSE_FAILED"]
+
+    def _condition_checks_nunique_guard(test_node: ast.AST) -> bool:
+        if not isinstance(test_node, ast.Compare):
+            return False
+        left = test_node.left
+        if not isinstance(left, ast.Call):
+            return False
+        func = left.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "nunique"):
+            return False
+        comparator_consts = [
+            comp
+            for comp in test_node.comparators
+            if isinstance(comp, ast.Constant) and isinstance(comp.value, (int, float))
+        ]
+        if not comparator_consts:
+            return False
+        for op, comp in zip(test_node.ops, comparator_consts):
+            if isinstance(op, ast.Eq) and comp.value == 1:
+                return True
+            if isinstance(op, ast.LtE) and comp.value <= 1:
+                return True
+            if isinstance(op, ast.Lt) and comp.value <= 2:
+                return True
+        return False
+
+    def _if_has_value_error_raise(body_nodes) -> bool:
+        for node in body_nodes:
+            if isinstance(node, ast.Raise):
+                exc = node.exc
+                if isinstance(exc, ast.Call) and isinstance(exc.func, ast.Name) and exc.func.id == "ValueError":
+                    return True
+            for child in ast.walk(node):
+                if isinstance(child, ast.Raise):
+                    exc = child.exc
+                    if isinstance(exc, ast.Call) and isinstance(exc.func, ast.Name) and exc.func.id == "ValueError":
+                        return True
+        return False
+
+    has_variance_guard = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If):
+            if _condition_checks_nunique_guard(node.test) and _if_has_value_error_raise(node.body):
+                has_variance_guard = True
+                break
+    if not has_variance_guard:
+        issues.append("TARGET_VARIANCE_GUARD")
+
+    def _is_df_feature_cols_subscript(node: ast.AST) -> bool:
+        if isinstance(node, ast.Subscript):
+            if isinstance(node.value, ast.Name) and node.value.id == "df":
+                sl = node.slice
+                if isinstance(sl, ast.Name) and sl.id == "feature_cols":
+                    return True
+                if isinstance(sl, ast.Tuple) and len(sl.elts) >= 2:
+                    return any(isinstance(e, ast.Name) and e.id == "feature_cols" for e in sl.elts)
+            if isinstance(node.value, ast.Attribute):
+                # df.loc[:, feature_cols]
+                if isinstance(node.value.value, ast.Name) and node.value.value.id == "df" and node.value.attr == "loc":
+                    sl = node.slice
+                    if isinstance(sl, ast.Tuple) and len(sl.elts) >= 2:
+                        return any(isinstance(e, ast.Name) and e.id == "feature_cols" for e in sl.elts)
+        return False
+
+    def _drop_excludes_target(call: ast.Call, target_names: set[str]) -> bool:
+        if not isinstance(call.func, ast.Attribute):
+            return False
+        if call.func.attr != "drop":
+            return False
+        if not isinstance(call.func.value, ast.Name) or call.func.value.id != "df":
+            return False
+        targets = set(target_names) | {"target", "y", "target_col"}
+        # keywords
+        for kw in call.keywords:
+            if kw.arg != "columns":
+                continue
+            if isinstance(kw.value, ast.List):
+                for elt in kw.value.elts:
+                    if isinstance(elt, ast.Name) and elt.id in targets:
+                        return True
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str) and elt.value.lower() in targets:
+                        return True
+        # positional args
+        for arg in call.args:
+            if isinstance(arg, ast.List):
+                for elt in arg.elts:
+                    if isinstance(elt, ast.Name) and elt.id in targets:
+                        return True
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str) and elt.value.lower() in targets:
+                        return True
+        return False
+
+    target_names: set[str] = set()
+    has_target_assignment = False
+    has_x_from_feature_cols = False
+    has_drop_target = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            # target assignment
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name) and tgt.id in {"y", "target", "y_train", "target_series"}:
+                    has_target_assignment = True
+                    target_names.add(tgt.id)
+            # X assignment
+            if any(isinstance(t, ast.Name) and t.id in {"X", "x"} for t in node.targets):
+                if _is_df_feature_cols_subscript(node.value):
+                    has_x_from_feature_cols = True
+                if isinstance(node.value, ast.Call) and _drop_excludes_target(node.value, target_names):
+                    has_drop_target = True
+        elif isinstance(node, ast.Call):
+            if _drop_excludes_target(node, target_names):
+                has_drop_target = True
+
+    has_target_exclusion = has_target_assignment and (has_x_from_feature_cols or has_drop_target)
+    if not has_target_exclusion:
+        issues.append("TARGET_NOT_IN_X")
+
+    has_high_card_filter = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare):
+            left = node.left
+            comps = [left] + list(node.comparators)
+            if any(isinstance(op, (ast.Gt, ast.GtE)) for op in node.ops):
+                for comp in comps:
+                    if isinstance(comp, ast.Call):
+                        func = comp.func
+                        if isinstance(func, ast.Attribute) and func.attr == "nunique":
+                            has_high_card_filter = True
+                            break
+        if has_high_card_filter:
+            break
+
+    if not (has_x_from_feature_cols or has_high_card_filter):
+        issues.append("HIGH_CARDINALITY_HANDLING")
+
+    return issues
+
 def dialect_guard_violations(code: str, csv_sep: str, csv_decimal: str, csv_encoding: str, expected_path: str | None = None) -> List[str]:
     """
     AST-based guard to ensure pd.read_csv (first call or the one reading expected_path) sets sep/decimal/encoding.
@@ -1098,6 +1251,30 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             "error_message": msg
         }
 
+def run_ml_preflight(state: AgentState) -> AgentState:
+    print("--- ML PREFLIGHT ---")
+    code = state.get("generated_code", "")
+    issues = ml_quality_preflight(code)
+    if issues:
+        feedback = f"ML_PREFLIGHT_MISSING: {', '.join(issues)}"
+        history = list(state.get("feedback_history", []))
+        history.append(feedback)
+        gate_context = {
+            "source": "ml_preflight",
+            "status": "REJECTED",
+            "feedback": feedback,
+            "failed_gates": issues,
+            "required_fixes": issues,
+        }
+        return {
+            "ml_preflight_failed": True,
+            "feedback_history": history,
+            "last_gate_context": gate_context,
+            "review_verdict": "REJECTED",
+            "review_feedback": feedback,
+        }
+    return {"ml_preflight_failed": False}
+
 def check_qa_review(state: AgentState):
     if state.get("error_message") or state.get("review_abort_reason"):
         return "failed"
@@ -1105,6 +1282,11 @@ def check_qa_review(state: AgentState):
         return "rejected"
     # APPROVED or APPROVE_WITH_WARNINGS -> proceeds
     return "approved"
+
+def check_ml_preflight(state: AgentState):
+    if state.get("ml_preflight_failed"):
+        return "failed"
+    return "passed"
 
 
 def check_review(state: AgentState):
@@ -1555,6 +1737,7 @@ def run_postmortem(state: AgentState) -> AgentState:
         "restrategize_count": state.get("restrategize_count", 0),
         "error_message": state.get("error_message", ""),
         "missing_repeat_count": state.get("missing_repeat_count", 0),
+        "last_gate_context": state.get("last_gate_context", {}),
     }
     try:
         with open("data/output_contract_report.json", "r", encoding="utf-8") as f:
@@ -1682,6 +1865,7 @@ workflow.add_node("data_engineer", run_data_engineer)
 workflow.add_node("engineer", run_engineer)
 workflow.add_node("reviewer", run_reviewer)
 workflow.add_node("qa_reviewer", run_qa_reviewer) # QA Node
+workflow.add_node("ml_preflight", run_ml_preflight)
 workflow.add_node("execute_code", execute_code)
 workflow.add_node("evaluate_results", run_result_evaluator) # New Node
 workflow.add_node("retry_handler", retry_handler)
@@ -1705,8 +1889,17 @@ workflow.add_conditional_edges(
     "engineer",
     check_engineer_success,
     {
-        "success": "reviewer",
+        "success": "ml_preflight",
         "failed": "translator"
+    }
+)
+
+workflow.add_conditional_edges(
+    "ml_preflight",
+    check_ml_preflight,
+    {
+        "passed": "reviewer",
+        "failed": "retry_handler",
     }
 )
 

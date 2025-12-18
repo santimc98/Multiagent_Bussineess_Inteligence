@@ -53,6 +53,7 @@ class DataEngineerAgent:
         1. NO PRIVATE APIS: Prohibited `pd.io.*`, `pandas.io.*`, `ParserBase`. Use public API `pd.read_csv` only.
         2. NO NETWORK/FS OPS: Prohibited `os.system`, `subprocess`, `requests`.
         3. OUTPUT: Valid Python Code ONLY. No markdown.
+        4. Do NOT import `sys`.
         
         *** INPUT PARAMETERS ***
         - Input: '$input_path'
@@ -72,9 +73,11 @@ class DataEngineerAgent:
              * KEEP: Any column that looks like signal (even if not required).
              * DROP: Only if 100% Null or Constant (nunique<=1).
            - "Universal" means the output CSV should support MULTIPLE possible strategies, not just the current one.
+           - Do NOT drop required/derived columns solely because they are constant; keep and record a "constant_column" warning in the manifest instead.
         
         2. ROBUST LOADING & NAMING:
            - Try/Except load (Smart Metadata -> Fallback Python Engine -> Latin1).
+           - The FIRST pd.read_csv MUST include sep, decimal, encoding from the provided dialect variables (do NOT hardcode literal values).
            - COLUMN NAMING:
              * Normalize to `snake_case`.
              * DEDUPLICATION (CRITICAL):
@@ -95,6 +98,9 @@ class DataEngineerAgent:
              * Do NOT blindly strip '.' characters; infer decimal/thousands from patterns (only '.' present -> decimal='.'; only ',' -> decimal=','; if both, decide by rightmost separator).
              * For percentages: always strip '%' and parse using the detected decimal separator.
              * If a conversion is reverted, restore exactly the original series (no downstream overwrites or partial coercion).
+           - Percentage role handling (MANDATORY):
+             * If role==percentage in the contract, parse with the detected decimal separator and normalize to 0-1 when most values are in [1,100] or p50 > 1.
+             * Keep both raw and normalized versions only if explicitly required by the contract; otherwise overwrite with normalized values.
         
         4. MANIFEST ARTIFACT (AUDITABILITY):
            - In addition to 'data/cleaned_data.csv', you MUST save 'data/cleaning_manifest.json'.

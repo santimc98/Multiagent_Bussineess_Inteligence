@@ -41,6 +41,8 @@ class PostmortemAgent:
         feedback_history = context.get("feedback_history", []) or []
         variance_count = sum(1 for item in feedback_history if "target has no variance" in str(item).lower())
         missing_repeat = context.get("missing_repeat_count", 0) or 0
+        last_gate = context.get("last_gate_context") or {}
+        last_source = str(last_gate.get("source", "")).lower()
 
         def _decision(action: str, reason: str) -> Dict[str, Any]:
             return {
@@ -56,6 +58,11 @@ class PostmortemAgent:
                     "reset_review_streaks": True,
                 }
             }
+
+        if last_source in {"ml_preflight", "qa_reviewer", "reviewer"}:
+            return _decision("retry_ml_engineer", f"Last gate failed in {last_source}; retry ML engineer.")
+        if last_source in {"data_engineer", "integrity_audit", "column_mapping", "dialect_guard", "cleaning"} or "dialect" in last_source:
+            return _decision("retry_data_engineer", f"Last gate failed in {last_source}; retry Data Engineer.")
 
         if "target has no variance" in err_msg:
             if variance_count >= 2 and restrat < 2:

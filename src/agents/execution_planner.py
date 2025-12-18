@@ -10,6 +10,27 @@ from openai import OpenAI
 
 load_dotenv()
 
+def enforce_percentage_ranges(contract: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return {}
+    reqs = contract.get("data_requirements", []) or []
+    for req in reqs:
+        if not isinstance(req, dict):
+            continue
+        role = (req.get("role") or "").lower()
+        expected = req.get("expected_range")
+        if role == "percentage" and not expected:
+            req["expected_range"] = [0, 1]
+    notes = contract.get("notes_for_engineers")
+    if not isinstance(notes, list):
+        notes = []
+    note = "Percentages must be normalized to 0-1; if values look like 0-100 scale, divide by 100."
+    if note not in notes:
+        notes.append(note)
+    contract["notes_for_engineers"] = notes
+    contract["data_requirements"] = reqs
+    return contract
+
 
 class ExecutionPlannerAgent:
     """
@@ -114,7 +135,7 @@ class ExecutionPlannerAgent:
                     "Align cleaning/modeling with this contract; avoid hardcoded business rules.",
                 ],
             }
-            return _apply_inventory_source(contract)
+            return contract
 
         if not self.client:
             return _fallback()
@@ -176,6 +197,6 @@ Return the contract JSON.
                 return _fallback()
             if "required_dependencies" not in contract:
                 contract["required_dependencies"] = []
-            return _apply_inventory_source(contract)
+            return enforce_percentage_ranges(_apply_inventory_source(contract))
         except Exception:
             return _fallback()

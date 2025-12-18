@@ -172,6 +172,9 @@ def run_integrity_audit(df: pd.DataFrame, contract: Dict[str, Any] | None = None
             if not num.dropna().empty:
                 p95 = float(num.quantile(0.95))
                 p05 = float(num.quantile(0.05))
+                p50 = float(num.quantile(0.50))
+                max_val = float(num.max())
+                frac_gt_one = float((num > 1).mean())
                 tolerance = 0.05 * (hi - lo) if hi is not None and lo is not None else 0.0
                 if (hi is not None and p95 > hi + tolerance) or (lo is not None and p05 < lo - tolerance):
                     issues.append(
@@ -183,15 +186,17 @@ def run_integrity_audit(df: pd.DataFrame, contract: Dict[str, Any] | None = None
                         }
                     )
                 # Percentage scaling suspicion
-                if (hi == 1 or (role in {"percentage", "probability", "ratio"})) and p95 > 1.5 and p95 <= 1000 and num.quantile(0.5) > 1:
-                    issues.append(
-                        {
-                            "type": "PERCENT_SCALE_SUSPECTED",
-                            "severity": "warning",
-                            "column": actual,
-                            "detail": f"Expected ~[0,1] but observed p95={p95:.3f}; may need scaling.",
-                        }
-                    )
+                if lo == 0 and hi == 1:
+                    if p95 > 1.5 or (max_val > 1 and frac_gt_one > 0.2):
+                        severity = "critical" if (p95 > 1.5 or frac_gt_one > 0.5) else "warning"
+                        issues.append(
+                            {
+                                "type": "PERCENT_SCALE_SUSPECTED",
+                                "severity": severity,
+                                "column": actual,
+                                "detail": f"Expected ~[0,1] but observed p50={p50:.3f}, p95={p95:.3f}, max={max_val:.3f}, frac_gt_one={frac_gt_one:.2f}.",
+                            }
+                        )
 
         # Categorical destroyed by parsing
         if role == "categorical":
