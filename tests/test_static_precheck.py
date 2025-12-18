@@ -17,3 +17,14 @@ def main():
 """
     undefined = detect_undefined_names(code)
     assert "load_data_with_dialect" in undefined
+
+
+def test_precheck_allows_lambda_args():
+    code = """
+import pandas as pd
+f = lambda x: x.quantile(0.25)
+df = pd.DataFrame({"a":[1,2,3]})
+q = df["a"].agg(lambda x: x.quantile(0.25))
+"""
+    undefined = detect_undefined_names(code)
+    assert undefined == []

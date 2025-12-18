@@ -105,6 +105,13 @@ def detect_undefined_names(code: str) -> List[str]:
                 defined.add(node.args.vararg.arg)
             if node.args.kwarg:
                 defined.add(node.args.kwarg.arg)
+        elif isinstance(node, ast.Lambda):
+            for arg in node.args.args + node.args.kwonlyargs:
+                defined.add(arg.arg)
+            if node.args.vararg:
+                defined.add(node.args.vararg.arg)
+            if node.args.kwarg:
+                defined.add(node.args.kwarg.arg)
         elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             add_target(node.target if hasattr(node, "target") else None)
             if hasattr(node, "targets"):
@@ -1377,6 +1384,10 @@ def execute_code(state: AgentState) -> AgentState:
         msg = f"STATIC_PRECHECK_UNDEFINED: Undefined names detected preflight: {', '.join(undefined)}"
         fh = list(state.get("feedback_history", []))
         fh.append(f"STATIC_PRECHECK_UNDEFINED: {msg}")
+        try:
+            print(msg)
+        except Exception:
+            pass
         return {"error_message": msg, "execution_output": msg, "feedback_history": fh}
 
     # Secure execution using E2B
