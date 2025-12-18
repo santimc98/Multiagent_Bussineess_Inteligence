@@ -39,6 +39,17 @@ def _extract_weights(obj: Any) -> Dict[str, float]:
             return {str(k): float(v) for k, v in obj["weights"].items() if _is_number(v)}
         if isinstance(obj.get("feature_weights"), dict):
             return {str(k): float(v) for k, v in obj["feature_weights"].items() if _is_number(v)}
+        if isinstance(obj.get("weights"), list) and isinstance(obj.get("features"), list):
+            weights = obj.get("weights") or []
+            features = obj.get("features") or []
+            if len(weights) == len(features):
+                out = {}
+                for idx, feat in enumerate(features):
+                    val = weights[idx]
+                    if _is_number(val):
+                        out[str(feat)] = float(val)
+                if out:
+                    return out
         if all(_is_number(v) for v in obj.values()):
             return {str(k): float(v) for k, v in obj.items()}
     return {}

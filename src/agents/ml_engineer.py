@@ -126,6 +126,15 @@ class MLEngineerAgent:
         - Use the execution contract to decide which columns/roles to include, expected ranges, null thresholds, and required artifacts. Do NOT invent hardcoded rules.
         - Validate results against the contract; if a validation fails, print `FAIL_CONTRACT:<reason>` and explain.
         - If the contract marks a target as `source="derived"` or the target column is absent, derive it explicitly (document formula/logic) before training and log `DERIVED_TARGET:<name>` to stdout.
+        
+        *** DERIVED COLUMN HANDLING (MANDATORY) ***
+        - If the cleaned dataset already contains derived columns listed in the execution contract (source="derived"), use them directly and do NOT recompute or overwrite them.
+        - Only derive a column if it is missing. If deriving, preserve NaN values; do not coerce NaN to 0 unless the contract explicitly states a default.
+        
+        *** BASELINE COMPARISON (MANDATORY IF AVAILABLE) ***
+        - If a baseline metric column exists (role "baseline_metric" in the contract or a non-derived "Score" column),
+          compute a comparison between baseline and Score_nuevo (e.g., correlation and mean absolute difference).
+        - Print the comparison and include it in any metrics/weights output.
 
         *** TARGET & DATA GUARDRAILS (MANDATORY) ***
         - If df.empty after loading with output_dialect -> raise ValueError with dialect info.
@@ -177,6 +186,7 @@ class MLEngineerAgent:
         - Implement a high-cardinality safeguard: either (a) compute/drop high-card columns via nunique/len threshold, or (b) use only feature_cols and ignore extra columns.
         - Ensure os.makedirs('static/plots', exist_ok=True) before saving plots.
         - Ensure os.makedirs('data', exist_ok=True) before saving outputs.
+        - Save a per-row scored dataset to `data/scored_rows.csv` when derived outputs are present in the contract.
         - Print a final block: `QA_SELF_CHECK: PASS` and list which checklist items were satisfied.
         - For ordinal scoring: optimize a ranking-aware loss at case level, and add regularization to avoid degenerate weights (e.g., L2 on weights and/or max-weight penalty). Enforce w>=0 and sum(w)=1.
         - Report HHI/entropy, max weight, near-zero weights, and ranking violations in stdout; save these metrics into data/weights.json.
@@ -186,6 +196,7 @@ class MLEngineerAgent:
         - Save model (optional, pickle).
         - Save metrics (print to stdout).
         - Save plots to `static/plots/`.
+        - Save scored rows (inputs + derived outputs) to `data/scored_rows.csv` if the contract includes derived outputs.
         """
         
         ml_runbook_json = json.dumps(

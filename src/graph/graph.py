@@ -69,6 +69,18 @@ def _resolve_required_input_columns(contract: Dict[str, Any], strategy: Dict[str
             return [r.get("name") for r in contract_reqs if isinstance(r, dict) and r.get("source", "input") == "input" and r.get("name")]
     return strategy.get("required_columns", []) if strategy else []
 
+def _ensure_scored_rows_output(contract: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return {}
+    reqs = contract.get("data_requirements", []) or []
+    needs_scored = any(isinstance(r, dict) and r.get("source") == "derived" for r in reqs)
+    if needs_scored:
+        outputs = contract.get("required_outputs", []) or []
+        if "data/scored_rows.csv" not in outputs:
+            outputs.append("data/scored_rows.csv")
+        contract["required_outputs"] = outputs
+    return contract
+
 def detect_undefined_names(code: str) -> List[str]:
     """
     AST-based preflight to detect names that are used but never defined/imported.
@@ -601,6 +613,7 @@ def run_execution_planner(state: AgentState) -> AgentState:
             "notes_for_engineers": ["Planner failed; use strategy + data_summary."],
         }
     contract = ensure_role_runbooks(contract)
+    contract = _ensure_scored_rows_output(contract)
     try:
         os.makedirs("data", exist_ok=True)
         with open("data/execution_contract.json", "w", encoding="utf-8") as f:
@@ -1572,7 +1585,10 @@ def execute_code(state: AgentState) -> AgentState:
                             b64_content = proc.stdout.strip()
                             content = base64.b64decode(b64_content)
                             if len(content) >= 0:
-                                local_path = remote_path.lstrip("/home/user/").lstrip("/")
+                                if remote_path.startswith("/home/user/"):
+                                    local_path = remote_path[len("/home/user/"):].lstrip("/")
+                                else:
+                                    local_path = remote_path.lstrip("/")
                                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
                                 with open(local_path, "wb") as f_local:
                                     f_local.write(content)

@@ -45,6 +45,9 @@ DEFAULT_ML_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "Include variance guard: if y.nunique() <= 1 raise ValueError.",
         "Print Mapping Summary and build X only from contract feature columns.",
         "Ensure output dirs exist (data/, static/plots/) before saving artifacts.",
+        "If derived columns exist in cleaned data, do not recompute or overwrite; only derive if missing and preserve NaNs unless the contract explicitly sets a default.",
+        "If a baseline_metric exists, compare it to the computed score (e.g., correlation/MAE) and report the result.",
+        "If derived outputs are present in the contract, save per-row scored output to data/scored_rows.csv.",
     ],
     "must_not": [
         "Do not import sys.",
@@ -65,7 +68,7 @@ DEFAULT_ML_ENGINEER_RUNBOOK: Dict[str, Any] = {
     ],
     "outputs": {
         "required": ["data/cleaned_data.csv"],
-        "optional": ["data/weights.json", "static/plots/*.png"],
+        "optional": ["data/weights.json", "static/plots/*.png", "data/scored_rows.csv"],
     },
 }
 
