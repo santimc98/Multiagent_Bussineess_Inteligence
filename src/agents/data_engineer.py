@@ -188,6 +188,8 @@ class DataEngineerAgent:
         - When deriving contract columns (e.g., Case, RefScore, Score_nuevo), NEVER hardcode raw column names.
         - Build a map of normalized names -> actual column names after canonicalization and use it to access source columns.
         - If a required source column is missing, raise a clear ValueError instead of defaulting all rows.
+        - Do NOT validate required column presence before canonicalization; check after normalization mapping.
+        - Only enforce existence for source="input" columns. For source="derived", derive after mapping.
 
         *** SCRIPT STRUCTURE ***
         1. Imports (pandas, numpy, json, os, re).

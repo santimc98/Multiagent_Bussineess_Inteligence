@@ -143,6 +143,83 @@ class ExecutionPlannerAgent:
             contract["data_requirements"] = updated_reqs
             return contract
 
+        def _extract_data_risks(contract: Dict[str, Any]) -> List[str]:
+            risks: List[str] = []
+            summary_text = data_summary or ""
+            summary_lower = summary_text.lower()
+            # Surface explicit alert/critical lines from steward summary
+            for raw_line in summary_text.splitlines():
+                line = raw_line.strip()
+                lower = line.lower()
+                if not line:
+                    continue
+                if "alert" in lower or "critical" in lower or "warning" in lower:
+                    risks.append(line)
+            # Sampling warning
+            if "sample" in summary_lower and ("5000" in summary_lower or "sampled" in summary_lower):
+                risks.append("Summary indicates sampling; verify results on full dataset.")
+            # Dialect/encoding hints
+            if "delimiter" in summary_lower or "dialect" in summary_lower or "encoding" in summary_lower:
+                risks.append("Potential dialect/encoding sensitivity; enforce manifest output_dialect on load.")
+            # Variance/constant hints
+            if "no variation" in summary_lower or "no variance" in summary_lower or "constant" in summary_lower:
+                risks.append("Potential low-variance/constant columns; guard for target/feature variance.")
+
+            inv_norm = {_norm(c) for c in (column_inventory or []) if c is not None}
+            missing_inputs: List[str] = []
+            derived_needed: List[str] = []
+            for req in contract.get("data_requirements", []) or []:
+                if not isinstance(req, dict):
+                    continue
+                name = req.get("name")
+                if not name:
+                    continue
+                source = req.get("source", "input") or "input"
+                if source == "input" and inv_norm:
+                    if _norm(name) not in inv_norm:
+                        missing_inputs.append(name)
+                if source == "derived":
+                    derived_needed.append(name)
+            if missing_inputs:
+                risks.append(
+                    f"Input requirements not found in header inventory: {missing_inputs}. "
+                    "Use normalized mapping after canonicalization; do not fail before mapping."
+                )
+            if derived_needed:
+                risks.append(
+                    f"Derived columns required: {derived_needed}. "
+                    "Derive after mapping; do not expect in raw input."
+                )
+
+            # Deduplicate and cap
+            seen = set()
+            unique = []
+            for r in risks:
+                if r not in seen:
+                    seen.add(r)
+                    unique.append(r)
+            return unique[:8]
+
+        def _attach_data_risks(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            risks = _extract_data_risks(contract)
+            if risks:
+                existing = contract.get("data_risks")
+                if not isinstance(existing, list):
+                    existing = []
+                combined = existing + [r for r in risks if r not in existing]
+                contract["data_risks"] = combined
+                notes = contract.get("notes_for_engineers")
+                if not isinstance(notes, list):
+                    notes = []
+                for r in risks:
+                    note = f"DATA_RISK: {r}"
+                    if note not in notes:
+                        notes.append(note)
+                contract["notes_for_engineers"] = notes
+            return contract
+
         def _fallback() -> Dict[str, Any]:
             required_cols = strategy.get("required_columns", []) or []
             data_requirements: List[Dict[str, Any]] = []
@@ -210,7 +287,11 @@ class ExecutionPlannerAgent:
                     "ml_engineer": DEFAULT_ML_ENGINEER_RUNBOOK,
                 },
             }
-            return ensure_role_runbooks(enforce_percentage_ranges(_apply_expected_kind(_apply_inventory_source(contract))))
+            contract = _apply_inventory_source(contract)
+            contract = _apply_expected_kind(contract)
+            contract = enforce_percentage_ranges(contract)
+            contract = ensure_role_runbooks(contract)
+            return _attach_data_risks(contract)
 
         if not self.client:
             return _fallback()
@@ -221,12 +302,14 @@ class ExecutionPlannerAgent:
 You are a senior execution planner. Produce a JSON contract to guide data cleaning and modeling.
 Requirements:
 - Output JSON ONLY (no markdown/code fences).
-- Include: contract_version, strategy_title, business_objective, required_outputs, data_requirements, validations, notes_for_engineers, required_dependencies.
+- Include: contract_version, strategy_title, business_objective, required_outputs, data_requirements, validations, notes_for_engineers, required_dependencies, data_risks.
         - data_requirements: list of {name, role, expected_range, allowed_null_frac, source, expected_kind}. expected_kind in {numeric, datetime, categorical, unknown}.
 - Each data_requirement may include source: "input" | "derived" (default input). If role==target and the name is not present in the column inventory from data_summary, mark source="derived" if reasonable.
 - expected_range e.g. [0,1] for probabilities/scores/percentages if implied by the column description.
 - validations: generic checks (e.g., ranking_coherence spearman, out_of_range).
   - Do NOT invent columns; base everything on the provided strategy and data_summary.
+  - If a required column is NOT present in the column inventory, mark source="derived" and add a data_risks note.
+  - data_risks should list potential failure modes (missing columns, low variance, dialect/encoding sensitivity, sampling).
   - required_outputs should always include data/cleaned_data.csv. For scoring/weights/ranking strategies, also include data/weights.json, data/case_summary.csv, and at least one plot like static/plots/*.png. For standard classification/regression, include data/metrics.json and one plot.
   - Include role_runbooks for data_engineer and ml_engineer with: goals, must, must_not, safe_idioms, validation_checklist, and (for DE) manifest_requirements; (for ML) methodology and outputs.
   - If role == "date", use expected_range=null. Do not mix numeric ranges with null (avoid [0, null]); either null or a full numeric range when appropriate.
@@ -289,7 +372,10 @@ Return the contract JSON.
                     "regularization": {"l2": 0.05, "concentration_penalty": 0.1},
                     "ranking_loss": "hinge_pairwise",
                 }
-            contract = enforce_percentage_ranges(_apply_expected_kind(_apply_inventory_source(contract)))
-            return ensure_role_runbooks(contract)
+            contract = _apply_inventory_source(contract)
+            contract = _apply_expected_kind(contract)
+            contract = enforce_percentage_ranges(contract)
+            contract = ensure_role_runbooks(contract)
+            return _attach_data_risks(contract)
         except Exception:
             return _fallback()

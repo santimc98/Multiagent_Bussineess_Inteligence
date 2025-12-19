@@ -15,6 +15,8 @@ DEFAULT_DATA_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "Do not drop required/derived columns solely for being constant; record as constant in manifest.",
         "When deriving contract columns, use normalized column mappings instead of hardcoding raw names.",
         "If a required source column for derivations is missing, raise a clear ValueError (do not default all rows).",
+        "Do not validate required columns before canonicalization; match after normalization mapping.",
+        "Only enforce existence for source='input' columns; source='derived' must be created after mapping.",
     ],
     "must_not": [
         "Do not blindly strip '.'; infer thousands/decimal from patterns.",
