@@ -3,6 +3,7 @@ import os
 import subprocess
 import re
 import json
+from datetime import datetime
 from typing import TypedDict, Dict, Any, List, Literal
 from langgraph.graph import StateGraph, END
 from e2b_code_interpreter import Sandbox
@@ -48,6 +49,14 @@ from src.utils.sandbox_deps import (
 from src.utils.case_alignment import build_case_alignment_report
 from src.utils.contract_validation import ensure_role_runbooks
 from src.utils.data_engineer_preflight import data_engineer_preflight
+from src.utils.run_logger import init_run_log, log_run_event, finalize_run_log
+from src.utils.dataset_memory import (
+    fingerprint_dataset,
+    load_dataset_memory,
+    record_dataset_memory,
+    summarize_memory,
+)
+from src.utils.governance import write_governance_report, build_run_summary
 
 def _norm_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
@@ -96,6 +105,33 @@ def _ensure_scored_rows_output(contract: Dict[str, Any]) -> Dict[str, Any]:
             outputs.append("data/scored_rows.csv")
         contract["required_outputs"] = outputs
     return contract
+
+DEFAULT_RUN_BUDGET = {
+    "max_de_calls": 3,
+    "max_ml_calls": 5,
+    "max_reviewer_calls": 5,
+    "max_qa_calls": 5,
+    "max_execution_calls": 3,
+}
+
+def _ensure_budget_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    budget = dict(state.get("run_budget") or {})
+    if not budget:
+        budget = dict(DEFAULT_RUN_BUDGET)
+    counters = dict(state.get("budget_counters") or {})
+    for key in ["de_calls", "ml_calls", "reviewer_calls", "qa_calls", "execution_calls"]:
+        counters.setdefault(key, 0)
+    return {"run_budget": budget, "budget_counters": counters}
+
+def _consume_budget(state: Dict[str, Any], counter_key: str, limit_key: str, label: str):
+    budget = state.get("run_budget") or DEFAULT_RUN_BUDGET
+    counters = dict(state.get("budget_counters") or {})
+    limit = budget.get(limit_key, DEFAULT_RUN_BUDGET.get(limit_key))
+    used = counters.get(counter_key, 0) + 1
+    counters[counter_key] = used
+    if limit is not None and used > limit:
+        return False, counters, f"BUDGET_EXCEEDED: {label} exceeded {used}/{limit}"
+    return True, counters, ""
 
 def detect_undefined_names(code: str) -> List[str]:
     """
@@ -459,6 +495,12 @@ class AgentState(TypedDict):
     restrategize_count: int
     strategist_context_override: str
     missing_repeat_count: int
+    run_id: str
+    run_start_ts: str
+    dataset_fingerprint: str
+    dataset_memory_context: str
+    run_budget: Dict[str, Any]
+    budget_counters: Dict[str, int]
 
 from src.agents.domain_expert import DomainExpertAgent
 
@@ -479,6 +521,25 @@ postmortem_agent = PostmortemAgent()
 
 def run_steward(state: AgentState) -> AgentState:
     print("--- [1] Steward: Analyzing Data ---")
+    run_id = state.get("run_id") if state else None
+    if not run_id:
+        run_id = uuid.uuid4().hex[:8]
+    run_start_ts = state.get("run_start_ts") if state else None
+    if not run_start_ts:
+        run_start_ts = datetime.utcnow().isoformat()
+    csv_path = state.get("csv_path") if state else ""
+    dataset_fingerprint = fingerprint_dataset(csv_path)
+    memory_entries = load_dataset_memory()
+    memory_context = summarize_memory(memory_entries, dataset_fingerprint)
+    init_run_log(
+        run_id,
+        {
+            "csv_path": csv_path,
+            "business_objective": state.get("business_objective") if state else "",
+            "dataset_fingerprint": dataset_fingerprint,
+        },
+    )
+    log_run_event(run_id, "steward_start", {"csv_path": csv_path})
     
     # Pre-emptive cleanup
     import glob
@@ -501,7 +562,14 @@ def run_steward(state: AgentState) -> AgentState:
     
     print(f"Steward Detected: Encoding={encoding}, Sep='{sep}', Decimal='{decimal}'")
     
+    log_run_event(
+        run_id,
+        "steward_complete",
+        {"summary_len": len(summary or ""), "encoding": encoding, "sep": sep, "decimal": decimal},
+    )
+
     # Initialize loop variables
+    budget_state = _ensure_budget_state(state or {})
     return {
         "data_summary": summary,
         "csv_encoding": encoding,
@@ -520,6 +588,12 @@ def run_steward(state: AgentState) -> AgentState:
         "restrategize_count": state.get("restrategize_count", 0) if state else 0,
         "strategist_context_override": state.get("strategist_context_override", "") if state else "",
         "missing_repeat_count": 0,
+        "run_id": run_id,
+        "run_start_ts": run_start_ts,
+        "dataset_fingerprint": dataset_fingerprint,
+        "dataset_memory_context": memory_context,
+        "run_budget": budget_state.get("run_budget", {}),
+        "budget_counters": budget_state.get("budget_counters", {}),
     }
 
 def run_strategist(state: AgentState) -> AgentState:
@@ -600,7 +674,13 @@ def run_execution_planner(state: AgentState) -> AgentState:
     print("--- [2.7] Execution Planner: Building Contract ---")
     strategy = state.get("selected_strategy", {})
     data_summary = state.get("data_summary", "")
+    memory_context = state.get("dataset_memory_context")
+    if memory_context:
+        data_summary = f"{data_summary}\n\n{memory_context}"
     business_objective = state.get("business_objective", "")
+    run_id = state.get("run_id")
+    if run_id:
+        log_run_event(run_id, "execution_planner_start", {"strategy": strategy.get("title", "")})
     csv_path = state.get("csv_path", "")
     csv_sep = state.get("csv_sep", ",")
     csv_decimal = state.get("csv_decimal", ".")
@@ -637,6 +717,12 @@ def run_execution_planner(state: AgentState) -> AgentState:
             json.dump(contract, f, indent=2)
     except Exception as save_err:
         print(f"Warning: failed to persist execution_contract.json: {save_err}")
+    if run_id:
+        log_run_event(
+            run_id,
+            "execution_planner_complete",
+            {"required_outputs": contract.get("required_outputs", [])},
+        )
     return {"execution_contract": contract}
 
 
@@ -644,6 +730,20 @@ def run_execution_planner(state: AgentState) -> AgentState:
 
 def run_data_engineer(state: AgentState) -> AgentState:
     print("--- [3] Data Engineer: Cleaning Data (E2B Sandbox) ---")
+    run_id = state.get("run_id")
+    ok, counters, err_msg = _consume_budget(state, "de_calls", "max_de_calls", "Data Engineer")
+    state["budget_counters"] = counters
+    if not ok:
+        if run_id:
+            log_run_event(run_id, "budget_exceeded", {"label": "data_engineer", "error": err_msg})
+        return {
+            "cleaning_code": "",
+            "cleaned_data_preview": "Error: Budget Exceeded",
+            "error_message": err_msg,
+            "budget_counters": counters,
+        }
+    if run_id:
+        log_run_event(run_id, "data_engineer_start", {})
     
     selected = state.get('selected_strategy')
     if not selected:
@@ -682,7 +782,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
         return {
             "cleaning_code": code,
             "cleaned_data_preview": "Error: Generation Failed",
-            "error_message": code
+            "error_message": code,
+            "budget_counters": counters,
         }
 
     preflight_issues = data_engineer_preflight(code)
@@ -707,6 +808,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "error_message": msg,
             "feedback_history": fh,
             "last_gate_context": lgc,
+            "budget_counters": counters,
         }
 
     # Manifest serialization guard: ensure json.dump uses default=
@@ -727,6 +829,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 "cleaning_code": code,
                 "cleaned_data_preview": "Error: Manifest JSON Guard",
                 "error_message": "CRITICAL: Manifest serialization must use json.dump(..., default=_json_default).",
+                "budget_counters": counters,
             }
 
     # Dialect enforcement guard: ensure pd.read_csv uses provided dialect
@@ -748,6 +851,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 "cleaning_code": code,
                 "cleaned_data_preview": "Error: Dialect Guard",
                 "error_message": "CRITICAL: pd.read_csv must use provided dialect parameters.",
+                "budget_counters": counters,
             }
 
     # STATIC SAFETY SCAN FOR CLEANING CODE (HARDENING)
@@ -758,7 +862,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
         return {
             "cleaning_code": code,
             "cleaned_data_preview": "Security Block",
-            "error_message": f"Cleaning Code Blocked: {failure_reason}"
+            "error_message": f"Cleaning Code Blocked: {failure_reason}",
+            "budget_counters": counters,
         }
 
     # Execute in E2B Sandbox
@@ -767,7 +872,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
         api_key = os.getenv("E2B_API_KEY")
         if not api_key:
             msg = "CRITICAL: E2B_API_KEY missing in .env file."
-            return {"error_message": msg, "cleaned_data_preview": "Error: Missing E2B Key"}
+            return {"error_message": msg, "cleaned_data_preview": "Error: Missing E2B Key", "budget_counters": counters}
         
         os.environ["E2B_API_KEY"] = api_key
 
@@ -844,17 +949,19 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 return {
                     "cleaning_code": code,
                     "cleaned_data_preview": "Error: Cleaning Failed",
-                    "error_message": f"Sandbox Cleaning Failed: {error_details}"
+                    "error_message": f"Sandbox Cleaning Failed: {error_details}",
+                    "budget_counters": counters,
                 }
             
             # 4. Verification & Download
             # Check if cleaned file exists
             ls_check = sandbox.commands.run("ls data/cleaned_data.csv")
             if ls_check.exit_code != 0:
-                 return {
-                    "cleaning_code": code,
-                    "cleaned_data_preview": "Error: File Not Created",
-                    "error_message": f"Cleaning script finished but data/cleaned_data.csv was not found.\nLogs:\n{output_log}"
+                  return {
+                     "cleaning_code": code,
+                     "cleaned_data_preview": "Error: File Not Created",
+                     "error_message": f"Cleaning script finished but data/cleaned_data.csv was not found.\nLogs:\n{output_log}",
+                     "budget_counters": counters,
                 }
 
             # Persist DE artifact
@@ -884,10 +991,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     with open(local_cleaned_path, "wb") as f_local:
                         f_local.write(decoded)
                 else:
-                     return {
+                      return {
                         "cleaning_code": code,
                         "cleaned_data_preview": "Error: Download Failed",
-                        "error_message": f"Failed to download cleaned data: {proc.stderr}"
+                        "error_message": f"Failed to download cleaned data: {proc.stderr}",
+                        "budget_counters": counters,
                     }
 
             # Download Manifest (JSON) - Roundtrip Support
@@ -997,7 +1105,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             "csv_sep": csv_sep,
                             "csv_decimal": csv_decimal,
                             "csv_encoding": csv_encoding,
-                            "leakage_audit_summary": leakage_audit_summary
+                            "leakage_audit_summary": leakage_audit_summary,
+                            "budget_counters": counters,
                         }
                 
                 # Apply Renaming to Canonical Names
@@ -1153,23 +1262,31 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 
             except Exception as e:
                 print(f"Column Mapping Failed: {e}")
-                return {
-                     "cleaning_code": code,
-                     "cleaned_data_preview": f"Error: Mapping Failed {e}",
-                     "error_message": f"Host-side Column Mapping Failed: {str(e)}",
-                     "csv_sep": csv_sep,
-                     "csv_decimal": csv_decimal,
-                     "csv_encoding": csv_encoding,
-                     "leakage_audit_summary": leakage_audit_summary
-                }
+                    return {
+                         "cleaning_code": code,
+                         "cleaned_data_preview": f"Error: Mapping Failed {e}",
+                         "error_message": f"Host-side Column Mapping Failed: {str(e)}",
+                         "csv_sep": csv_sep,
+                         "csv_decimal": csv_decimal,
+                         "csv_encoding": csv_encoding,
+                         "leakage_audit_summary": leakage_audit_summary,
+                         "budget_counters": counters,
+                    }
 
+            if run_id:
+                log_run_event(
+                    run_id,
+                    "data_engineer_complete",
+                    {"rows": len(df_final), "columns": len(df_final.columns)},
+                )
             return {
                 "cleaning_code": code,
                 "cleaned_data_preview": preview,
                 "csv_sep": csv_sep,
                 "csv_decimal": csv_decimal,
                 "csv_encoding": csv_encoding,
-                "leakage_audit_summary": leakage_audit_summary
+                "leakage_audit_summary": leakage_audit_summary,
+                "budget_counters": counters,
             }
 
     except Exception as e:
@@ -1177,7 +1294,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
         return {
             "cleaning_code": code,
             "cleaned_data_preview": f"Error: {e}",
-            "error_message": f"System Error during Data Cleaning: {str(e)}"
+            "error_message": f"System Error during Data Cleaning: {str(e)}",
+            "budget_counters": counters,
         }
 
 def check_data_success(state: AgentState):
@@ -1199,6 +1317,20 @@ def check_data_success(state: AgentState):
 
 def run_engineer(state: AgentState) -> AgentState:
     print(f"--- [4] ML Engineer: Generating Code (Iteration {state.get('iteration_count', 0) + 1}) ---")
+    run_id = state.get("run_id")
+    ok, counters, err_msg = _consume_budget(state, "ml_calls", "max_ml_calls", "ML Engineer")
+    state["budget_counters"] = counters
+    if not ok:
+        if run_id:
+            log_run_event(run_id, "budget_exceeded", {"label": "ml_engineer", "error": err_msg})
+        return {
+            "error_message": err_msg,
+            "generated_code": "# Generation Failed",
+            "execution_output": err_msg,
+            "budget_counters": counters,
+        }
+    if run_id:
+        log_run_event(run_id, "ml_engineer_start", {"iteration": state.get("iteration_count", 0) + 1})
     
     strategy = state.get('selected_strategy')
     
@@ -1249,11 +1381,14 @@ def run_engineer(state: AgentState) -> AgentState:
         except Exception as artifact_err:
             print(f"Warning: failed to persist ml_engineer_last.py: {artifact_err}")
 
+        if run_id:
+            log_run_event(run_id, "ml_engineer_complete", {"code_len": len(code or "")})
         return {
             "selected_strategy": strategy,
             "generated_code": code,
             "last_generated_code": code, # Update for next patch
             "ml_data_path": data_path,
+            "budget_counters": counters,
         }
     except Exception as e:
         msg = f"CRITICAL: ML Engineer crashed in host: {str(e)}"
@@ -1261,7 +1396,8 @@ def run_engineer(state: AgentState) -> AgentState:
         return {
             "error_message": msg,
             "generated_code": "# Generation Failed",
-            "execution_output": msg
+            "execution_output": msg,
+            "budget_counters": counters,
         }
 
 def check_engineer_success(state: AgentState):
@@ -1285,6 +1421,20 @@ def check_postmortem_action(state: AgentState):
 
 def run_reviewer(state: AgentState) -> AgentState:
     print("--- REVIEWER AGENT ---")
+    run_id = state.get("run_id")
+    ok, counters, err_msg = _consume_budget(state, "reviewer_calls", "max_reviewer_calls", "Reviewer")
+    state["budget_counters"] = counters
+    if not ok:
+        if run_id:
+            log_run_event(run_id, "budget_exceeded", {"label": "reviewer", "error": err_msg})
+        return {
+            "review_verdict": "REJECTED",
+            "review_feedback": err_msg,
+            "error_message": err_msg,
+            "budget_counters": counters,
+        }
+    if run_id:
+        log_run_event(run_id, "reviewer_start", {})
     
     code = state['generated_code']
     current_iter = state.get('reviewer_iteration', 0)
@@ -1324,33 +1474,38 @@ def run_reviewer(state: AgentState) -> AgentState:
             # 1. Critical API Error
             if "Reviewer unavailable" in review['feedback']:
                  msg = f"CRITICAL SYSTEM FAILURE: {review['feedback']}"
-                 return {
-                     "review_verdict": "REJECTED",
-                     "review_feedback": review['feedback'],
-                     "feedback_history": new_history,
-                     "reviewer_iteration": current_iter + 1,
-                     "review_abort_reason": msg
-                 }
+                  return {
+                      "review_verdict": "REJECTED",
+                      "review_feedback": review['feedback'],
+                      "feedback_history": new_history,
+                      "reviewer_iteration": current_iter + 1,
+                      "review_abort_reason": msg,
+                      "budget_counters": counters,
+                  }
 
             # 2. Reject Streak Exceeded (Avoid infinite loop on bad code)
             if streak >= 3:
                  msg = f"CRITICAL: Code review failed {streak} times in a row. Aborting to avoid loops."
                  print(msg)
-                 return {
-                     "review_verdict": "REJECTED",
-                     "review_feedback": review['feedback'],
-                     "feedback_history": new_history,
-                     "reviewer_iteration": current_iter + 1,
-                     "review_abort_reason": msg
-                 }
+                  return {
+                      "review_verdict": "REJECTED",
+                      "review_feedback": review['feedback'],
+                      "feedback_history": new_history,
+                      "reviewer_iteration": current_iter + 1,
+                      "review_abort_reason": msg,
+                      "budget_counters": counters,
+                  }
 
+        if run_id:
+            log_run_event(run_id, "reviewer_complete", {"status": review.get("status")})
         return {
             "review_verdict": review['status'],
             "review_feedback": review['feedback'],
             "feedback_history": new_history,
             "reviewer_iteration": current_iter + 1,
             "last_gate_context": gate_context,
-            "review_reject_streak": streak
+            "review_reject_streak": streak,
+            "budget_counters": counters,
         }
 
     except Exception as e:
@@ -1361,11 +1516,26 @@ def run_reviewer(state: AgentState) -> AgentState:
             "review_feedback": msg,
             "feedback_history": new_history,
             "reviewer_iteration": current_iter + 1,
-            "error_message": msg
+            "error_message": msg,
+            "budget_counters": counters,
         }
 
 def run_qa_reviewer(state: AgentState) -> AgentState:
     print("--- QA REVIEWER AGENT ---")
+    run_id = state.get("run_id")
+    ok, counters, err_msg = _consume_budget(state, "qa_calls", "max_qa_calls", "QA Reviewer")
+    state["budget_counters"] = counters
+    if not ok:
+        if run_id:
+            log_run_event(run_id, "budget_exceeded", {"label": "qa_reviewer", "error": err_msg})
+        return {
+            "review_verdict": "REJECTED",
+            "review_feedback": err_msg,
+            "error_message": err_msg,
+            "budget_counters": counters,
+        }
+    if run_id:
+        log_run_event(run_id, "qa_reviewer_start", {})
     code = state['generated_code']
     strategy = state.get('selected_strategy', {})
     business_objective = state.get('business_objective', '')
@@ -1417,28 +1587,33 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             # QA Fail Safe
             if streak >= 5:
                  msg = f"CRITICAL: QA Rejected code {streak} times consecutively. Quality Standard not met."
-                 return {
-                     "review_verdict": "REJECTED",
-                     "review_feedback": feedback,
-                     "feedback_history": current_history,
-                     "error_message": msg,
-                     "last_gate_context": gate_context,
-                     "qa_reject_streak": streak
-                 }
+                  return {
+                      "review_verdict": "REJECTED",
+                      "review_feedback": feedback,
+                      "feedback_history": current_history,
+                      "error_message": msg,
+                      "last_gate_context": gate_context,
+                      "qa_reject_streak": streak,
+                      "budget_counters": counters,
+                  }
             
             return {
                 "review_verdict": "REJECTED", # Mark as rejected to trigger retry
                 "review_feedback": feedback,
                 "feedback_history": current_history,
                 "last_gate_context": gate_context,
-                "qa_reject_streak": streak
+                "qa_reject_streak": streak,
+                "budget_counters": counters,
             }
             
+        if run_id:
+            log_run_event(run_id, "qa_reviewer_complete", {"status": status})
         return {
             "review_verdict": "APPROVED",
             "feedback_history": current_history,
             "last_gate_context": gate_context,
-            "qa_reject_streak": streak
+            "qa_reject_streak": streak,
+            "budget_counters": counters,
         }
 
     except Exception as e:
@@ -1448,7 +1623,8 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             "review_verdict": "REJECTED",
             "review_feedback": msg,
             "feedback_history": current_history,
-            "error_message": msg
+            "error_message": msg,
+            "budget_counters": counters,
         }
 
 def run_ml_preflight(state: AgentState) -> AgentState:
@@ -1555,6 +1731,15 @@ def check_review(state: AgentState):
 
 def execute_code(state: AgentState) -> AgentState:
     print("--- [5] System: Executing Code (E2B Sandbox) ---")
+    run_id = state.get("run_id")
+    ok, counters, err_msg = _consume_budget(state, "execution_calls", "max_execution_calls", "Execution")
+    state["budget_counters"] = counters
+    if not ok:
+        if run_id:
+            log_run_event(run_id, "budget_exceeded", {"label": "execution", "error": err_msg})
+        return {"error_message": err_msg, "execution_output": err_msg, "budget_counters": counters}
+    if run_id:
+        log_run_event(run_id, "execution_start", {})
     code = state['generated_code']
     
     # 0. Static Safety Scan
@@ -1562,7 +1747,7 @@ def execute_code(state: AgentState) -> AgentState:
     if not is_safe:
         failure_reason = "CRITICAL: Security Violations:\n" + "\n".join(violations)
         print(f"🚫 Security Block: {failure_reason}")
-        return {"error_message": failure_reason, "execution_output": failure_reason}
+        return {"error_message": failure_reason, "execution_output": failure_reason, "budget_counters": counters}
 
     # Dependency allowlist precheck
     contract = state.get("execution_contract", {}) or {}
@@ -1573,13 +1758,13 @@ def execute_code(state: AgentState) -> AgentState:
         msg = f"EXECUTION ERROR: DEPENDENCY_BLOCKED banned imports: {banned}"
         fh = list(state.get("feedback_history", []))
         fh.append(f"DEPENDENCY_BLOCKED: {banned}")
-        return {"error_message": msg, "execution_output": msg, "feedback_history": fh}
+        return {"error_message": msg, "execution_output": msg, "feedback_history": fh, "budget_counters": counters}
     if dep_result.get("blocked"):
         blocked = ", ".join(dep_result["blocked"])
         msg = f"EXECUTION ERROR: DEPENDENCY_BLOCKED imports not in allowlist: {blocked}"
         fh = list(state.get("feedback_history", []))
         fh.append(f"DEPENDENCY_BLOCKED: {blocked}")
-        return {"error_message": msg, "execution_output": msg, "feedback_history": fh}
+        return {"error_message": msg, "execution_output": msg, "feedback_history": fh, "budget_counters": counters}
 
     # 0b. Undefined name preflight (avoid sandbox NameError)
     undefined = detect_undefined_names(code)
@@ -1599,7 +1784,7 @@ def execute_code(state: AgentState) -> AgentState:
         api_key = os.getenv("E2B_API_KEY")
         if not api_key:
             msg = "CRITICAL: E2B_API_KEY missing in .env file."
-            return {"error_message": msg, "execution_output": msg}
+            return {"error_message": msg, "execution_output": msg, "budget_counters": counters}
         os.environ["E2B_API_KEY"] = api_key 
         
         with Sandbox.create() as sandbox:
@@ -1794,6 +1979,16 @@ def execute_code(state: AgentState) -> AgentState:
     except Exception as oc_err:
         print(f"Warning: failed to persist output_contract_report.json: {oc_err}")
 
+    if run_id:
+        log_run_event(
+            run_id,
+            "execution_complete",
+            {
+                "plots": len(plots_local),
+                "has_error": bool(error_in_output),
+                "output_missing": len(oc_report.get("missing", [])) if isinstance(oc_report, dict) else None,
+            },
+        )
     return {
         "execution_output": output,
         "plots_local": plots_local,
@@ -1801,7 +1996,8 @@ def execute_code(state: AgentState) -> AgentState:
         "execution_attempt": state.get('execution_attempt', 0) + 1,
         "last_runtime_error_tail": runtime_tail,
         "ml_skipped_reason": ml_skipped_reason,
-        "output_contract_report": oc_report
+        "output_contract_report": oc_report,
+        "budget_counters": counters,
     }
 
 def retry_handler(state: AgentState) -> AgentState:
@@ -1827,6 +2023,9 @@ def retry_handler(state: AgentState) -> AgentState:
     
 def run_result_evaluator(state: AgentState) -> AgentState:
     print("--- [5.5] Reviewer: Evaluating Results ---")
+    run_id = state.get("run_id")
+    if run_id:
+        log_run_event(run_id, "result_evaluator_start", {})
     
     execution_output = state.get('execution_output', '')
     if "Traceback" in execution_output:
@@ -1914,6 +2113,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     }
     if status == "NEEDS_IMPROVEMENT":
         result_state["iteration_count"] = state.get("iteration_count", 0) + 1
+    if run_id:
+        log_run_event(run_id, "result_evaluator_complete", {"status": status})
     return result_state
 
 def check_execution_status(state: AgentState):
@@ -1972,6 +2173,9 @@ def check_evaluation(state: AgentState):
 
 def run_translator(state: AgentState) -> AgentState:
     print("--- [6] Translator: Generating Report ---")
+    run_id = state.get("run_id")
+    if run_id:
+        log_run_event(run_id, "translator_start", {})
     
     # Handle Failure Case
     # Handle Failure Case
@@ -2011,11 +2215,38 @@ def run_translator(state: AgentState) -> AgentState:
         Please check the logs for more details.
         """
         
+    try:
+        write_governance_report(state)
+        summary = build_run_summary(state)
+        try:
+            os.makedirs("data", exist_ok=True)
+            with open("data/run_summary.json", "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2)
+        except Exception:
+            pass
+        fingerprint = state.get("dataset_fingerprint")
+        if fingerprint:
+            record_dataset_memory(
+                {
+                    "fingerprint": fingerprint,
+                    "run_id": state.get("run_id"),
+                    "status": summary.get("status"),
+                    "failed_gates": summary.get("failed_gates", []),
+                }
+            )
+        if run_id:
+            finalize_run_log(run_id, summary)
+            log_run_event(run_id, "translator_complete", {"report_len": len(report or "")})
+    except Exception:
+        pass
     return {"final_report": report}
 
 
 def run_postmortem(state: AgentState) -> AgentState:
     print("--- [POSTMORTEM] Tech Lead Decision ---")
+    run_id = state.get("run_id")
+    if run_id:
+        log_run_event(run_id, "postmortem_start", {})
     # Load integrity audit issues if available
     integrity_issues = []
     try:
@@ -2054,6 +2285,8 @@ def run_postmortem(state: AgentState) -> AgentState:
             json.dump(decision, f, indent=2)
     except Exception as err:
         print(f"Warning: failed to persist postmortem_decision.json: {err}")
+    if run_id:
+        log_run_event(run_id, "postmortem_complete", {"action": decision.get("action")})
 
     # Build state patch
     new_state = {}
