@@ -64,7 +64,8 @@ class DataEngineerAgent:
         - Encoding: '$csv_encoding' | Sep: '$csv_sep' | Decimal: '$csv_decimal'
         - Business Objective: "$business_objective"
         - Required Columns (Strategy): $required_columns
-        - Execution Contract (json): $execution_contract_json
+        - Execution Contract (json): $execution_contract_json (for reasoning; do not inline raw JSON into Python code)
+        - If you must reference the contract in code, read it from data/execution_contract.json and ensure JSON nulls are not treated as Python names.
         - ROLE RUNBOOK (Data Engineer): $data_engineer_runbook (you MUST adhere to goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist)
 
         *** DATA AUDIT ***

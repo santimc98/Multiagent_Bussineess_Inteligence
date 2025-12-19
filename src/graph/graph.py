@@ -236,6 +236,21 @@ def manifest_dump_missing_default(code: str) -> bool:
                 return True
     return False
 
+def contains_json_null_literal(code: str) -> bool:
+    """
+    Detects use of JSON literal `null` in Python code (likely from copied JSON).
+    """
+    import io
+    import tokenize
+    try:
+        tokens = tokenize.generate_tokens(io.StringIO(code).readline)
+    except Exception:
+        return False
+    for tok in tokens:
+        if tok.type == tokenize.NAME and tok.string == "null":
+            return True
+    return False
+
 def ml_quality_preflight(code: str) -> List[str]:
     """
     Static ML quality checks to prevent QA loops before reviewer/sandbox.
@@ -820,6 +835,30 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "budget_counters": counters,
         }
 
+    if contains_json_null_literal(code):
+        if not state.get("de_json_literal_retry_done"):
+            new_state = dict(state)
+            new_state["de_json_literal_retry_done"] = True
+            override = state.get("data_summary", "")
+            try:
+                override += (
+                    "\n\nCONTRACT_LITERAL_GUARD: Do not inline raw JSON into Python code. "
+                    "JSON literals like null/true/false are invalid identifiers in Python. "
+                    "If you need the execution contract, read it from data/execution_contract.json "
+                    "or use Python-native values."
+                )
+            except Exception:
+                pass
+            new_state["data_engineer_audit_override"] = override
+            print("Contract literal guard triggered: retrying Data Engineer with safety instructions.")
+            return run_data_engineer(new_state)
+        return {
+            "cleaning_code": code,
+            "cleaned_data_preview": "Error: Contract Literal Guard",
+            "error_message": "CRITICAL: JSON literals (null/true/false) found in Python code.",
+            "budget_counters": counters,
+        }
+
     # Manifest serialization guard: ensure json.dump uses default=
     if manifest_dump_missing_default(code):
         if not state.get("de_manifest_retry_done"):
@@ -895,7 +934,16 @@ def run_data_engineer(state: AgentState) -> AgentState:
             print(f"Uploading {csv_path} to sandbox...")
             with open(csv_path, "rb") as f:
                 sandbox.files.write("data/raw.csv", f)
-            
+
+            # 2.5 Upload Execution Contract (best-effort)
+            local_contract_path = "data/execution_contract.json"
+            if os.path.exists(local_contract_path):
+                try:
+                    with open(local_contract_path, "rb") as f:
+                        sandbox.files.write("data/execution_contract.json", f)
+                except Exception as contract_err:
+                    print(f"Warning: failed to upload execution_contract.json: {contract_err}")
+
             # 3. Execute Cleaning
             print("Executing Cleaning Script in Sandbox...")
             execution = sandbox.run_code(code)

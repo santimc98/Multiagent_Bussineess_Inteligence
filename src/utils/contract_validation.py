@@ -35,6 +35,7 @@ DEFAULT_DATA_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "If conversion yields too many NaN, revert and log instead of dropping required columns.",
         "If derived columns are required, confirm source inputs exist and document any NA handling assumptions.",
         "When checking dtype on a selected column, handle duplicate labels consistently and log the choice.",
+        "If referencing contract/config content in code, ensure it is valid Python (JSON null/true/false must be handled).",
     ],
     "validation_checklist": [
         "Print CLEANING_VALIDATION with null_frac and range/type checks; validation must not raise.",
@@ -128,6 +129,12 @@ def ensure_role_runbooks(contract: Dict[str, Any]) -> Dict[str, Any]:
         out["must_not"] = _ensure_list_of_str(rb.get("must_not"), default.get("must_not", []))
         out["safe_idioms"] = _ensure_list_of_str(rb.get("safe_idioms"), default.get("safe_idioms", []))
         out["reasoning_checklist"] = _ensure_list_of_str(rb.get("reasoning_checklist"), default.get("reasoning_checklist", []))
+        if default.get("reasoning_checklist") and out.get("reasoning_checklist") is not None:
+            merged = list(out["reasoning_checklist"])
+            for item in default.get("reasoning_checklist", []):
+                if item not in merged:
+                    merged.append(item)
+            out["reasoning_checklist"] = merged
         out["validation_checklist"] = _ensure_list_of_str(rb.get("validation_checklist"), default.get("validation_checklist", []))
         mr = rb.get("manifest_requirements", default.get("manifest_requirements", {}))
         out["manifest_requirements"] = mr if isinstance(mr, dict) else copy.deepcopy(default.get("manifest_requirements", {}))
