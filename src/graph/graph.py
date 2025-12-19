@@ -69,6 +69,22 @@ def _resolve_required_input_columns(contract: Dict[str, Any], strategy: Dict[str
             return [r.get("name") for r in contract_reqs if isinstance(r, dict) and r.get("source", "input") == "input" and r.get("name")]
     return strategy.get("required_columns", []) if strategy else []
 
+def _resolve_contract_columns(contract: Dict[str, Any], sources: set[str] | None = None) -> List[str]:
+    if not contract or not isinstance(contract, dict):
+        return []
+    reqs = contract.get("data_requirements", []) or []
+    out: List[str] = []
+    for req in reqs:
+        if not isinstance(req, dict):
+            continue
+        name = req.get("name")
+        if not name:
+            continue
+        source = req.get("source", "input") or "input"
+        if sources is None or source in sources:
+            out.append(name)
+    return out
+
 def _ensure_scored_rows_output(contract: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(contract, dict):
         return {}
@@ -895,8 +911,10 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         f"Delimiter/Dialect mismatch: cleaned dataset loaded empty with sep='{csv_sep}', decimal='{csv_decimal}', encoding='{csv_encoding}'."
                     )
                 contract = state.get("execution_contract", {}) or {}
-                required_cols = _resolve_required_input_columns(contract, selected)
-                cleaned_columns_set = set(df.columns.str.lower())
+    required_cols = _resolve_required_input_columns(contract, selected)
+    contract_all_cols = _resolve_contract_columns(contract)
+    contract_derived_cols = _resolve_contract_columns(contract, sources={"derived", "output"})
+    cleaned_columns_set = set(df.columns.str.lower())
                 
                 print(f"Applying Column Mapping v2 for strategy: {selected.get('title')}")
                 print(f"Required: {required_cols}")
@@ -937,6 +955,24 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 
                 # Apply Renaming to Canonical Names
                 df_mapped = df.rename(columns=mapping_result['rename_mapping'])
+
+                # Best-effort rename for derived/output columns already present
+                if contract_all_cols:
+                    existing_norm = {}
+                    for col in df_mapped.columns:
+                        normed = _norm_name(col)
+                        if normed and normed not in existing_norm:
+                            existing_norm[normed] = col
+                    derived_rename = {}
+                    for req_name in contract_all_cols:
+                        if req_name in df_mapped.columns:
+                            continue
+                        req_norm = _norm_name(req_name)
+                        match = existing_norm.get(req_norm)
+                        if match and match not in derived_rename:
+                            derived_rename[match] = req_name
+                    if derived_rename:
+                        df_mapped = df_mapped.rename(columns=derived_rename)
                 
                 # Create Synthetic Columns if needed
                 for synth in mapping_result['synthetic']:
@@ -1008,6 +1044,10 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 # Filter to only required columns (Strict output)
                 # Ensure we strictly have what we asked for, aligned by name
                 final_cols = [c for c in required_cols if c in df_mapped.columns]
+                if contract_derived_cols:
+                    for col in contract_derived_cols:
+                        if col in df_mapped.columns and col not in final_cols:
+                            final_cols.append(col)
                 if not final_cols:
                     final_cols = df_mapped.columns.tolist()
                 df_final = df_mapped[final_cols]
@@ -1378,6 +1418,24 @@ def run_ml_preflight(state: AgentState) -> AgentState:
             "feedback": feedback,
             "failed_gates": issues,
             "required_fixes": issues,
+        }
+        return {
+            "ml_preflight_failed": True,
+            "feedback_history": history,
+            "last_gate_context": gate_context,
+            "review_verdict": "REJECTED",
+            "review_feedback": feedback,
+        }
+    if manifest_dump_missing_default(code):
+        feedback = "ML_JSON_SERIALIZATION_GUARD: json.dump must use default=_json_default to serialize numpy/pandas types."
+        history = list(state.get("feedback_history", []))
+        history.append(feedback)
+        gate_context = {
+            "source": "ml_preflight",
+            "status": "REJECTED",
+            "feedback": feedback,
+            "failed_gates": ["JSON_SERIALIZATION_GUARD"],
+            "required_fixes": ["Add json.dump(..., default=_json_default) and define _json_default helper."],
         }
         return {
             "ml_preflight_failed": True,

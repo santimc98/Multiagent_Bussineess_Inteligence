@@ -136,6 +136,10 @@ class MLEngineerAgent:
           compute a comparison between baseline and Score_nuevo (e.g., correlation and mean absolute difference).
         - Print the comparison and include it in any metrics/weights output.
 
+        *** JSON SERIALIZATION SAFETY (MANDATORY) ***
+        - When writing JSON artifacts (e.g., weights.json), ALWAYS use json.dump(..., default=_json_default).
+        - Include a small helper _json_default to convert numpy/pandas types (np.generic, np.bool_, pd.Timestamp, NaN).
+
         *** TARGET & DATA GUARDRAILS (MANDATORY) ***
         - If df.empty after loading with output_dialect -> raise ValueError with dialect info.
         - If df.shape[1] == 1 AND the sole column name contains ',', ';', or '\\t' with length > 20 -> raise ValueError("Delimiter/Dialect mismatch: ...") with dialect info; DO NOT fabricate/split columns.
@@ -187,6 +191,7 @@ class MLEngineerAgent:
         - Ensure os.makedirs('static/plots', exist_ok=True) before saving plots.
         - Ensure os.makedirs('data', exist_ok=True) before saving outputs.
         - Save a per-row scored dataset to `data/scored_rows.csv` when derived outputs are present in the contract.
+        - Use json.dump(..., default=_json_default) for any JSON outputs.
         - Print a final block: `QA_SELF_CHECK: PASS` and list which checklist items were satisfied.
         - For ordinal scoring: optimize a ranking-aware loss at case level, and add regularization to avoid degenerate weights (e.g., L2 on weights and/or max-weight penalty). Enforce w>=0 and sum(w)=1.
         - Report HHI/entropy, max weight, near-zero weights, and ranking violations in stdout; save these metrics into data/weights.json.

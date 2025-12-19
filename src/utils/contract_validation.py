@@ -48,6 +48,7 @@ DEFAULT_ML_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "If derived columns exist in cleaned data, do not recompute or overwrite; only derive if missing and preserve NaNs unless the contract explicitly sets a default.",
         "If a baseline_metric exists, compare it to the computed score (e.g., correlation/MAE) and report the result.",
         "If derived outputs are present in the contract, save per-row scored output to data/scored_rows.csv.",
+        "When writing JSON artifacts, use json.dump(..., default=_json_default) to handle numpy/pandas types.",
     ],
     "must_not": [
         "Do not import sys.",
