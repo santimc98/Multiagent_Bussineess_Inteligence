@@ -192,6 +192,8 @@ class DataEngineerAgent:
         - Only enforce existence for source="input" columns. For source="derived", derive after mapping.
         - When printing validation summaries, guard None values:
           actual = str(result.get('actual_column') or 'MISSING') before slicing/formatting.
+        - When reading dtype for validation, guard duplicate column names:
+          series = df[actual_col]; if isinstance(series, pd.DataFrame), use series = series.iloc[:, 0] and log a warning.
 
         *** SCRIPT STRUCTURE ***
         1. Imports (pandas, numpy, json, os, re).

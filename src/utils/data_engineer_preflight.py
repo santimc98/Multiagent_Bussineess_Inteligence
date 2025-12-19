@@ -42,4 +42,8 @@ def data_engineer_preflight(code: str) -> List[str]:
                     "Guard actual_column when printing: use actual = str(res.get('actual_column') or 'MISSING') before slicing."
                 )
                 break
+    if "df[actual_col].dtype" in code or "df[actual_col].dtypes" in code:
+        issues.append(
+            "Guard duplicate column labels: assign series = df[actual_col]; if isinstance(series, pd.DataFrame) use series = series.iloc[:, 0] before accessing dtype."
+        )
     return issues

@@ -825,6 +825,22 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     new_state["data_engineer_audit_override"] = override
                     print("Validation print guard: retrying Data Engineer with None-safe formatting.")
                     return run_data_engineer(new_state)
+                if "AttributeError" in error_details and "DataFrame" in error_details and "dtype" in error_details:
+                    if not state.get("de_dtype_guard_retry_done"):
+                        new_state = dict(state)
+                        new_state["de_dtype_guard_retry_done"] = True
+                        override = state.get("data_summary", "")
+                        try:
+                            override += (
+                                "\n\nDUPLICATE_COLUMN_GUARD: When reading dtype, handle duplicate column labels. "
+                                "Use series = df[actual_col]; if isinstance(series, pd.DataFrame), "
+                                "use series = series.iloc[:, 0] and log a warning."
+                            )
+                        except Exception:
+                            pass
+                        new_state["data_engineer_audit_override"] = override
+                        print("Duplicate column dtype guard: retrying Data Engineer.")
+                        return run_data_engineer(new_state)
                 return {
                     "cleaning_code": code,
                     "cleaned_data_preview": "Error: Cleaning Failed",
