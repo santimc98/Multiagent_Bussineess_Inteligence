@@ -911,10 +911,10 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         f"Delimiter/Dialect mismatch: cleaned dataset loaded empty with sep='{csv_sep}', decimal='{csv_decimal}', encoding='{csv_encoding}'."
                     )
                 contract = state.get("execution_contract", {}) or {}
-    required_cols = _resolve_required_input_columns(contract, selected)
-    contract_all_cols = _resolve_contract_columns(contract)
-    contract_derived_cols = _resolve_contract_columns(contract, sources={"derived", "output"})
-    cleaned_columns_set = set(df.columns.str.lower())
+                required_cols = _resolve_required_input_columns(contract, selected)
+                contract_all_cols = _resolve_contract_columns(contract)
+                contract_derived_cols = _resolve_contract_columns(contract, sources={"derived", "output"})
+                cleaned_columns_set = set(df.columns.str.lower())
                 
                 print(f"Applying Column Mapping v2 for strategy: {selected.get('title')}")
                 print(f"Required: {required_cols}")
