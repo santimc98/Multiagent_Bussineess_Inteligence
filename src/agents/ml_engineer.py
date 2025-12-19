@@ -99,7 +99,7 @@ class MLEngineerAgent:
         - Required Features: $required_columns
         - Execution Contract (json): $execution_contract_json
         - Spec Extraction (source-of-truth): $spec_extraction_json
-        - ROLE RUNBOOK (ML Engineer): $ml_engineer_runbook (adhere to goals/must/must_not/safe_idioms)
+        - ROLE RUNBOOK (ML Engineer): $ml_engineer_runbook (adhere to goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist)
         
         *** FEASIBILITY & CAUSALITY CHECK (CRITICAL) ***
         - Before modeling, CHECK CAUSALITY TRAPS:

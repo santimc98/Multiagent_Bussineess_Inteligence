@@ -26,6 +26,14 @@ DEFAULT_DATA_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "For ratios of boolean patterns use mask.mean(); avoid sum(mask.sum()) or sum(<scalar>).",
         "Avoid double sum: never call sum(x.sum()) on a scalar; aggregate with .mean() or divide by len(mask).",
     ],
+    "reasoning_checklist": [
+        "Verify required columns after normalization/mapping; do not treat pre-mapped absence as missing.",
+        "If a numeric-looking column is typed as object/string, treat conversion as a risk before comparisons/normalization.",
+        "If normalization causes name collisions, choose deterministically and log a warning for traceability.",
+        "If conversion yields too many NaN, revert and log instead of dropping required columns.",
+        "If derived columns are required, confirm source inputs exist and document any NA handling assumptions.",
+        "When checking dtype on a selected column, handle duplicate labels consistently and log the choice.",
+    ],
     "validation_checklist": [
         "Print CLEANING_VALIDATION with null_frac and range/type checks; validation must not raise.",
         "Use norm() helper to match required columns case/spacing insensitive.",
@@ -63,6 +71,12 @@ DEFAULT_ML_ENGINEER_RUNBOOK: Dict[str, Any] = {
     "safe_idioms": [
         "For optimization/LP prefer scipy.optimize.linprog/minimize; avoid pulp/cvxpy.",
         "For fuzzy matching prefer difflib; use rapidfuzz only if contract requests dependency.",
+    ],
+    "reasoning_checklist": [
+        "Treat spec_extraction as source-of-truth; do not invent formulas, cases, or constraints.",
+        "If target_type is ordinal/ranking, avoid predictive regression as the primary objective.",
+        "Validate weight constraints and explain any regularization choices.",
+        "Ensure outputs satisfy the explicitly requested deliverables.",
     ],
     "methodology": {
         "ranking_loss": "Use ranking-aware loss for ordinal scoring when applicable.",
@@ -110,6 +124,7 @@ def ensure_role_runbooks(contract: Dict[str, Any]) -> Dict[str, Any]:
         out["must"] = _ensure_list_of_str(rb.get("must"), default.get("must", []))
         out["must_not"] = _ensure_list_of_str(rb.get("must_not"), default.get("must_not", []))
         out["safe_idioms"] = _ensure_list_of_str(rb.get("safe_idioms"), default.get("safe_idioms", []))
+        out["reasoning_checklist"] = _ensure_list_of_str(rb.get("reasoning_checklist"), default.get("reasoning_checklist", []))
         out["validation_checklist"] = _ensure_list_of_str(rb.get("validation_checklist"), default.get("validation_checklist", []))
         mr = rb.get("manifest_requirements", default.get("manifest_requirements", {}))
         out["manifest_requirements"] = mr if isinstance(mr, dict) else copy.deepcopy(default.get("manifest_requirements", {}))

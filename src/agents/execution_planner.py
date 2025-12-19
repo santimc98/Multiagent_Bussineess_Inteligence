@@ -459,12 +459,12 @@ Requirements:
   - If a required column is NOT present in the column inventory, mark source="derived" and add a data_risks note.
   - data_risks should list potential failure modes (missing columns, low variance, dialect/encoding sensitivity, sampling).
   - required_outputs should always include data/cleaned_data.csv. For scoring/weights/ranking strategies, also include data/weights.json, data/case_summary.csv, and at least one plot like static/plots/*.png. For standard classification/regression, include data/metrics.json and one plot.
-  - Include role_runbooks for data_engineer and ml_engineer with: goals, must, must_not, safe_idioms, validation_checklist, and (for DE) manifest_requirements; (for ML) methodology and outputs.
+  - Include role_runbooks for data_engineer and ml_engineer with: goals, must, must_not, safe_idioms, reasoning_checklist, validation_checklist, and (for DE) manifest_requirements; (for ML) methodology and outputs.
   - If role == "date", use expected_range=null. Do not mix numeric ranges with null (avoid [0, null]); either null or a full numeric range when appropriate.
           - COLUMN INVENTORY (detected from CSV header) to help decide source input/derived: $column_inventory
           - required_dependencies is optional; include only if strongly implied by the strategy title or data_summary. Use module names (e.g., "xgboost", "statsmodels", "pyarrow", "openpyxl"). Otherwise use [].
         - Include quality_gates (spearman_min, violations_max, inactive_share_max, max_weight_max, hhi_max, near_zero_max) and optimization_preferences (regularization + ranking_loss).
-        - Include role_runbooks as above to guide engineers with run-time safe idioms (e.g., use mask.mean() for boolean ratios; avoid sum(mask.sum())).
+        - Include role_runbooks as above to guide engineers with run-time safe idioms and reasoning checks.
   - SPEC EXTRACTION (from business_objective + strategy): include a spec_extraction object with:
     - scoring_formula: a string formula if explicitly stated, else null.
     - derived_columns: list of {name, formula, depends_on, constraints} for any explicitly described derived fields.

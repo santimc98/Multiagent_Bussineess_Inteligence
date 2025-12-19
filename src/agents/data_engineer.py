@@ -65,7 +65,7 @@ class DataEngineerAgent:
         - Business Objective: "$business_objective"
         - Required Columns (Strategy): $required_columns
         - Execution Contract (json): $execution_contract_json
-        - ROLE RUNBOOK (Data Engineer): $data_engineer_runbook (you MUST adhere to these goals/must/must_not/safe_idioms)
+        - ROLE RUNBOOK (Data Engineer): $data_engineer_runbook (you MUST adhere to goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist)
 
         *** DATA AUDIT ***
         $data_audit
