@@ -49,6 +49,10 @@ from src.utils.sandbox_deps import (
 from src.utils.case_alignment import build_case_alignment_report
 from src.utils.contract_validation import ensure_role_runbooks
 from src.utils.data_engineer_preflight import data_engineer_preflight
+from src.utils.cleaning_plan import parse_cleaning_plan, validate_cleaning_plan
+from src.utils.cleaning_executor import execute_cleaning_plan
+from src.utils.ml_plan import parse_ml_plan, validate_ml_plan
+from src.utils.ml_executor import execute_ml_plan
 from src.utils.run_logger import init_run_log, log_run_event, finalize_run_log
 from src.utils.dataset_memory import (
     fingerprint_dataset,
@@ -799,6 +803,29 @@ def run_data_engineer(state: AgentState) -> AgentState:
             f_art.write(code)
     except Exception as art_err:
         print(f"Warning: failed to persist data_engineer_last.py: {art_err}")
+
+    plan_payload = None
+    is_plan = False
+    plan_issues: List[str] = []
+    plan, _ = parse_cleaning_plan(code)
+    if plan:
+        is_plan = True
+        plan_payload = plan
+        plan_issues = validate_cleaning_plan(plan)
+        try:
+            os.makedirs("artifacts", exist_ok=True)
+            with open(os.path.join("artifacts", "data_engineer_last_plan.json"), "w", encoding="utf-8") as f_plan:
+                json.dump(plan_payload, f_plan, indent=2, ensure_ascii=False)
+        except Exception as art_err:
+            print(f"Warning: failed to persist data_engineer_last_plan.json: {art_err}")
+        if plan_issues:
+            msg = "CLEANING_PLAN_INVALID: " + "; ".join(plan_issues)
+            return {
+                "cleaning_code": code,
+                "cleaned_data_preview": "Error: Invalid Plan",
+                "error_message": msg,
+                "budget_counters": counters,
+            }
     
     # Check if generation failed
     if code.strip().startswith("# Error"):
@@ -810,61 +837,63 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "budget_counters": counters,
         }
 
-    preflight_issues = data_engineer_preflight(code)
-    if preflight_issues:
-        msg = "DATA_ENGINEER_PREFLIGHT: " + "; ".join(preflight_issues)
-        fh = list(state.get("feedback_history", []))
-        fh.append(msg)
-        lgc = {
-            "source": "data_engineer_preflight",
-            "status": "REJECTED",
-            "feedback": msg,
-            "required_fixes": preflight_issues,
-            "failed_gates": preflight_issues,
-        }
-        try:
-            print(msg)
-        except Exception:
-            pass
-        return {
-            "cleaning_code": code,
-            "cleaned_data_preview": "Preflight Failed",
-            "error_message": msg,
-            "feedback_history": fh,
-            "last_gate_context": lgc,
-            "budget_counters": counters,
-        }
-
-    # 0a. Undefined name preflight for Data Engineer code
-    undefined = detect_undefined_names(code)
-    if undefined:
-        msg = f"STATIC_PRECHECK_UNDEFINED: Undefined names detected preflight: {', '.join(undefined)}"
-        if not state.get("de_undefined_retry_done"):
-            new_state = dict(state)
-            new_state["de_undefined_retry_done"] = True
-            override = state.get("data_summary", "")
+    if not is_plan:
+        preflight_issues = data_engineer_preflight(code)
+        if preflight_issues:
+            msg = "DATA_ENGINEER_PREFLIGHT: " + "; ".join(preflight_issues)
+            fh = list(state.get("feedback_history", []))
+            fh.append(msg)
+            lgc = {
+                "source": "data_engineer_preflight",
+                "status": "REJECTED",
+                "feedback": msg,
+                "required_fixes": preflight_issues,
+                "failed_gates": preflight_issues,
+            }
             try:
-                override += (
-                    "\n\nUNDEFINED_NAME_GUARD: Ensure every referenced name is defined in the same scope. "
-                    "Avoid using variables created inside helper functions in outer scopes. "
-                    "Do not inline JSON literals (null/true/false) into Python code."
-                )
+                print(msg)
             except Exception:
                 pass
-            new_state["data_engineer_audit_override"] = override
-            print("Undefined name guard triggered: retrying Data Engineer with safety instructions.")
-            return run_data_engineer(new_state)
-        fh = list(state.get("feedback_history", []))
-        fh.append(msg)
-        return {
-            "cleaning_code": code,
-            "cleaned_data_preview": "Preflight Failed",
-            "error_message": msg,
-            "feedback_history": fh,
-            "budget_counters": counters,
-        }
+            return {
+                "cleaning_code": code,
+                "cleaned_data_preview": "Preflight Failed",
+                "error_message": msg,
+                "feedback_history": fh,
+                "last_gate_context": lgc,
+                "budget_counters": counters,
+            }
 
-    if contains_json_null_literal(code):
+    # 0a. Undefined name preflight for Data Engineer code
+    if not is_plan:
+        undefined = detect_undefined_names(code)
+        if undefined:
+            msg = f"STATIC_PRECHECK_UNDEFINED: Undefined names detected preflight: {', '.join(undefined)}"
+            if not state.get("de_undefined_retry_done"):
+                new_state = dict(state)
+                new_state["de_undefined_retry_done"] = True
+                override = state.get("data_summary", "")
+                try:
+                    override += (
+                        "\n\nUNDEFINED_NAME_GUARD: Ensure every referenced name is defined in the same scope. "
+                        "Avoid using variables created inside helper functions in outer scopes. "
+                        "Do not inline JSON literals (null/true/false) into Python code."
+                    )
+                except Exception:
+                    pass
+                new_state["data_engineer_audit_override"] = override
+                print("Undefined name guard triggered: retrying Data Engineer with safety instructions.")
+                return run_data_engineer(new_state)
+            fh = list(state.get("feedback_history", []))
+            fh.append(msg)
+            return {
+                "cleaning_code": code,
+                "cleaned_data_preview": "Preflight Failed",
+                "error_message": msg,
+                "feedback_history": fh,
+                "budget_counters": counters,
+            }
+
+    if not is_plan and contains_json_null_literal(code):
         if not state.get("de_json_literal_retry_done"):
             new_state = dict(state)
             new_state["de_json_literal_retry_done"] = True
@@ -889,7 +918,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
         }
 
     # Manifest serialization guard: ensure json.dump uses default=
-    if manifest_dump_missing_default(code):
+    if not is_plan and manifest_dump_missing_default(code):
         if not state.get("de_manifest_retry_done"):
             new_state = dict(state)
             new_state["de_manifest_retry_done"] = True
@@ -910,7 +939,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
             }
 
     # Dialect enforcement guard: ensure pd.read_csv uses provided dialect
-    dialect_issues = dialect_guard_violations(code, csv_sep, csv_decimal, csv_encoding, expected_path="data/raw.csv")
+    dialect_issues = []
+    if not is_plan:
+        dialect_issues = dialect_guard_violations(code, csv_sep, csv_decimal, csv_encoding, expected_path="data/raw.csv")
     if dialect_issues:
         if not state.get("de_dialect_retry_done"):
             new_state = dict(state)
@@ -932,7 +963,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
             }
 
     # STATIC SAFETY SCAN FOR CLEANING CODE (HARDENING)
-    is_safe, violations = scan_code_safety(code)
+    is_safe, violations = (True, [])
+    if not is_plan:
+        is_safe, violations = scan_code_safety(code)
     if not is_safe:
         failure_reason = "CRITICAL: Security Violations:\n" + "\n".join(violations)
         print(f"🚫 Security Block (Data Engineer): {failure_reason}")
@@ -945,435 +978,488 @@ def run_data_engineer(state: AgentState) -> AgentState:
 
     # Execute in E2B Sandbox
     try:
-        # load_dotenv() is called at module level or main
-        api_key = os.getenv("E2B_API_KEY")
-        if not api_key:
-            msg = "CRITICAL: E2B_API_KEY missing in .env file."
-            return {"error_message": msg, "cleaned_data_preview": "Error: Missing E2B Key", "budget_counters": counters}
-        
-        os.environ["E2B_API_KEY"] = api_key
-
-        with Sandbox.create() as sandbox:
-            # 1. Setup Environment
-            print("Installing dependencies in Sandbox...")
-            sandbox.commands.run("pip install pandas numpy")
-            sandbox.commands.run("mkdir -p data")
+        local_cleaned_path = "data/cleaned_data.csv"
+        local_manifest_path = "data/cleaning_manifest.json"
+        output_log = ""
+        if is_plan:
+            try:
+                plan_exec = dict(plan_payload or {})
+                input_cfg = plan_exec.get("input")
+                if not isinstance(input_cfg, dict):
+                    input_cfg = {}
+                input_cfg["path"] = csv_path
+                plan_exec["input"] = input_cfg
+                dialect_cfg = plan_exec.get("dialect")
+                if not isinstance(dialect_cfg, dict):
+                    dialect_cfg = {}
+                dialect_cfg.setdefault("sep", csv_sep)
+                dialect_cfg.setdefault("decimal", csv_decimal)
+                dialect_cfg.setdefault("encoding", csv_encoding)
+                plan_exec["dialect"] = dialect_cfg
+                result = execute_cleaning_plan(plan_exec, state.get("execution_contract", {}) or {})
+                local_cleaned_path = result.get("cleaned_path", local_cleaned_path)
+                local_manifest_path = result.get("manifest_path", local_manifest_path)
+                csv_sep, csv_decimal, csv_encoding, dialect_updated = get_output_dialect_from_manifest(
+                    local_manifest_path, csv_sep, csv_decimal, csv_encoding
+                )
+                if dialect_updated:
+                    print(f"Downstream dialect updated from output_dialect: sep={csv_sep}, decimal={csv_decimal}, encoding={csv_encoding}")
+            except Exception as plan_err:
+                msg = f"Host Cleaning Plan Failed: {plan_err}"
+                return {"cleaning_code": code, "cleaned_data_preview": "Error: Plan Failed", "error_message": msg, "budget_counters": counters}
+        else:
+            # load_dotenv() is called at module level or main
+            api_key = os.getenv("E2B_API_KEY")
+            if not api_key:
+                msg = "CRITICAL: E2B_API_KEY missing in .env file."
+                return {"error_message": msg, "cleaned_data_preview": "Error: Missing E2B Key", "budget_counters": counters}
             
-            # 2. Upload Raw Data
-            print(f"Uploading {csv_path} to sandbox...")
-            with open(csv_path, "rb") as f:
-                sandbox.files.write("data/raw.csv", f)
-
-            # 2.5 Upload Execution Contract (best-effort)
-            local_contract_path = "data/execution_contract.json"
-            if os.path.exists(local_contract_path):
-                try:
-                    with open(local_contract_path, "rb") as f:
-                        sandbox.files.write("data/execution_contract.json", f)
-                except Exception as contract_err:
-                    print(f"Warning: failed to upload execution_contract.json: {contract_err}")
-
-            # 3. Execute Cleaning
-            print("Executing Cleaning Script in Sandbox...")
-            execution = sandbox.run_code(code)
-            
-            # Capture Output
-            output_log = ""
-            if execution.logs.stdout: output_log += "\n".join(execution.logs.stdout)
-            if execution.logs.stderr: output_log += "\n".join(execution.logs.stderr)
-            
-            if execution.error:
-                error_details = f"{execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
-                print(f"Cleaning Failed in Sandbox: {error_details}")
-                contract = state.get("execution_contract", {}) or {}
-                derived_cols = _resolve_contract_columns(contract, sources={"derived", "output"})
-                if "Missing required columns" in error_details and derived_cols and not state.get("de_missing_derived_retry_done"):
-                    new_state = dict(state)
-                    new_state["de_missing_derived_retry_done"] = True
-                    override = state.get("data_summary", "")
+            os.environ["E2B_API_KEY"] = api_key
+    
+            with Sandbox.create() as sandbox:
+                # 1. Setup Environment
+                print("Installing dependencies in Sandbox...")
+                sandbox.commands.run("pip install pandas numpy")
+                sandbox.commands.run("mkdir -p data")
+                
+                # 2. Upload Raw Data
+                print(f"Uploading {csv_path} to sandbox...")
+                with open(csv_path, "rb") as f:
+                    sandbox.files.write("data/raw.csv", f)
+    
+                # 2.5 Upload Execution Contract (best-effort)
+                local_contract_path = "data/execution_contract.json"
+                if os.path.exists(local_contract_path):
                     try:
-                        override += (
-                            "\n\nDERIVED_COLUMN_MISSING_GUARD: "
-                            f"{derived_cols} are derived. Do not treat them as required input columns. "
-                            "Only enforce source='input' columns after canonicalization; derive the rest."
-                        )
-                    except Exception:
-                        pass
-                    new_state["data_engineer_audit_override"] = override
-                    print("Derived column missing guard: retrying Data Engineer with derived-column guidance.")
-                    return run_data_engineer(new_state)
-                if "actual_column" in error_details and "NoneType" in error_details and not state.get("de_actual_column_guard_retry_done"):
-                    new_state = dict(state)
-                    new_state["de_actual_column_guard_retry_done"] = True
-                    override = state.get("data_summary", "")
-                    try:
-                        override += (
-                            "\n\nVALIDATION_PRINT_GUARD: Use actual = str(result.get('actual_column') or 'MISSING') "
-                            "before slicing; do not subscript None."
-                        )
-                    except Exception:
-                        pass
-                    new_state["data_engineer_audit_override"] = override
-                    print("Validation print guard: retrying Data Engineer with None-safe formatting.")
-                    return run_data_engineer(new_state)
-                if "AttributeError" in error_details and "DataFrame" in error_details and "dtype" in error_details:
-                    if not state.get("de_dtype_guard_retry_done"):
+                        with open(local_contract_path, "rb") as f:
+                            sandbox.files.write("data/execution_contract.json", f)
+                    except Exception as contract_err:
+                        print(f"Warning: failed to upload execution_contract.json: {contract_err}")
+    
+                # 3. Execute Cleaning
+                print("Executing Cleaning Script in Sandbox...")
+                execution = sandbox.run_code(code)
+                
+                # Capture Output
+                output_log = ""
+                if execution.logs.stdout: output_log += "\n".join(execution.logs.stdout)
+                if execution.logs.stderr: output_log += "\n".join(execution.logs.stderr)
+                
+                if execution.error:
+                    error_details = f"{execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
+                    print(f"Cleaning Failed in Sandbox: {error_details}")
+                    contract = state.get("execution_contract", {}) or {}
+                    derived_cols = _resolve_contract_columns(contract, sources={"derived", "output"})
+                    if "Missing required columns" in error_details and derived_cols and not state.get("de_missing_derived_retry_done"):
                         new_state = dict(state)
-                        new_state["de_dtype_guard_retry_done"] = True
+                        new_state["de_missing_derived_retry_done"] = True
                         override = state.get("data_summary", "")
                         try:
                             override += (
-                                "\n\nDUPLICATE_COLUMN_GUARD: When reading dtype, handle duplicate column labels. "
-                                "Use series = df[actual_col]; if isinstance(series, pd.DataFrame), "
-                                "use series = series.iloc[:, 0] and log a warning."
+                                "\n\nDERIVED_COLUMN_MISSING_GUARD: "
+                                f"{derived_cols} are derived. Do not treat them as required input columns. "
+                                "Only enforce source='input' columns after canonicalization; derive the rest."
                             )
                         except Exception:
                             pass
                         new_state["data_engineer_audit_override"] = override
-                        print("Duplicate column dtype guard: retrying Data Engineer.")
+                        print("Derived column missing guard: retrying Data Engineer with derived-column guidance.")
                         return run_data_engineer(new_state)
-                return {
-                    "cleaning_code": code,
-                    "cleaned_data_preview": "Error: Cleaning Failed",
-                    "error_message": f"Sandbox Cleaning Failed: {error_details}",
-                    "budget_counters": counters,
-                }
-            
-            # 4. Verification & Download
-            # Check if cleaned file exists
-            ls_check = sandbox.commands.run("ls data/cleaned_data.csv")
-            if ls_check.exit_code != 0:
-                  return {
-                     "cleaning_code": code,
-                     "cleaned_data_preview": "Error: File Not Created",
-                     "error_message": f"Cleaning script finished but data/cleaned_data.csv was not found.\nLogs:\n{output_log}",
-                     "budget_counters": counters,
-                }
-
-            # Persist DE artifact
-            try:
-                os.makedirs("artifacts", exist_ok=True)
-                with open(os.path.join("artifacts", "data_engineer_last.py"), "w", encoding="utf-8") as f_art:
-                    f_art.write(code)
-            except Exception as art_err:
-                print(f"Warning: failed to persist data_engineer_last.py: {art_err}")
-
-            # Download Result (CSV)
-            print("Downloading cleaned data...")
-            local_cleaned_path = "data/cleaned_data.csv"
-            os.makedirs("data", exist_ok=True)
-            
-            try:
-                # Try standard download
-                with open(local_cleaned_path, "wb") as f_local:
-                    remote_bytes = sandbox.files.read("data/cleaned_data.csv")
-                    f_local.write(remote_bytes)
-            except Exception as dl_err:
-                print(f"Standard download failed ({dl_err}), trying Base64 fallback...")
-                proc = sandbox.commands.run("base64 -w 0 data/cleaned_data.csv")
-                if proc.exit_code == 0:
-                    b64_content = proc.stdout.strip()
-                    decoded = base64.b64decode(b64_content)
-                    with open(local_cleaned_path, "wb") as f_local:
-                        f_local.write(decoded)
-                else:
-                      return {
+                    if "actual_column" in error_details and "NoneType" in error_details and not state.get("de_actual_column_guard_retry_done"):
+                        new_state = dict(state)
+                        new_state["de_actual_column_guard_retry_done"] = True
+                        override = state.get("data_summary", "")
+                        try:
+                            override += (
+                                "\n\nVALIDATION_PRINT_GUARD: Use actual = str(result.get('actual_column') or 'MISSING') "
+                                "before slicing; do not subscript None."
+                            )
+                        except Exception:
+                            pass
+                        new_state["data_engineer_audit_override"] = override
+                        print("Validation print guard: retrying Data Engineer with None-safe formatting.")
+                        return run_data_engineer(new_state)
+                    if "AttributeError" in error_details and "DataFrame" in error_details and "dtype" in error_details:
+                        if not state.get("de_dtype_guard_retry_done"):
+                            new_state = dict(state)
+                            new_state["de_dtype_guard_retry_done"] = True
+                            override = state.get("data_summary", "")
+                            try:
+                                override += (
+                                    "\n\nDUPLICATE_COLUMN_GUARD: When reading dtype, handle duplicate column labels. "
+                                    "Use series = df[actual_col]; if isinstance(series, pd.DataFrame), "
+                                    "use series = series.iloc[:, 0] and log a warning."
+                                )
+                            except Exception:
+                                pass
+                            new_state["data_engineer_audit_override"] = override
+                            print("Duplicate column dtype guard: retrying Data Engineer.")
+                            return run_data_engineer(new_state)
+                    return {
                         "cleaning_code": code,
-                        "cleaned_data_preview": "Error: Download Failed",
-                        "error_message": f"Failed to download cleaned data: {proc.stderr}",
+                        "cleaned_data_preview": "Error: Cleaning Failed",
+                        "error_message": f"Sandbox Cleaning Failed: {error_details}",
                         "budget_counters": counters,
                     }
-
-            # Download Manifest (JSON) - Roundtrip Support
-            print("Downloading cleaning manifest...")
-            local_manifest_path = "data/cleaning_manifest.json"
-            try:
-                # Try standard download
-                with open(local_manifest_path, "wb") as f_local:
-                    remote_bytes = sandbox.files.read("data/cleaning_manifest.json")
-                    f_local.write(remote_bytes)
-            except Exception:
-                # Fallback Base64
-                proc = sandbox.commands.run("base64 -w 0 data/cleaning_manifest.json")
-                if proc.exit_code == 0:
-                    b64_content = proc.stdout.strip()
-                    decoded = base64.b64decode(b64_content)
-                    with open(local_manifest_path, "wb") as f_local:
-                        f_local.write(decoded)
-                else:
-                    print("Warning: Manifest download failed (not found?). Creating default.")
-                    # Create default manifest if missing
-                    import json
-                    default_manifest = {
-                        "input_dialect": {"encoding": csv_encoding, "sep": csv_sep, "decimal": csv_decimal},
-                        "output_dialect": {"encoding": "utf-8", "sep": ",", "decimal": "."},
-                        "generated_by": "Host Fallback"
+                
+                # 4. Verification & Download
+                # Check if cleaned file exists
+                ls_check = sandbox.commands.run("ls data/cleaned_data.csv")
+                if ls_check.exit_code != 0:
+                      return {
+                         "cleaning_code": code,
+                         "cleaned_data_preview": "Error: File Not Created",
+                         "error_message": f"Cleaning script finished but data/cleaned_data.csv was not found.\nLogs:\n{output_log}",
+                         "budget_counters": counters,
                     }
-                    with open(local_manifest_path, "w") as f_def:
-                        json.dump(default_manifest, f_def)
-            try:
-                os.makedirs("artifacts", exist_ok=True)
-                with open(os.path.join("artifacts", "cleaning_manifest_last.json"), "wb") as f_copy:
-                    with open(local_manifest_path, "rb") as f_src:
-                        f_copy.write(f_src.read())
-            except Exception as copy_err:
-                print(f"Warning: failed to persist cleaning_manifest_last.json: {copy_err}")
-
-            print("Cleaning Success (Artifacts Downloaded).")
-
-            # Apply output_dialect for downstream reads
-            csv_sep, csv_decimal, csv_encoding, dialect_updated = get_output_dialect_from_manifest(
-                local_manifest_path, csv_sep, csv_decimal, csv_encoding
-            )
-            if dialect_updated:
-                print(f"Downstream dialect updated from output_dialect: sep={csv_sep}, decimal={csv_decimal}, encoding={csv_encoding}")
-
-            # --- HOST-SIDE COLUMN MAPPING PROTOCOL v2 ---
-            import pandas as pd
-            import json
-            from src.utils.column_mapping import build_mapping
-            from src.utils.cleaning_validation import (
-                normalize_manifest,
-                load_json,
-                detect_destructive_drop,
-                format_patch_instructions,
-            )
-            
-            try:
-                df = pd.read_csv(
-                    local_cleaned_path,
-                    sep=csv_sep,
-                    decimal=csv_decimal,
-                    encoding=csv_encoding
-                )
-                assert_not_single_column_delimiter_mismatch(df, csv_sep, csv_decimal, csv_encoding)
-                if df.empty:
-                    raise ValueError(
-                        f"Delimiter/Dialect mismatch: cleaned dataset loaded empty with sep='{csv_sep}', decimal='{csv_decimal}', encoding='{csv_encoding}'."
-                    )
-                contract = state.get("execution_contract", {}) or {}
-                required_cols = _resolve_required_input_columns(contract, selected)
-                contract_all_cols = _resolve_contract_columns(contract)
-                contract_derived_cols = _resolve_contract_columns(contract, sources={"derived", "output"})
-                cleaned_columns_set = set(df.columns.str.lower())
+    
+                # Persist DE artifact
+                try:
+                    os.makedirs("artifacts", exist_ok=True)
+                    with open(os.path.join("artifacts", "data_engineer_last.py"), "w", encoding="utf-8") as f_art:
+                        f_art.write(code)
+                except Exception as art_err:
+                    print(f"Warning: failed to persist data_engineer_last.py: {art_err}")
+    
+                # Download Result (CSV)
+                print("Downloading cleaned data...")
+                local_cleaned_path = "data/cleaned_data.csv"
+                os.makedirs("data", exist_ok=True)
                 
-                print(f"Applying Column Mapping v2 for strategy: {selected.get('title')}")
-                print(f"Required: {required_cols}")
-                
-                mapping_result = build_mapping(required_cols, df.columns.tolist())
-                
-                # Check for Missing Critical Columns (input only)
-                if mapping_result['missing']:
-                    missing_cols = mapping_result['missing']
-                    missing_input = [m for m in missing_cols]
-                    if missing_input:
-                        alias_conflicts = [req for req, meta in mapping_result.get("summary", {}).items() if meta.get("method") == "alias_conflict"]
-                        manifest_raw = normalize_manifest(load_json(local_manifest_path))
-                        issues = detect_destructive_drop(
-                            manifest_raw,
-                            missing_input,
-                            csv_path,
-                            input_dialect
-                        )
-                        if issues and not state.get("de_destructive_retry_done"):
-                            patch = format_patch_instructions(issues)
-                            new_state = dict(state)
-                            new_state["de_destructive_retry_done"] = True
-                            new_state["data_engineer_audit_override"] = state.get("data_summary", "") + "\n\n" + patch
-                            print("⚠️ DESTRUCTIVE_CONVERSION_GUARD: retrying Data Engineer once with patch instructions.")
-                            return run_data_engineer(new_state)
-                        conflict_msg = f" Alias conflicts: {alias_conflicts}" if alias_conflicts else ""
-                        failure_msg = f"CRITICAL: Missing required columns after mapping: {missing_input}.{conflict_msg} Cleaning failed to provide necessary features."
-                        return {
+                try:
+                    # Try standard download
+                    with open(local_cleaned_path, "wb") as f_local:
+                        remote_bytes = sandbox.files.read("data/cleaned_data.csv")
+                        f_local.write(remote_bytes)
+                except Exception as dl_err:
+                    print(f"Standard download failed ({dl_err}), trying Base64 fallback...")
+                    proc = sandbox.commands.run("base64 -w 0 data/cleaned_data.csv")
+                    if proc.exit_code == 0:
+                        b64_content = proc.stdout.strip()
+                        decoded = base64.b64decode(b64_content)
+                        with open(local_cleaned_path, "wb") as f_local:
+                            f_local.write(decoded)
+                    else:
+                          return {
                             "cleaning_code": code,
-                            "cleaned_data_preview": "Error: Missing Columns",
-                            "error_message": failure_msg,
-                            "csv_sep": csv_sep,
-                            "csv_decimal": csv_decimal,
-                            "csv_encoding": csv_encoding,
-                            "leakage_audit_summary": leakage_audit_summary,
+                            "cleaned_data_preview": "Error: Download Failed",
+                            "error_message": f"Failed to download cleaned data: {proc.stderr}",
                             "budget_counters": counters,
                         }
-                
-                # Apply Renaming to Canonical Names
-                df_mapped = df.rename(columns=mapping_result['rename_mapping'])
-
-                # Best-effort rename for derived/output columns already present
-                if contract_all_cols:
-                    existing_norm = {}
-                    for col in df_mapped.columns:
-                        normed = _norm_name(col)
-                        if normed and normed not in existing_norm:
-                            existing_norm[normed] = col
-                    derived_rename = {}
-                    for req_name in contract_all_cols:
-                        if req_name in df_mapped.columns:
-                            continue
-                        req_norm = _norm_name(req_name)
-                        match = existing_norm.get(req_norm)
-                        if match and match not in derived_rename:
-                            derived_rename[match] = req_name
-                    if derived_rename:
-                        df_mapped = df_mapped.rename(columns=derived_rename)
-
-                # Guard: derived columns should not be constant if present
-                derived_issues = []
-                if contract_derived_cols:
-                    col_by_norm = {_norm_name(c): c for c in df_mapped.columns}
-                    for derived_name in contract_derived_cols:
-                        norm_name = _norm_name(derived_name)
-                        actual_name = col_by_norm.get(norm_name)
-                        if not actual_name:
-                            continue
-                        nunique = df_mapped[actual_name].nunique(dropna=False)
-                        if nunique <= 1:
-                            derived_issues.append(f"{derived_name} has no variance (nunique={nunique})")
-                if derived_issues:
-                    if not state.get("de_derived_guard_retry_done"):
-                        new_state = dict(state)
-                        new_state["de_derived_guard_retry_done"] = True
-                        override = state.get("data_summary", "")
-                        try:
-                            override += (
-                                "\n\nDERIVED_COLUMN_GUARD: "
-                                + "; ".join(derived_issues)
-                                + ". Ensure derived columns use normalized column mapping "
-                                "to access source columns and do not default all rows."
-                            )
-                        except Exception:
-                            pass
-                        new_state["data_engineer_audit_override"] = override
-                        print("Derived column guard: retrying Data Engineer with mapping guidance.")
-                        return run_data_engineer(new_state)
-                    else:
-                        return {
-                            "cleaning_code": code,
-                            "cleaned_data_preview": "Error: Derived Columns Constant",
-                            "error_message": "CRITICAL: Derived columns present but constant; verify mapping and derivation.",
-                        }
-                
-                # Create Synthetic Columns if needed
-                for synth in mapping_result['synthetic']:
-                    print(f"Creating Synthetic Column: {synth} (0.0)")
-                    df_mapped[synth] = 0.0
-
-                # Integrity audit only (no auto-fix)
-                feature_flags = {}
-                feature_stats = {}
-                contract = state.get("execution_contract", {})
+    
+                # Download Manifest (JSON) - Roundtrip Support
+                print("Downloading cleaning manifest...")
+                local_manifest_path = "data/cleaning_manifest.json"
                 try:
-                    contract_for_audit = _filter_input_contract(contract)
-                    issues, stats = run_integrity_audit(df_mapped, contract_for_audit)
-                    feature_stats = stats
-                    os.makedirs("data", exist_ok=True)
-                    with open("data/integrity_audit_report.json", "w", encoding="utf-8") as f:
-                        json.dump({"issues": issues, "stats": stats}, f, indent=2)
-                    critical = [i for i in issues if i.get("severity") == "critical"]
-                    if critical and not state.get("integrity_retry_done"):
+                    # Try standard download
+                    with open(local_manifest_path, "wb") as f_local:
+                        remote_bytes = sandbox.files.read("data/cleaning_manifest.json")
+                        f_local.write(remote_bytes)
+                except Exception:
+                    # Fallback Base64
+                    proc = sandbox.commands.run("base64 -w 0 data/cleaning_manifest.json")
+                    if proc.exit_code == 0:
+                        b64_content = proc.stdout.strip()
+                        decoded = base64.b64decode(b64_content)
+                        with open(local_manifest_path, "wb") as f_local:
+                            f_local.write(decoded)
+                    else:
+                        print("Warning: Manifest download failed (not found?). Creating default.")
+                        # Create default manifest if missing
+                        import json
+                        default_manifest = {
+                            "input_dialect": {"encoding": csv_encoding, "sep": csv_sep, "decimal": csv_decimal},
+                            "output_dialect": {"encoding": "utf-8", "sep": ",", "decimal": "."},
+                            "generated_by": "Host Fallback"
+                        }
+                        with open(local_manifest_path, "w") as f_def:
+                            json.dump(default_manifest, f_def)
+                try:
+                    os.makedirs("artifacts", exist_ok=True)
+                    with open(os.path.join("artifacts", "cleaning_manifest_last.json"), "wb") as f_copy:
+                        with open(local_manifest_path, "rb") as f_src:
+                            f_copy.write(f_src.read())
+                except Exception as copy_err:
+                    print(f"Warning: failed to persist cleaning_manifest_last.json: {copy_err}")
+    
+                print("Cleaning Success (Artifacts Downloaded).")
+    
+                # Apply output_dialect for downstream reads
+                csv_sep, csv_decimal, csv_encoding, dialect_updated = get_output_dialect_from_manifest(
+                    local_manifest_path, csv_sep, csv_decimal, csv_encoding
+                )
+                if dialect_updated:
+                    print(f"Downstream dialect updated from output_dialect: sep={csv_sep}, decimal={csv_decimal}, encoding={csv_encoding}")
+    
+        if not os.path.exists(local_cleaned_path):
+            return {
+                "cleaning_code": code,
+                "cleaned_data_preview": "Error: File Not Created",
+                "error_message": f"Cleaning finished but {local_cleaned_path} was not found.\nLogs:\n{output_log}",
+                "budget_counters": counters,
+            }
+        if not os.path.exists(local_manifest_path):
+            default_manifest = {
+                "input_dialect": {"encoding": csv_encoding, "sep": csv_sep, "decimal": csv_decimal},
+                "output_dialect": {"encoding": "utf-8", "sep": ",", "decimal": "."},
+                "generated_by": "Host Fallback",
+            }
+            os.makedirs(os.path.dirname(local_manifest_path) or ".", exist_ok=True)
+            with open(local_manifest_path, "w", encoding="utf-8") as f_def:
+                json.dump(default_manifest, f_def, indent=2)
+        try:
+            os.makedirs("artifacts", exist_ok=True)
+            with open(os.path.join("artifacts", "cleaning_manifest_last.json"), "wb") as f_copy:
+                with open(local_manifest_path, "rb") as f_src:
+                    f_copy.write(f_src.read())
+        except Exception as copy_err:
+            print(f"Warning: failed to persist cleaning_manifest_last.json: {copy_err}")
+        # --- HOST-SIDE COLUMN MAPPING PROTOCOL v2 ---
+        import pandas as pd
+        import json
+        from src.utils.column_mapping import build_mapping
+        from src.utils.cleaning_validation import (
+            normalize_manifest,
+            load_json,
+            detect_destructive_drop,
+            format_patch_instructions,
+        )
+        
+        try:
+            df = pd.read_csv(
+                local_cleaned_path,
+                sep=csv_sep,
+                decimal=csv_decimal,
+                encoding=csv_encoding
+            )
+            assert_not_single_column_delimiter_mismatch(df, csv_sep, csv_decimal, csv_encoding)
+            if df.empty:
+                raise ValueError(
+                    f"Delimiter/Dialect mismatch: cleaned dataset loaded empty with sep='{csv_sep}', decimal='{csv_decimal}', encoding='{csv_encoding}'."
+                )
+            contract = state.get("execution_contract", {}) or {}
+            required_cols = _resolve_required_input_columns(contract, selected)
+            contract_all_cols = _resolve_contract_columns(contract)
+            contract_derived_cols = _resolve_contract_columns(contract, sources={"derived", "output"})
+            cleaned_columns_set = set(df.columns.str.lower())
+            
+            print(f"Applying Column Mapping v2 for strategy: {selected.get('title')}")
+            print(f"Required: {required_cols}")
+            
+            mapping_result = build_mapping(required_cols, df.columns.tolist())
+            
+            # Check for Missing Critical Columns (input only)
+            if mapping_result['missing']:
+                missing_cols = mapping_result['missing']
+                missing_input = [m for m in missing_cols]
+                if missing_input:
+                    alias_conflicts = [req for req, meta in mapping_result.get("summary", {}).items() if meta.get("method") == "alias_conflict"]
+                    manifest_raw = normalize_manifest(load_json(local_manifest_path))
+                    issues = detect_destructive_drop(
+                        manifest_raw,
+                        missing_input,
+                        csv_path,
+                        input_dialect
+                    )
+                    if issues and not state.get("de_destructive_retry_done"):
+                        patch = format_patch_instructions(issues)
                         new_state = dict(state)
-                        new_state["integrity_retry_done"] = True
-                        try:
-                            issue_text = json.dumps(issues, indent=2)
-                        except Exception:
-                            issue_text = str(issues)
-                        new_state["data_engineer_audit_override"] = state.get("data_summary", "") + "\n\nINTEGRITY_AUDIT_ISSUES:\n" + issue_text
-                        print("⚠️ INTEGRITY_AUDIT: triggering Data Engineer retry with issues context.")
+                        new_state["de_destructive_retry_done"] = True
+                        new_state["data_engineer_audit_override"] = state.get("data_summary", "") + "\n\n" + patch
+                        print("⚠️ DESTRUCTIVE_CONVERSION_GUARD: retrying Data Engineer once with patch instructions.")
                         return run_data_engineer(new_state)
-                except Exception as audit_err:
-                    print(f"Warning: integrity audit failed: {audit_err}")
+                    conflict_msg = f" Alias conflicts: {alias_conflicts}" if alias_conflicts else ""
+                    failure_msg = f"CRITICAL: Missing required columns after mapping: {missing_input}.{conflict_msg} Cleaning failed to provide necessary features."
+                    return {
+                        "cleaning_code": code,
+                        "cleaned_data_preview": "Error: Missing Columns",
+                        "error_message": failure_msg,
+                        "csv_sep": csv_sep,
+                        "csv_decimal": csv_decimal,
+                        "csv_encoding": csv_encoding,
+                        "leakage_audit_summary": leakage_audit_summary,
+                        "budget_counters": counters,
+                    }
+            
+            # Apply Renaming to Canonical Names
+            df_mapped = df.rename(columns=mapping_result['rename_mapping'])
+
+            # Best-effort rename for derived/output columns already present
+            if contract_all_cols:
+                existing_norm = {}
+                for col in df_mapped.columns:
+                    normed = _norm_name(col)
+                    if normed and normed not in existing_norm:
+                        existing_norm[normed] = col
+                derived_rename = {}
+                for req_name in contract_all_cols:
+                    if req_name in df_mapped.columns:
+                        continue
+                    req_norm = _norm_name(req_name)
+                    match = existing_norm.get(req_norm)
+                    if match and match not in derived_rename:
+                        derived_rename[match] = req_name
+                if derived_rename:
+                    df_mapped = df_mapped.rename(columns=derived_rename)
+
+            # Guard: derived columns should not be constant if present
+            derived_issues = []
+            if contract_derived_cols:
+                col_by_norm = {_norm_name(c): c for c in df_mapped.columns}
+                for derived_name in contract_derived_cols:
+                    norm_name = _norm_name(derived_name)
+                    actual_name = col_by_norm.get(norm_name)
+                    if not actual_name:
+                        continue
+                    nunique = df_mapped[actual_name].nunique(dropna=False)
+                    if nunique <= 1:
+                        derived_issues.append(f"{derived_name} has no variance (nunique={nunique})")
+            if derived_issues:
+                if not state.get("de_derived_guard_retry_done"):
+                    new_state = dict(state)
+                    new_state["de_derived_guard_retry_done"] = True
+                    override = state.get("data_summary", "")
                     try:
-                        os.makedirs("data", exist_ok=True)
-                        with open("data/integrity_audit_report.json", "w", encoding="utf-8") as f:
-                            json.dump({"error": str(audit_err)}, f, indent=2)
+                        override += (
+                            "\n\nDERIVED_COLUMN_GUARD: "
+                            + "; ".join(derived_issues)
+                            + ". Ensure derived columns use normalized column mapping "
+                            "to access source columns and do not default all rows."
+                        )
                     except Exception:
                         pass
+                    new_state["data_engineer_audit_override"] = override
+                    print("Derived column guard: retrying Data Engineer with mapping guidance.")
+                    return run_data_engineer(new_state)
+                else:
+                    return {
+                        "cleaning_code": code,
+                        "cleaned_data_preview": "Error: Derived Columns Constant",
+                        "error_message": "CRITICAL: Derived columns present but constant; verify mapping and derivation.",
+                    }
             
+            # Create Synthetic Columns if needed
+            for synth in mapping_result['synthetic']:
+                print(f"Creating Synthetic Column: {synth} (0.0)")
+                df_mapped[synth] = 0.0
+
+            # Integrity audit only (no auto-fix)
+            feature_flags = {}
+            feature_stats = {}
+            contract = state.get("execution_contract", {})
+            try:
+                contract_for_audit = _filter_input_contract(contract)
+                issues, stats = run_integrity_audit(df_mapped, contract_for_audit)
+                feature_stats = stats
+                os.makedirs("data", exist_ok=True)
+                with open("data/integrity_audit_report.json", "w", encoding="utf-8") as f:
+                    json.dump({"issues": issues, "stats": stats}, f, indent=2)
+                critical = [i for i in issues if i.get("severity") == "critical"]
+                if critical and not state.get("integrity_retry_done"):
+                    new_state = dict(state)
+                    new_state["integrity_retry_done"] = True
+                    try:
+                        issue_text = json.dumps(issues, indent=2)
+                    except Exception:
+                        issue_text = str(issues)
+                    new_state["data_engineer_audit_override"] = state.get("data_summary", "") + "\n\nINTEGRITY_AUDIT_ISSUES:\n" + issue_text
+                    print("⚠️ INTEGRITY_AUDIT: triggering Data Engineer retry with issues context.")
+                    return run_data_engineer(new_state)
+            except Exception as audit_err:
+                print(f"Warning: integrity audit failed: {audit_err}")
                 try:
                     os.makedirs("data", exist_ok=True)
-                    df_mapped.to_csv(
-                        "data/cleaned_full.csv",
-                        index=False,
-                        sep=csv_sep,
-                        decimal=csv_decimal,
-                        encoding=csv_encoding
-                    )
-                except Exception as full_save_err:
-                    print(f"Warning: failed to save cleaned_full.csv: {full_save_err}")
-
-                try:
-                    audit = run_unsupervised_numeric_relation_audit(df_mapped)
-                    with open("data/leakage_audit.json", "w", encoding="utf-8") as f:
-                        json.dump(audit, f, indent=2)
-                    findings = audit.get("relations", [])
-                    if findings:
-                        top = findings[:3]
-                        leakage_audit_summary = "; ".join(
-                            [
-                                f"{rel.get('type')}:{','.join(rel.get('columns', []))} (support={rel.get('support_frac', 0):.3f})"
-                                for rel in top
-                            ]
-                        )
-                    else:
-                        leakage_audit_summary = "No deterministic numeric relations found."
-                except Exception as audit_err:
-                    print(f"Warning: leakage audit failed: {audit_err}")
-                    leakage_audit_summary = "Leakage audit failed; proceed with caution."
-
-                # Filter to only required columns (Strict output)
-                # Ensure we strictly have what we asked for, aligned by name
-                final_cols = [c for c in required_cols if c in df_mapped.columns]
-                if contract_derived_cols:
-                    for col in contract_derived_cols:
-                        if col in df_mapped.columns and col not in final_cols:
-                            final_cols.append(col)
-                if not final_cols:
-                    final_cols = df_mapped.columns.tolist()
-                df_final = df_mapped[final_cols]
-                
-                # Save Mapped Data back to disk
-                df_final.to_csv(
-                    local_cleaned_path,
+                    with open("data/integrity_audit_report.json", "w", encoding="utf-8") as f:
+                        json.dump({"error": str(audit_err)}, f, indent=2)
+                except Exception:
+                    pass
+        
+            try:
+                os.makedirs("data", exist_ok=True)
+                df_mapped.to_csv(
+                    "data/cleaned_full.csv",
                     index=False,
                     sep=csv_sep,
                     decimal=csv_decimal,
                     encoding=csv_encoding
                 )
-                print("Mapped data saved to 'data/cleaned_data.csv'")
-                
-                # Save Summary
-                with open("data/column_mapping_summary.json", "w") as f:
-                    json.dump(mapping_result, f, indent=2)
-                    
-                preview = df_final.head(5).to_json(orient='split')
-                
-            except Exception as e:
-                print(f"Column Mapping Failed: {e}")
-                return {
-                    "cleaning_code": code,
-                    "cleaned_data_preview": f"Error: Mapping Failed {e}",
-                    "error_message": f"Host-side Column Mapping Failed: {str(e)}",
-                    "csv_sep": csv_sep,
-                    "csv_decimal": csv_decimal,
-                    "csv_encoding": csv_encoding,
-                    "leakage_audit_summary": leakage_audit_summary,
-                    "budget_counters": counters,
-                }
+            except Exception as full_save_err:
+                print(f"Warning: failed to save cleaned_full.csv: {full_save_err}")
 
-            if run_id:
-                log_run_event(
-                    run_id,
-                    "data_engineer_complete",
-                    {"rows": len(df_final), "columns": len(df_final.columns)},
-                )
+            try:
+                audit = run_unsupervised_numeric_relation_audit(df_mapped)
+                with open("data/leakage_audit.json", "w", encoding="utf-8") as f:
+                    json.dump(audit, f, indent=2)
+                findings = audit.get("relations", [])
+                if findings:
+                    top = findings[:3]
+                    leakage_audit_summary = "; ".join(
+                        [
+                            f"{rel.get('type')}:{','.join(rel.get('columns', []))} (support={rel.get('support_frac', 0):.3f})"
+                            for rel in top
+                        ]
+                    )
+                else:
+                    leakage_audit_summary = "No deterministic numeric relations found."
+            except Exception as audit_err:
+                print(f"Warning: leakage audit failed: {audit_err}")
+                leakage_audit_summary = "Leakage audit failed; proceed with caution."
+
+            # Filter to only required columns (Strict output)
+            # Ensure we strictly have what we asked for, aligned by name
+            final_cols = [c for c in required_cols if c in df_mapped.columns]
+            if contract_derived_cols:
+                for col in contract_derived_cols:
+                    if col in df_mapped.columns and col not in final_cols:
+                        final_cols.append(col)
+            if not final_cols:
+                final_cols = df_mapped.columns.tolist()
+            df_final = df_mapped[final_cols]
+            
+            # Save Mapped Data back to disk
+            df_final.to_csv(
+                local_cleaned_path,
+                index=False,
+                sep=csv_sep,
+                decimal=csv_decimal,
+                encoding=csv_encoding
+            )
+            print("Mapped data saved to 'data/cleaned_data.csv'")
+            
+            # Save Summary
+            with open("data/column_mapping_summary.json", "w") as f:
+                json.dump(mapping_result, f, indent=2)
+                
+            preview = df_final.head(5).to_json(orient='split')
+            
+        except Exception as e:
+            print(f"Column Mapping Failed: {e}")
             return {
                 "cleaning_code": code,
-                "cleaned_data_preview": preview,
+                "cleaned_data_preview": f"Error: Mapping Failed {e}",
+                "error_message": f"Host-side Column Mapping Failed: {str(e)}",
                 "csv_sep": csv_sep,
                 "csv_decimal": csv_decimal,
                 "csv_encoding": csv_encoding,
                 "leakage_audit_summary": leakage_audit_summary,
                 "budget_counters": counters,
             }
+
+        if run_id:
+            log_run_event(
+                run_id,
+                "data_engineer_complete",
+                {"rows": len(df_final), "columns": len(df_final.columns)},
+            )
+        return {
+            "cleaning_code": code,
+            "cleaned_data_preview": preview,
+            "csv_sep": csv_sep,
+            "csv_decimal": csv_decimal,
+            "csv_encoding": csv_encoding,
+            "leakage_audit_summary": leakage_audit_summary,
+            "budget_counters": counters,
+        }
 
     except Exception as e:
         print(f"Cleaning Execution Error (System): {e}")
@@ -1466,14 +1552,42 @@ def run_engineer(state: AgentState) -> AgentState:
                 f_art.write(code)
         except Exception as artifact_err:
             print(f"Warning: failed to persist ml_engineer_last.py: {artifact_err}")
+        plan_payload = None
+        plan_issues: List[str] = []
+        plan, _ = parse_ml_plan(code)
+        if plan:
+            plan_payload = plan
+            plan_issues = validate_ml_plan(plan)
+            try:
+                os.makedirs("artifacts", exist_ok=True)
+                with open(os.path.join("artifacts", "ml_engineer_last_plan.json"), "w", encoding="utf-8") as f_plan:
+                    json.dump(plan_payload, f_plan, indent=2, ensure_ascii=False)
+            except Exception as plan_err:
+                print(f"Warning: failed to persist ml_engineer_last_plan.json: {plan_err}")
+            if plan_issues:
+                msg = "ML_PLAN_INVALID: " + "; ".join(plan_issues)
+                return {
+                    "error_message": msg,
+                    "generated_code": code,
+                    "execution_output": msg,
+                    "budget_counters": counters,
+                }
 
         if run_id:
             log_run_event(run_id, "ml_engineer_complete", {"code_len": len(code or "")})
+        if str(code).strip().startswith("# Error:"):
+            return {
+                "error_message": code,
+                "generated_code": code,
+                "execution_output": code,
+                "budget_counters": counters,
+            }
         return {
             "selected_strategy": strategy,
             "generated_code": code,
             "last_generated_code": code, # Update for next patch
             "ml_data_path": data_path,
+            "ml_plan": plan_payload,
             "budget_counters": counters,
         }
     except Exception as e:
@@ -1525,6 +1639,29 @@ def run_reviewer(state: AgentState) -> AgentState:
     code = state['generated_code']
     current_iter = state.get('reviewer_iteration', 0)
     new_history = list(state.get('feedback_history', []))
+    plan = state.get("ml_plan")
+    if not plan:
+        plan, _ = parse_ml_plan(code)
+    if plan:
+        feedback = "ML plan detected; skipping code review and proceeding to execution."
+        gate_context = {
+            "source": "reviewer",
+            "status": "APPROVED",
+            "feedback": feedback,
+            "failed_gates": [],
+            "required_fixes": [],
+        }
+        if run_id:
+            log_run_event(run_id, "reviewer_complete", {"status": "APPROVED"})
+        return {
+            "review_verdict": "APPROVED",
+            "review_feedback": feedback,
+            "feedback_history": new_history,
+            "reviewer_iteration": current_iter + 1,
+            "last_gate_context": gate_context,
+            "review_reject_streak": 0,
+            "budget_counters": counters,
+        }
     
     # Context Construction
     strategy = state.get('selected_strategy', {})
@@ -1627,6 +1764,27 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
     business_objective = state.get('business_objective', '')
     
     current_history = list(state.get('feedback_history', []))
+    plan = state.get("ml_plan")
+    if not plan:
+        plan, _ = parse_ml_plan(code)
+    if plan:
+        feedback = "ML plan detected; skipping QA code audit and proceeding to execution."
+        gate_context = {
+            "source": "qa_reviewer",
+            "status": "APPROVED",
+            "feedback": feedback,
+            "failed_gates": [],
+            "required_fixes": [],
+        }
+        if run_id:
+            log_run_event(run_id, "qa_reviewer_complete", {"status": "APPROVED"})
+        return {
+            "review_verdict": "APPROVED",
+            "feedback_history": current_history,
+            "last_gate_context": gate_context,
+            "qa_reject_streak": 0,
+            "budget_counters": counters,
+        }
     
     try:
         # Run QA Audit
@@ -1716,6 +1874,11 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
 def run_ml_preflight(state: AgentState) -> AgentState:
     print("--- ML PREFLIGHT ---")
     code = state.get("generated_code", "")
+    plan = state.get("ml_plan")
+    if not plan:
+        plan, _ = parse_ml_plan(code)
+    if plan:
+        return {"ml_preflight_failed": False}
     contract = state.get("execution_contract", {}) or {}
     required_deps = contract.get("required_dependencies", []) or []
     dep_result = check_dependency_precheck(code, required_deps)
@@ -1827,6 +1990,70 @@ def execute_code(state: AgentState) -> AgentState:
     if run_id:
         log_run_event(run_id, "execution_start", {})
     code = state['generated_code']
+    plan = state.get("ml_plan")
+    if not plan:
+        plan, _ = parse_ml_plan(code)
+    if plan:
+        issues = validate_ml_plan(plan)
+        if issues:
+            msg = "ML_PLAN_INVALID: " + "; ".join(issues)
+            return {"error_message": msg, "execution_output": msg, "budget_counters": counters}
+        try:
+            plan_exec = dict(plan)
+            input_cfg = plan_exec.get("input") or {}
+            input_cfg["cleaned_path"] = state.get("ml_data_path") or input_cfg.get("cleaned_path") or "data/cleaned_data.csv"
+            input_cfg.setdefault("manifest_path", "data/cleaning_manifest.json")
+            plan_exec["input"] = input_cfg
+            dialect_cfg = plan_exec.get("dialect") or {}
+            dialect_cfg.setdefault("sep", state.get("csv_sep", ","))
+            dialect_cfg.setdefault("decimal", state.get("csv_decimal", "."))
+            dialect_cfg.setdefault("encoding", state.get("csv_encoding", "utf-8"))
+            plan_exec["dialect"] = dialect_cfg
+            result = execute_ml_plan(plan_exec, state.get("execution_contract", {}) or {})
+            output = result.get("execution_output", "ML_PLAN_EXECUTION_OK")
+            plots_local = result.get("plots", [])
+            if not plots_local and os.path.exists("data/cleaned_data.csv"):
+                try:
+                    plots_local = generate_fallback_plots(
+                        "data/cleaned_data.csv",
+                        sep=state.get("csv_sep", ","),
+                        decimal=state.get("csv_decimal", "."),
+                        encoding=state.get("csv_encoding", "utf-8"),
+                    )
+                except Exception:
+                    plots_local = plots_local
+            has_partial_visuals = len(plots_local) > 0
+
+            output_contract = state.get("execution_contract", {}).get("required_outputs", [])
+            oc_report = check_required_outputs(output_contract)
+            try:
+                os.makedirs("data", exist_ok=True)
+                with open("data/output_contract_report.json", "w", encoding="utf-8") as f:
+                    json.dump(oc_report, f, indent=2)
+            except Exception as oc_err:
+                print(f"Warning: failed to persist output_contract_report.json: {oc_err}")
+
+            if run_id:
+                log_run_event(
+                    run_id,
+                    "execution_complete",
+                    {
+                        "plots": len(plots_local),
+                        "has_error": False,
+                        "output_missing": len(oc_report.get("missing", [])) if isinstance(oc_report, dict) else None,
+                    },
+                )
+            return {
+                "execution_output": output,
+                "plots_local": plots_local,
+                "has_partial_visuals": has_partial_visuals,
+                "execution_attempt": state.get('execution_attempt', 0) + 1,
+                "output_contract_report": oc_report,
+                "budget_counters": counters,
+            }
+        except Exception as plan_err:
+            msg = f"EXECUTION ERROR: ML plan failed: {plan_err}"
+            return {"error_message": msg, "execution_output": msg, "budget_counters": counters}
     
     # 0. Static Safety Scan
     is_safe, violations = scan_code_safety(code)

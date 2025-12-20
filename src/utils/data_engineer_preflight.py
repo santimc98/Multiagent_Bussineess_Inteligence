@@ -34,6 +34,24 @@ def data_engineer_preflight(code: str) -> List[str]:
                     ):
                         issues.append("Avoid sum(x.sum()); use mask.mean() or mask.sum()/len(mask) for ratios.")
                         break
+    # Guard against any()/all() applied to a single membership test
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"any", "all"}:
+            if len(node.args) != 1:
+                continue
+            arg0 = node.args[0]
+            if not isinstance(arg0, ast.Compare):
+                continue
+            if not any(isinstance(op, (ast.In, ast.NotIn)) for op in arg0.ops):
+                continue
+            if not arg0.comparators:
+                continue
+            comp = arg0.comparators[0]
+            if isinstance(comp, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+                issues.append(
+                    "any()/all() expects an iterable; avoid passing a single membership test (it returns a bool)."
+                )
+                break
     # Guard against slicing None for actual_column in validation summaries
     if "actual_column" in code:
         for line in code.splitlines():
