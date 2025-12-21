@@ -42,6 +42,10 @@ class PostmortemAgent:
             return "Model returned a JSON plan instead of executable Python code."
         if "dialect" in lower or "read_csv" in lower:
             return "CSV dialect mismatch (sep/decimal/encoding) or missing dialect params."
+        if "target has no variance" in lower:
+            return "Target has no variance; optimization/training is not feasible."
+        if "no successful experiments executed" in lower:
+            return "Optimization failed; constraints or missingness left no viable solution."
         if "parsererror" in lower or "tokenizing data" in lower:
             return "CSV dialect/quoting mismatch; enforce detected sep/decimal/encoding."
         if "nameerror" in lower:
@@ -85,6 +89,35 @@ class PostmortemAgent:
         lines.append("FIX_GUIDANCE: Fix the root cause and regenerate the full cleaning script.")
         return "\n".join(lines)
 
+    def _build_ml_context_payload(self, context: Dict[str, Any], reason: str) -> str:
+        last_gate = context.get("last_gate_context") or {}
+        required_fixes = last_gate.get("required_fixes", [])
+        gate_feedback = last_gate.get("feedback", "")
+        err_msg = context.get("error_message", "") or ""
+        exec_out = context.get("execution_output", "") or ""
+        why = ""
+        if required_fixes:
+            why = f"Gate required fixes: {required_fixes}"
+        else:
+            why = self._infer_failure_cause(gate_feedback or err_msg or exec_out)
+        if not reason:
+            reason = err_msg or gate_feedback or "ML Engineer failure."
+        if not why:
+            why = "Unknown root cause. Inspect feature mapping, target variance, and dialect usage."
+        lines = ["POSTMORTEM_CONTEXT_FOR_ML:"]
+        if reason:
+            lines.append(f"FAILURE_SUMMARY: {reason}")
+        if why:
+            lines.append(f"WHY_IT_HAPPENED: {why}")
+        if gate_feedback:
+            lines.append(f"LAST_GATE_FEEDBACK: {gate_feedback}")
+        if err_msg:
+            lines.append(f"ERROR_MESSAGE: {err_msg}")
+        if exec_out:
+            lines.append(f"EXECUTION_OUTPUT_TAIL: {exec_out[-1200:]}")
+        lines.append("FIX_GUIDANCE: Fix the root cause and regenerate the full ML script.")
+        return "\n".join(lines)
+
     def _fallback(self, context: Dict[str, Any]) -> Dict[str, Any]:
         exec_out = context.get("execution_output", "") or ""
         issues = context.get("integrity_issues", []) or []
@@ -99,10 +132,21 @@ class PostmortemAgent:
 
         def _decision(action: str, reason: str, context_patch: Dict[str, Any] | None = None) -> Dict[str, Any]:
             if context_patch is None:
-                context_patch = {
-                    "target": "feedback_history",
-                    "payload": f"POSTMORTEM: {reason}",
-                }
+                if action == "retry_data_engineer":
+                    context_patch = {
+                        "target": "data_engineer_audit_override",
+                        "payload": self._build_de_context_payload(context, reason),
+                    }
+                elif action == "retry_ml_engineer":
+                    context_patch = {
+                        "target": "ml_engineer_audit_override",
+                        "payload": self._build_ml_context_payload(context, reason),
+                    }
+                else:
+                    context_patch = {
+                        "target": "feedback_history",
+                        "payload": f"POSTMORTEM: {reason}",
+                    }
             return {
                 "action": action,
                 "reason": reason,
@@ -166,6 +210,12 @@ class PostmortemAgent:
                 "payload": self._build_de_context_payload(context, reason),
             }
             return _decision(action, reason, de_patch)
+        if action == "retry_ml_engineer":
+            ml_patch = {
+                "target": "ml_engineer_audit_override",
+                "payload": self._build_ml_context_payload(context, reason),
+            }
+            return _decision(action, reason, ml_patch)
         return _decision(action, reason)
 
     def decide(self, context: Dict[str, Any]) -> Dict[str, Any]:
@@ -178,6 +228,10 @@ Decide the next action after a failed/weak run. Return STRICT JSON only.
 Allowed actions: retry_data_engineer | retry_ml_engineer | re_strategize | stop.
 Provide clear instructions (no code) and a context_patch to inject into next agent.
 If action is retry_data_engineer, context_patch MUST target "data_engineer_audit_override" and include:
+- FAILURE_SUMMARY
+- WHY_IT_HAPPENED (root cause explanation)
+- FIX_GUIDANCE
+If action is retry_ml_engineer, context_patch MUST target "ml_engineer_audit_override" and include:
 - FAILURE_SUMMARY
 - WHY_IT_HAPPENED (root cause explanation)
 - FIX_GUIDANCE
@@ -251,6 +305,18 @@ LAST_GATE_CONTEXT: $last_gate_context
                     payload = f"{payload}\n\n{auto_payload}" if payload else auto_payload
                 decision["context_patch"] = {
                     "target": "data_engineer_audit_override",
+                    "payload": payload,
+                }
+            if decision.get("action") == "retry_ml_engineer":
+                existing_payload = ""
+                if isinstance(decision.get("context_patch"), dict):
+                    existing_payload = str(decision["context_patch"].get("payload") or "")
+                auto_payload = self._build_ml_context_payload(context, decision.get("reason", ""))
+                payload = existing_payload
+                if auto_payload and auto_payload not in payload:
+                    payload = f"{payload}\n\n{auto_payload}" if payload else auto_payload
+                decision["context_patch"] = {
+                    "target": "ml_engineer_audit_override",
                     "payload": payload,
                 }
             # Normalize should_reset

@@ -11,7 +11,7 @@ from src.utils.prompting import render_prompt
 from src.utils.code_extract import extract_code_block
 
 # NOTE: scan_code_safety referenced by tests as a required safety mechanism.
-# ML plan mode doesn't execute code, but we keep the reference for integration checks.
+# ML code executes in sandbox; keep the reference for integration checks.
 _scan_code_safety_ref = "scan_code_safety"
 
 class MLEngineerAgent:
@@ -50,11 +50,12 @@ class MLEngineerAgent:
 
         SYSTEM_PROMPT_TEMPLATE = """
         You are an Expert Data Scientist and ML Engineer.
-        Your goal: Produce a robust ML EXPERIMENT PLAN based on Strategy and Clean Data.
+        Your goal: Produce a robust ML SCRIPT based on Strategy and Clean Data.
 
         *** HARD CONSTRAINTS (VIOLATION = FAILURE) ***
-        1. OUTPUT JSON ONLY (no markdown/code fences).
-        2. Do NOT output Python code.
+        1. OUTPUT VALID PYTHON CODE ONLY (no markdown/code fences).
+        2. Do NOT output JSON plans or pseudo-code.
+        3. If the audit includes RUNTIME_ERROR_CONTEXT or POSTMORTEM_CONTEXT_FOR_ML, fix the root cause and regenerate the full script.
 
         *** EXECUTION STYLE (FREEDOM WITH GUARDRAILS) ***
         - You are free to design the code structure and modeling approach; do NOT follow a rigid template.
@@ -104,6 +105,8 @@ class MLEngineerAgent:
         - Strategy: $strategy_title ($analysis_type)
         - Hypothesis: $hypothesis
         - Required Features: $required_columns
+        - Required Outputs: $required_outputs
+        - Canonical Columns: $canonical_columns
         - Execution Contract (json): $execution_contract_json
         - Spec Extraction (source-of-truth): $spec_extraction_json
         - ROLE RUNBOOK (ML Engineer): $ml_engineer_runbook (adhere to goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist)
@@ -198,31 +201,13 @@ class MLEngineerAgent:
         - For ordinal scoring: enforce w>=0 and sum(w)=1; add some regularization to avoid degenerate weights.
         - Report max weight and ranking violations; include these metrics in data/weights.json.
 
-        *** PLAN OUTPUT (JSON) ***
-        Output a JSON object with plan_type="ml_experiment_plan_v1".
-        Required keys:
-          {
-            "plan_type": "ml_experiment_plan_v1",
-            "input": {"cleaned_path": "$data_path", "manifest_path": "data/cleaning_manifest.json"},
-            "dialect": {"sep": "$csv_sep", "decimal": "$csv_decimal", "encoding": "$csv_encoding"},
-            "features": {"use_contract_features": true, "columns": []},
-            "target": {"name": "<canonical>", "type": "ranking|regression|classification", "source": "input|derived"},
-            "experiments": [
-              {"id": "exp_1", "method": "optimize_weights", "objective": "maximize_spearman|minimize_mse",
-               "constraints": {"non_negative": true, "sum_to_one": true}, "regularization": {"l2": 0.0}}
-            ],
-            "selection": {"metric": "spearman|mse", "direction": "max|min"},
-            "outputs": {
-              "weights_path": "data/weights.json",
-              "case_summary_path": "data/case_summary.csv",
-              "scored_rows_path": "data/scored_rows.csv",
-              "plots": ["static/plots/weight_distribution.png", "static/plots/score_vs_refscore_by_case.png"]
-            },
-            "notes": []
-          }
+        *** DELIVERABLES ***
+        - data/weights.json (with metrics and constraints checks)
+        - data/case_summary.csv
+        - data/scored_rows.csv
+        - At least one plot in static/plots/*.png
         - Use canonical_name from the contract for all column references.
         - If the contract has spec_extraction, honor it (target_type, formulas, constraints).
-        - Include 2-4 experiments that are compatible with the strategy.
         """
         
         ml_runbook_json = json.dumps(
@@ -241,6 +226,8 @@ class MLEngineerAgent:
             analysis_type=str(strategy.get('analysis_type', 'predictive')).upper(),
             hypothesis=strategy.get('hypothesis', 'N/A'),
             required_columns=json.dumps(strategy.get('required_columns', [])),
+            required_outputs=json.dumps((execution_contract or {}).get("required_outputs", [])),
+            canonical_columns=json.dumps((execution_contract or {}).get("canonical_columns", [])),
             data_path=data_path,
             csv_encoding=csv_encoding,
             csv_sep=csv_sep,
@@ -252,7 +239,7 @@ class MLEngineerAgent:
         )
         
         # USER TEMPLATES (Static)
-        USER_FIRSTPASS_TEMPLATE = "Generate the ML experiment plan for strategy: $strategy_title using data at $data_path. Check data/cleaning_manifest.json for dialect."
+        USER_FIRSTPASS_TEMPLATE = "Generate the ML Python script for strategy: $strategy_title using data at $data_path. Check data/cleaning_manifest.json for dialect."
         
         USER_PATCH_TEMPLATE = """
         *** PATCH MODE ACTIVATED ***
@@ -270,9 +257,9 @@ class MLEngineerAgent:
         
         *** PREVIOUS OUTPUT (TO PATCH) ***
         $previous_code
-        
+
         INSTRUCTIONS:
-        1. APPLY A MINIMAL PATCH to the previous JSON plan. DO NOT REWRITE FROM SCRATCH unless necessary.
+        1. APPLY A MINIMAL PATCH to the previous Python code. DO NOT REWRITE FROM SCRATCH unless necessary.
         2. Address EVERY item in the Required Fixes checklist.
         3. Ensure all MANDATORY UNIVERSAL QA INVARIANTS are met.
         """
@@ -353,15 +340,10 @@ class MLEngineerAgent:
         try:
             content = call_with_retries(_call_model, max_retries=3)
             print("DEBUG: DeepSeek response received.")
-            
-            from src.utils.ml_plan import parse_ml_plan, validate_ml_plan
-            plan, _ = parse_ml_plan(content)
-            if not plan:
-                return "# Error: ML_PLAN_REQUIRED"
-            issues = validate_ml_plan(plan)
-            if issues:
-                return f"# Error: ML_PLAN_INVALID: {', '.join(issues)}"
-            return json.dumps(plan, indent=2, ensure_ascii=False)
+            code = self._clean_code(content)
+            if code.strip().startswith("{") or code.strip().startswith("["):
+                return "# Error: ML_CODE_REQUIRED"
+            return code
 
         except Exception as e:
             # Raise RuntimeError as requested for clean catch in graph.py

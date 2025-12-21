@@ -51,8 +51,6 @@ from src.utils.contract_validation import ensure_role_runbooks
 from src.utils.data_engineer_preflight import data_engineer_preflight
 from src.utils.cleaning_plan import parse_cleaning_plan, validate_cleaning_plan
 from src.utils.cleaning_executor import execute_cleaning_plan
-from src.utils.ml_plan import parse_ml_plan, validate_ml_plan
-from src.utils.ml_executor import execute_ml_plan
 from src.utils.run_logger import init_run_log, log_run_event, finalize_run_log
 from src.utils.dataset_memory import (
     fingerprint_dataset,
@@ -530,6 +528,36 @@ def _build_de_postmortem_context(state: Dict[str, Any], decision: Dict[str, Any]
     lines.append("FIX_GUIDANCE: Fix the root cause and regenerate the full cleaning script.")
     return "\n".join(lines)
 
+def _build_ml_postmortem_context(state: Dict[str, Any], decision: Dict[str, Any]) -> str:
+    last_gate = state.get("last_gate_context") or {}
+    required_fixes = last_gate.get("required_fixes", [])
+    gate_feedback = last_gate.get("feedback", "")
+    err_msg = state.get("error_message", "") or ""
+    exec_out = state.get("execution_output", "") or ""
+    reason = decision.get("reason", "") or ""
+    why = ""
+    if required_fixes:
+        why = f"Gate required fixes: {required_fixes}"
+    else:
+        why = _infer_de_failure_cause(gate_feedback or err_msg or exec_out)
+    if not reason:
+        reason = err_msg or gate_feedback or "ML Engineer failure."
+    if not why:
+        why = "Unknown root cause. Inspect feature mapping, target variance, and dialect usage."
+    lines = ["POSTMORTEM_CONTEXT_FOR_ML:"]
+    if reason:
+        lines.append(f"FAILURE_SUMMARY: {reason}")
+    if why:
+        lines.append(f"WHY_IT_HAPPENED: {why}")
+    if gate_feedback:
+        lines.append(f"LAST_GATE_FEEDBACK: {gate_feedback}")
+    if err_msg:
+        lines.append(f"ERROR_MESSAGE: {err_msg}")
+    if exec_out:
+        lines.append(f"EXECUTION_OUTPUT_TAIL: {exec_out[-1200:]}")
+    lines.append("FIX_GUIDANCE: Fix the root cause and regenerate the full ML script.")
+    return "\n".join(lines)
+
 def _merge_de_audit_override(base: str, payload: str) -> str:
     base = base or ""
     payload = payload or ""
@@ -590,6 +618,8 @@ class AgentState(TypedDict):
     qa_reject_streak: int
     execution_attempt: int # Track runtime retries
     last_runtime_error_tail: str # Added for Runtime Error Visibility
+    data_engineer_audit_override: str
+    ml_engineer_audit_override: str
     leakage_audit_summary: str
     ml_skipped_reason: str
     execution_contract: Dict[str, Any]
@@ -1663,6 +1693,9 @@ def run_engineer(state: AgentState) -> AgentState:
     data_audit_context = state.get('data_summary', '')
     if leakage_summary:
         data_audit_context = f"{data_audit_context}\nLEAKAGE_AUDIT: {leakage_summary}"
+    ml_audit_override = state.get("ml_engineer_audit_override", "")
+    if ml_audit_override:
+        data_audit_context = _merge_de_audit_override(data_audit_context, ml_audit_override)
     business_objective = state.get('business_objective', '')
     csv_encoding = state.get('csv_encoding', 'utf-8') # Pass real encoding
     csv_sep = state.get('csv_sep', ',')
@@ -1695,6 +1728,38 @@ def run_engineer(state: AgentState) -> AgentState:
         sig = inspect.signature(ml_engineer.generate_code)
         if "execution_contract" in sig.parameters:
             kwargs["execution_contract"] = execution_contract
+        header_cols = _read_csv_header(data_path, csv_encoding, csv_sep)
+        if header_cols:
+            norm_map = {}
+            for col in header_cols:
+                normed = _norm_name(col)
+                if normed and normed not in norm_map:
+                    norm_map[normed] = col
+            header_context = (
+                "CLEANED_COLUMN_INVENTORY_RAW: "
+                + json.dumps(header_cols, ensure_ascii=False)
+                + "\nNORMALIZED_CLEANED_HEADER_MAP: "
+                + json.dumps(norm_map, ensure_ascii=False)
+            )
+            data_audit_context = _merge_de_audit_override(data_audit_context, header_context)
+            kwargs["data_audit_context"] = data_audit_context
+        try:
+            os.makedirs("artifacts", exist_ok=True)
+            ctx_payload = {
+                "data_path": data_path,
+                "csv_encoding": csv_encoding,
+                "csv_sep": csv_sep,
+                "csv_decimal": csv_decimal,
+                "header_cols": header_cols,
+                "required_features": strategy.get("required_columns", []),
+                "execution_contract": execution_contract,
+                "data_audit_context": data_audit_context,
+                "ml_engineer_audit_override": ml_audit_override,
+            }
+            with open(os.path.join("artifacts", "ml_engineer_context.json"), "w", encoding="utf-8") as f_ctx:
+                json.dump(ctx_payload, f_ctx, indent=2, ensure_ascii=False)
+        except Exception as ctx_err:
+            print(f"Warning: failed to persist ml_engineer_context.json: {ctx_err}")
         code = ml_engineer.generate_code(**kwargs)
         try:
             os.makedirs("artifacts", exist_ok=True)
@@ -1702,29 +1767,25 @@ def run_engineer(state: AgentState) -> AgentState:
                 f_art.write(code)
         except Exception as artifact_err:
             print(f"Warning: failed to persist ml_engineer_last.py: {artifact_err}")
-        plan_payload = None
-        plan_issues: List[str] = []
-        plan, _ = parse_ml_plan(code)
-        if plan:
-            plan_payload = plan
-            plan_issues = validate_ml_plan(plan)
-            try:
-                os.makedirs("artifacts", exist_ok=True)
-                with open(os.path.join("artifacts", "ml_engineer_last_plan.json"), "w", encoding="utf-8") as f_plan:
-                    json.dump(plan_payload, f_plan, indent=2, ensure_ascii=False)
-            except Exception as plan_err:
-                print(f"Warning: failed to persist ml_engineer_last_plan.json: {plan_err}")
-            if plan_issues:
-                msg = "ML_PLAN_INVALID: " + "; ".join(plan_issues)
-                return {
-                    "error_message": msg,
-                    "generated_code": code,
-                    "execution_output": msg,
-                    "budget_counters": counters,
-                }
 
         if run_id:
             log_run_event(run_id, "ml_engineer_complete", {"code_len": len(code or "")})
+        if str(code).strip().startswith("{") or str(code).strip().startswith("["):
+            msg = "ML_CODE_REQUIRED: model returned JSON plan; expected Python code."
+            if not state.get("ml_code_retry_done"):
+                new_state = dict(state)
+                new_state["ml_code_retry_done"] = True
+                override = new_state.get("ml_engineer_audit_override") or state.get("data_summary", "")
+                override += "\n\nML_CODE_REQUIRED: Return executable Python code only. Do not output JSON plans."
+                new_state["ml_engineer_audit_override"] = override
+                print("ML code-only guard triggered: retrying ML Engineer with code-only instructions.")
+                return run_engineer(new_state)
+            return {
+                "error_message": msg,
+                "generated_code": code,
+                "execution_output": msg,
+                "budget_counters": counters,
+            }
         if str(code).strip().startswith("# Error:"):
             return {
                 "error_message": code,
@@ -1737,7 +1798,6 @@ def run_engineer(state: AgentState) -> AgentState:
             "generated_code": code,
             "last_generated_code": code, # Update for next patch
             "ml_data_path": data_path,
-            "ml_plan": plan_payload,
             "budget_counters": counters,
         }
     except Exception as e:
@@ -1789,30 +1849,6 @@ def run_reviewer(state: AgentState) -> AgentState:
     code = state['generated_code']
     current_iter = state.get('reviewer_iteration', 0)
     new_history = list(state.get('feedback_history', []))
-    plan = state.get("ml_plan")
-    if not plan:
-        plan, _ = parse_ml_plan(code)
-    if plan:
-        feedback = "ML plan detected; skipping code review and proceeding to execution."
-        gate_context = {
-            "source": "reviewer",
-            "status": "APPROVED",
-            "feedback": feedback,
-            "failed_gates": [],
-            "required_fixes": [],
-        }
-        if run_id:
-            log_run_event(run_id, "reviewer_complete", {"status": "APPROVED"})
-        return {
-            "review_verdict": "APPROVED",
-            "review_feedback": feedback,
-            "feedback_history": new_history,
-            "reviewer_iteration": current_iter + 1,
-            "last_gate_context": gate_context,
-            "review_reject_streak": 0,
-            "budget_counters": counters,
-        }
-    
     # Context Construction
     strategy = state.get('selected_strategy', {})
     analysis_type = strategy.get('analysis_type', 'predictive')
@@ -1914,28 +1950,6 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
     business_objective = state.get('business_objective', '')
     
     current_history = list(state.get('feedback_history', []))
-    plan = state.get("ml_plan")
-    if not plan:
-        plan, _ = parse_ml_plan(code)
-    if plan:
-        feedback = "ML plan detected; skipping QA code audit and proceeding to execution."
-        gate_context = {
-            "source": "qa_reviewer",
-            "status": "APPROVED",
-            "feedback": feedback,
-            "failed_gates": [],
-            "required_fixes": [],
-        }
-        if run_id:
-            log_run_event(run_id, "qa_reviewer_complete", {"status": "APPROVED"})
-        return {
-            "review_verdict": "APPROVED",
-            "feedback_history": current_history,
-            "last_gate_context": gate_context,
-            "qa_reject_streak": 0,
-            "budget_counters": counters,
-        }
-    
     try:
         # Run QA Audit
         qa_result = qa_reviewer.review_code(code, strategy, business_objective)
@@ -2024,11 +2038,6 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
 def run_ml_preflight(state: AgentState) -> AgentState:
     print("--- ML PREFLIGHT ---")
     code = state.get("generated_code", "")
-    plan = state.get("ml_plan")
-    if not plan:
-        plan, _ = parse_ml_plan(code)
-    if plan:
-        return {"ml_preflight_failed": False}
     contract = state.get("execution_contract", {}) or {}
     required_deps = contract.get("required_dependencies", []) or []
     dep_result = check_dependency_precheck(code, required_deps)
@@ -2140,70 +2149,6 @@ def execute_code(state: AgentState) -> AgentState:
     if run_id:
         log_run_event(run_id, "execution_start", {})
     code = state['generated_code']
-    plan = state.get("ml_plan")
-    if not plan:
-        plan, _ = parse_ml_plan(code)
-    if plan:
-        issues = validate_ml_plan(plan)
-        if issues:
-            msg = "ML_PLAN_INVALID: " + "; ".join(issues)
-            return {"error_message": msg, "execution_output": msg, "budget_counters": counters}
-        try:
-            plan_exec = dict(plan)
-            input_cfg = plan_exec.get("input") or {}
-            input_cfg["cleaned_path"] = state.get("ml_data_path") or input_cfg.get("cleaned_path") or "data/cleaned_data.csv"
-            input_cfg.setdefault("manifest_path", "data/cleaning_manifest.json")
-            plan_exec["input"] = input_cfg
-            dialect_cfg = plan_exec.get("dialect") or {}
-            dialect_cfg.setdefault("sep", state.get("csv_sep", ","))
-            dialect_cfg.setdefault("decimal", state.get("csv_decimal", "."))
-            dialect_cfg.setdefault("encoding", state.get("csv_encoding", "utf-8"))
-            plan_exec["dialect"] = dialect_cfg
-            result = execute_ml_plan(plan_exec, state.get("execution_contract", {}) or {})
-            output = result.get("execution_output", "ML_PLAN_EXECUTION_OK")
-            plots_local = result.get("plots", [])
-            if not plots_local and os.path.exists("data/cleaned_data.csv"):
-                try:
-                    plots_local = generate_fallback_plots(
-                        "data/cleaned_data.csv",
-                        sep=state.get("csv_sep", ","),
-                        decimal=state.get("csv_decimal", "."),
-                        encoding=state.get("csv_encoding", "utf-8"),
-                    )
-                except Exception:
-                    plots_local = plots_local
-            has_partial_visuals = len(plots_local) > 0
-
-            output_contract = state.get("execution_contract", {}).get("required_outputs", [])
-            oc_report = check_required_outputs(output_contract)
-            try:
-                os.makedirs("data", exist_ok=True)
-                with open("data/output_contract_report.json", "w", encoding="utf-8") as f:
-                    json.dump(oc_report, f, indent=2)
-            except Exception as oc_err:
-                print(f"Warning: failed to persist output_contract_report.json: {oc_err}")
-
-            if run_id:
-                log_run_event(
-                    run_id,
-                    "execution_complete",
-                    {
-                        "plots": len(plots_local),
-                        "has_error": False,
-                        "output_missing": len(oc_report.get("missing", [])) if isinstance(oc_report, dict) else None,
-                    },
-                )
-            return {
-                "execution_output": output,
-                "plots_local": plots_local,
-                "has_partial_visuals": has_partial_visuals,
-                "execution_attempt": state.get('execution_attempt', 0) + 1,
-                "output_contract_report": oc_report,
-                "budget_counters": counters,
-            }
-        except Exception as plan_err:
-            msg = f"EXECUTION ERROR: ML plan failed: {plan_err}"
-            return {"error_message": msg, "execution_output": msg, "budget_counters": counters}
     
     # 0. Static Safety Scan
     is_safe, violations = scan_code_safety(code)
@@ -2780,6 +2725,9 @@ def run_postmortem(state: AgentState) -> AgentState:
         if target == "data_engineer_audit_override":
             base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
             new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, str(payload))
+        elif target == "ml_engineer_audit_override":
+            base_override = state.get("ml_engineer_audit_override") or state.get("data_summary", "")
+            new_state["ml_engineer_audit_override"] = _merge_de_audit_override(base_override, str(payload))
         elif target == "feedback_history":
             fh = list(new_state.get("feedback_history", state.get("feedback_history", [])))
             fh.append(payload)
@@ -2793,6 +2741,12 @@ def run_postmortem(state: AgentState) -> AgentState:
             base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
         auto_payload = _build_de_postmortem_context(state, decision)
         new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, auto_payload)
+    if action == "retry_ml_engineer":
+        base_override = new_state.get("ml_engineer_audit_override")
+        if not base_override:
+            base_override = state.get("ml_engineer_audit_override") or state.get("data_summary", "")
+        auto_payload = _build_ml_postmortem_context(state, decision)
+        new_state["ml_engineer_audit_override"] = _merge_de_audit_override(base_override, auto_payload)
 
     sr_raw = decision.get("should_reset")
     should_reset = sr_raw if isinstance(sr_raw, dict) else {}
