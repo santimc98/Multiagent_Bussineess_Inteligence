@@ -193,6 +193,27 @@ def _build_required_sample_context(
     if sample_df is None or getattr(sample_df, "empty", False):
         return ""
 
+    def _pattern_stats(series) -> Dict[str, float]:
+        try:
+            series = series.dropna().astype(str)
+        except Exception:
+            return {}
+        if series.empty:
+            return {}
+        sample = series
+        percent_like = float(sample.str.contains("%").mean())
+        comma_decimal = float(sample.str.contains(r"\d+,\d+").mean())
+        dot_decimal = float(sample.str.contains(r"\d+\.\d+").mean())
+        numeric_like = float(sample.str.contains(r"^[\\s\\-\\+]*[\\d,.\\s%]+$").mean())
+        whitespace = float(sample.str.contains(r"^\\s+|\\s+$").mean())
+        return {
+            "numeric_like_ratio": round(numeric_like, 4),
+            "percent_like_ratio": round(percent_like, 4),
+            "comma_decimal_ratio": round(comma_decimal, 4),
+            "dot_decimal_ratio": round(dot_decimal, 4),
+            "whitespace_ratio": round(whitespace, 4),
+        }
+
     samples: Dict[str, Dict[str, Any]] = {}
     for canon, raw in canon_to_raw.items():
         if raw not in sample_df.columns:
@@ -211,7 +232,11 @@ def _build_required_sample_context(
                 uniq.append(sval)
             if len(uniq) >= max_examples:
                 break
-        samples[canon] = {"raw_column": raw, "examples": uniq}
+        samples[canon] = {
+            "raw_column": raw,
+            "examples": uniq,
+            "pattern_stats": _pattern_stats(series),
+        }
 
     if not samples:
         return ""
@@ -1693,6 +1718,19 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         f"- {item['column']}: null_frac={item['null_frac']:.2%}, non_null_count={item['non_null_count']}"
                         for item in empty_required
                     )
+                    try:
+                        header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep)
+                        norm_map = {}
+                        for col in header_cols:
+                            normed = _norm_name(col)
+                            if normed and normed not in norm_map:
+                                norm_map[normed] = col
+                        empty_cols = [item["column"] for item in empty_required]
+                        sample_context = _build_required_sample_context(csv_path, input_dialect, empty_cols, norm_map, max_rows=200)
+                        if sample_context:
+                            payload = f"{payload}\n\n{sample_context}"
+                    except Exception:
+                        pass
                     new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
                     print("Empty required columns guard: retrying Data Engineer with evidence.")
                     return run_data_engineer(new_state)
