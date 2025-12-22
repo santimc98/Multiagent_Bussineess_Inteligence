@@ -2114,17 +2114,33 @@ def run_engineer(state: AgentState) -> AgentState:
         if "execution_contract" in sig.parameters:
             kwargs["execution_contract"] = execution_contract
         header_cols = _read_csv_header(data_path, csv_encoding, csv_sep)
+        aliasing = {}
+        derived_present = []
         if header_cols:
             norm_map = {}
+            norm_buckets = {}
             for col in header_cols:
                 normed = _norm_name(col)
                 if normed and normed not in norm_map:
                     norm_map[normed] = col
+                if normed:
+                    norm_buckets.setdefault(normed, []).append(col)
+            aliasing = {k: v for k, v in norm_buckets.items() if len(v) > 1}
+            try:
+                derived_cols = _resolve_contract_columns(execution_contract, sources={"derived"})
+                if derived_cols:
+                    derived_present = [c for c in derived_cols if c in set(header_cols)]
+            except Exception:
+                derived_present = []
             header_context = (
                 "CLEANED_COLUMN_INVENTORY_RAW: "
                 + json.dumps(header_cols, ensure_ascii=False)
                 + "\nNORMALIZED_CLEANED_HEADER_MAP: "
                 + json.dumps(norm_map, ensure_ascii=False)
+                + "\nCLEANED_ALIASING_COLLISIONS: "
+                + json.dumps(aliasing, ensure_ascii=False)
+                + "\nDERIVED_COLUMNS_PRESENT: "
+                + json.dumps(derived_present, ensure_ascii=False)
             )
             data_audit_context = _merge_de_audit_override(data_audit_context, header_context)
             kwargs["data_audit_context"] = data_audit_context
@@ -2136,6 +2152,8 @@ def run_engineer(state: AgentState) -> AgentState:
                 "csv_sep": csv_sep,
                 "csv_decimal": csv_decimal,
                 "header_cols": header_cols,
+                "cleaned_aliasing_collisions": aliasing if header_cols else {},
+                "derived_columns_present": derived_present if header_cols else [],
                 "required_features": strategy.get("required_columns", []),
                 "execution_contract": execution_contract,
                 "data_audit_context": data_audit_context,
@@ -2183,6 +2201,11 @@ def run_engineer(state: AgentState) -> AgentState:
             "generated_code": code,
             "last_generated_code": code, # Update for next patch
             "ml_data_path": data_path,
+            "ml_context_snapshot": {
+                "cleaned_column_inventory": header_cols,
+                "cleaned_aliasing_collisions": aliasing if header_cols else {},
+                "derived_columns_present": derived_present if header_cols else [],
+            },
             "budget_counters": counters,
         }
     except Exception as e:
@@ -3153,6 +3176,28 @@ def run_postmortem(state: AgentState) -> AgentState:
         if not base_override:
             base_override = state.get("ml_engineer_audit_override") or state.get("data_summary", "")
         auto_payload = _build_ml_postmortem_context(state, decision)
+        extra_payload = ""
+        try:
+            error_details = state.get("last_runtime_error_tail") or state.get("execution_output") or state.get("error_message", "")
+            code = state.get("generated_code") or state.get("last_generated_code") or ""
+            expl_ctx = state.get("ml_context_snapshot") or {}
+            expl_text = failure_explainer.explain_ml_failure(
+                code=code,
+                error_details=str(error_details),
+                context=expl_ctx,
+            )
+            if expl_text:
+                extra_payload = "ML_FAILURE_EXPLANATION:\n" + expl_text.strip()
+                try:
+                    os.makedirs("artifacts", exist_ok=True)
+                    with open(os.path.join("artifacts", "ml_engineer_failure_explainer.txt"), "w", encoding="utf-8") as f_exp:
+                        f_exp.write(expl_text.strip())
+                except Exception as exp_err:
+                    print(f"Warning: failed to persist ml_engineer_failure_explainer.txt: {exp_err}")
+        except Exception as expl_err:
+            print(f"Warning: ML failure explainer failed: {expl_err}")
+        if extra_payload:
+            auto_payload = _merge_de_audit_override(auto_payload, extra_payload)
         new_state["ml_engineer_audit_override"] = _merge_de_audit_override(base_override, auto_payload)
 
     sr_raw = decision.get("should_reset")

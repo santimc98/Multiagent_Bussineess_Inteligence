@@ -78,6 +78,57 @@ class FailureExplainerAgent:
 
         return (content or "").strip()
 
+    def explain_ml_failure(
+        self,
+        code: str,
+        error_details: str,
+        context: Dict[str, Any] | None = None,
+    ) -> str:
+        if not code or not error_details:
+            return ""
+        if not self.client:
+            return self._fallback(error_details)
+
+        ctx = context or {}
+        code_snippet = self._truncate(code, 6000)
+        error_snippet = self._truncate(error_details, 4000)
+        context_snippet = self._truncate(str(ctx), 2000)
+
+        system_prompt = (
+            "You are a senior ML debugging assistant. "
+            "Given the generated ML Python code, the runtime error output, and context, "
+            "explain why the failure happened. "
+            "Return concise plain text (2-6 short lines). "
+            "Do NOT include code. Do NOT restate the full traceback. "
+            "Focus on root cause and the specific logic mistake."
+        )
+        user_prompt = (
+            "CODE:\n"
+            f"{code_snippet}\n\n"
+            "ERROR:\n"
+            f"{error_snippet}\n\n"
+            "CONTEXT:\n"
+            f"{context_snippet}\n"
+        )
+
+        def _call_model():
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.1,
+            )
+            return response.choices[0].message.content
+
+        try:
+            content = call_with_retries(_call_model, max_retries=2)
+        except Exception:
+            return self._fallback(error_details)
+
+        return (content or "").strip()
+
     def _fallback(self, error_details: str) -> str:
         lower = error_details.lower()
         if "list of cases must be same length as list of conditions" in lower:
