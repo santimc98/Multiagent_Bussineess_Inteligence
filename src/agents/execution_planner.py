@@ -450,6 +450,73 @@ class ExecutionPlannerAgent:
             contract["role_runbooks"] = runbooks
             return contract
 
+        def _attach_business_alignment(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            spec = contract.get("spec_extraction", {}) if isinstance(contract.get("spec_extraction"), dict) else {}
+            target_type = str(spec.get("target_type") or "").lower()
+            has_cases = bool(spec.get("case_taxonomy"))
+            quality_gates = contract.get("quality_gates", {}) if isinstance(contract.get("quality_gates"), dict) else {}
+            priorities: List[Dict[str, Any]] = []
+            acceptance: Dict[str, Any] = {}
+            notes: List[str] = []
+
+            if has_cases and target_type in {"ordinal", "ranking"}:
+                priorities.append(
+                    {
+                        "priority": 1,
+                        "goal": "minimize_case_order_violations",
+                        "metric": "case_order_violations",
+                        "direction": "minimize",
+                    }
+                )
+                priorities.append(
+                    {
+                        "priority": 2,
+                        "goal": "maximize_case_level_rank_correlation",
+                        "metric": "case_level_spearman",
+                        "direction": "maximize",
+                    }
+                )
+                priorities.append(
+                    {
+                        "priority": 3,
+                        "goal": "maximize_global_rank_correlation",
+                        "metric": "spearman",
+                        "direction": "maximize",
+                    }
+                )
+                acceptance["case_order_violations_max"] = quality_gates.get("violations_max", 0)
+                acceptance["spearman_min"] = quality_gates.get("spearman_min")
+                notes.append(
+                    "Primary objective is case ordering consistency; global ranking is secondary when case taxonomy is defined."
+                )
+            else:
+                priorities.append(
+                    {
+                        "priority": 1,
+                        "goal": "maximize_global_rank_correlation",
+                        "metric": "spearman",
+                        "direction": "maximize",
+                    }
+                )
+                acceptance["spearman_min"] = quality_gates.get("spearman_min")
+
+            contract["business_alignment"] = {
+                "optimization_priorities": priorities,
+                "acceptance_criteria": acceptance,
+                "notes": notes,
+            }
+
+            runbooks = contract.get("role_runbooks")
+            if isinstance(runbooks, dict):
+                ml_runbook = runbooks.get("ml_engineer")
+                if isinstance(ml_runbook, dict):
+                    ml_runbook["business_alignment"] = contract["business_alignment"]
+                    runbooks["ml_engineer"] = ml_runbook
+                    contract["role_runbooks"] = runbooks
+            return contract
+
         def _fallback() -> Dict[str, Any]:
             required_cols = strategy.get("required_columns", []) or []
             data_requirements: List[Dict[str, Any]] = []
@@ -507,6 +574,7 @@ class ExecutionPlannerAgent:
                     "regularization": {"l2": 0.05, "concentration_penalty": 0.1},
                     "ranking_loss": "hinge_pairwise",
                 },
+                "business_alignment": {},
                 "validations": [],
                 "notes_for_engineers": [
                     "Refine roles/ranges using data_summary evidence; adjust in Patch Mode if needed.",
@@ -536,6 +604,7 @@ class ExecutionPlannerAgent:
             contract = _attach_data_risks(contract)
             contract = _attach_spec_extraction_issues(contract)
             contract = _ensure_spec_extraction(contract)
+            contract = _attach_business_alignment(contract)
             return _attach_spec_extraction_to_runbook(contract)
 
         if not self.client:
@@ -561,6 +630,7 @@ Requirements:
           - COLUMN INVENTORY (detected from CSV header) to help decide source input/derived: $column_inventory
           - required_dependencies is optional; include only if strongly implied by the strategy title or data_summary. Use module names (e.g., "xgboost", "statsmodels", "pyarrow", "openpyxl"). Otherwise use [].
         - Include quality_gates (spearman_min, violations_max, inactive_share_max, max_weight_max, hhi_max, near_zero_max) and optimization_preferences (regularization + ranking_loss).
+        - Include business_alignment with optimization_priorities (ordered list with priority/goal/metric/direction) and acceptance_criteria tied to quality_gates and spec_extraction.
         - Include role_runbooks as above to guide engineers with run-time safe idioms and reasoning checks.
   - SPEC EXTRACTION (from business_objective + strategy): include a spec_extraction object with:
     - scoring_formula: a string formula if explicitly stated, else null.
@@ -639,6 +709,7 @@ Return the contract JSON.
             contract = _attach_data_risks(contract)
             contract = _attach_spec_extraction_issues(contract)
             contract = _ensure_spec_extraction(contract)
+            contract = _attach_business_alignment(contract)
             return _attach_spec_extraction_to_runbook(contract)
         except Exception:
             return _fallback()

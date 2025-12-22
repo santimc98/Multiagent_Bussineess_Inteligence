@@ -107,6 +107,7 @@ class MLEngineerAgent:
         - Required Features: $required_columns
         - Required Outputs: $required_outputs
         - Canonical Columns: $canonical_columns
+        - Business Alignment: $business_alignment_json
         - Execution Contract (json): $execution_contract_json
         - Spec Extraction (source-of-truth): $spec_extraction_json
         - ROLE RUNBOOK (ML Engineer): $ml_engineer_runbook (adhere to goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist)
@@ -228,6 +229,7 @@ class MLEngineerAgent:
             required_columns=json.dumps(strategy.get('required_columns', [])),
             required_outputs=json.dumps((execution_contract or {}).get("required_outputs", [])),
             canonical_columns=json.dumps((execution_contract or {}).get("canonical_columns", [])),
+            business_alignment_json=json.dumps((execution_contract or {}).get("business_alignment", {}), indent=2),
             data_path=data_path,
             csv_encoding=csv_encoding,
             csv_sep=csv_sep,
