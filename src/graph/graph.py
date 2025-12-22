@@ -3027,6 +3027,44 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         feedback = f"{feedback}\n{feedback_missing}" if feedback else feedback_missing
         new_history.append(f"OUTPUT_CONTRACT_MISSING: {miss_text}")
 
+    # Post-exec code audit (non-blocking warnings)
+    code = state.get("generated_code") or state.get("last_generated_code") or ""
+    counters = dict(state.get("budget_counters") or {})
+    review_counters = counters
+    if code:
+        analysis_type = strategy.get("analysis_type", "predictive")
+        review_warnings: List[str] = []
+        try:
+            ok, counters, err_msg = _consume_budget(state, "reviewer_calls", "max_reviewer_calls", "Reviewer")
+            review_counters = counters
+            if ok:
+                review_result = reviewer.review_code(code, analysis_type, business_objective, strategy_context)
+                if review_result and review_result.get("status") != "APPROVED":
+                    review_warnings.append(
+                        f"REVIEWER_CODE_AUDIT[{review_result.get('status')}]: {review_result.get('feedback')}"
+                    )
+            else:
+                review_warnings.append(f"REVIEWER_CODE_AUDIT_SKIPPED: {err_msg}")
+        except Exception as review_err:
+            review_warnings.append(f"REVIEWER_CODE_AUDIT_ERROR: {review_err}")
+        try:
+            ok, counters, err_msg = _consume_budget(state, "qa_calls", "max_qa_calls", "QA Reviewer")
+            review_counters = counters
+            if ok:
+                qa_result = qa_reviewer.review_code(code, strategy, business_objective)
+                if qa_result and qa_result.get("status") != "APPROVED":
+                    review_warnings.append(
+                        f"QA_CODE_AUDIT[{qa_result.get('status')}]: {qa_result.get('feedback')}"
+                    )
+            else:
+                review_warnings.append(f"QA_CODE_AUDIT_SKIPPED: {err_msg}")
+        except Exception as qa_err:
+            review_warnings.append(f"QA_CODE_AUDIT_ERROR: {qa_err}")
+        if review_warnings:
+            warn_text = "\n".join(review_warnings)
+            feedback = f"{feedback}\n{warn_text}" if feedback else warn_text
+            new_history.append(warn_text)
+
     gate_context = {
         "source": "case_alignment_gate" if case_report.get("status") == "FAIL" else "result_evaluator",
         "status": status,
@@ -3048,6 +3086,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "output_contract_report": oc_report,
         "last_gate_context": gate_context,
     }
+    if review_counters:
+        result_state["budget_counters"] = review_counters
     if status == "NEEDS_IMPROVEMENT":
         try:
             advisor_ctx = {
@@ -3474,7 +3514,7 @@ workflow.add_conditional_edges(
     "ml_preflight",
     check_ml_preflight,
     {
-        "passed": "reviewer",
+        "passed": "execute_code",
         "failed": "retry_handler",
     }
 )
@@ -3489,27 +3529,10 @@ workflow.add_conditional_edges(
     }
 )
 
-# Conditional Edge for Reviewer
-workflow.add_conditional_edges(
-    "reviewer",
-    check_review,
-    {
-        "approved": "qa_reviewer", # Pass to QA instead of execute
-        "rejected": "retry_handler", 
-        "failed": "postmortem"
-    }
-)
-
-# Conditional Edge for QA Reviewer
-workflow.add_conditional_edges(
-    "qa_reviewer",
-    check_qa_review,
-    {
-        "approved": "execute_code", # Pass QA -> Execute
-        "rejected": "retry_handler", # Back to engineer
-        "failed": "postmortem"
-    }
-)
+"""
+# Reviewer/QA pre-exec gates bypassed in favor of post-exec advisory checks.
+# Nodes remain registered for optional future use.
+"""
 
 # New Flow: Execution -> Loop
 workflow.add_conditional_edges(
