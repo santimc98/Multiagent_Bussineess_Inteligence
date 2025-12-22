@@ -24,6 +24,7 @@ from src.agents.reviewer import ReviewerAgent
 from src.agents.qa_reviewer import QAReviewerAgent # New QA Gate
 from src.agents.execution_planner import ExecutionPlannerAgent
 from src.agents.postmortem import PostmortemAgent
+from src.agents.failure_explainer import FailureExplainerAgent
 from src.utils.pdf_generator import convert_report_to_pdf
 from src.utils.static_safety_scan import scan_code_safety
 from src.utils.visuals import generate_fallback_plots
@@ -890,6 +891,7 @@ reviewer = ReviewerAgent()
 qa_reviewer = QAReviewerAgent()
 execution_planner = ExecutionPlannerAgent()
 postmortem_agent = PostmortemAgent()
+failure_explainer = FailureExplainerAgent()
 
 
 # 2. Define Nodes
@@ -1562,6 +1564,42 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             diagnosis_lines = _build_de_runtime_diagnosis(error_details)
                             if diagnosis_lines:
                                 override += "\nERROR_DIAGNOSIS:\n- " + "\n- ".join(diagnosis_lines)
+                            explainer_text = ""
+                            try:
+                                required_input = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
+                                header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep)
+                                norm_map = {}
+                                for col in header_cols:
+                                    normed = _norm_name(col)
+                                    if normed and normed not in norm_map:
+                                        norm_map[normed] = col
+                                required_raw_map = _build_required_raw_map(required_input, norm_map)
+                                explainer_ctx = {
+                                    "strategy_title": selected.get("title", "") if selected else "",
+                                    "csv_dialect": input_dialect,
+                                    "required_input_columns": required_input,
+                                    "required_raw_header_map": required_raw_map,
+                                }
+                                explainer_text = failure_explainer.explain_data_engineer_failure(
+                                    code=code,
+                                    error_details=error_details,
+                                    context=explainer_ctx,
+                                )
+                            except Exception as explainer_err:
+                                print(f"Warning: failure explainer failed: {explainer_err}")
+                                explainer_text = ""
+                            if explainer_text:
+                                override += "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
+                                try:
+                                    os.makedirs("artifacts", exist_ok=True)
+                                    with open(
+                                        os.path.join("artifacts", "data_engineer_failure_explainer.txt"),
+                                        "w",
+                                        encoding="utf-8",
+                                    ) as f_exp:
+                                        f_exp.write(explainer_text.strip())
+                                except Exception as exp_err:
+                                    print(f"Warning: failed to persist data_engineer_failure_explainer.txt: {exp_err}")
                         except Exception:
                             pass
                         new_state["data_engineer_audit_override"] = override
