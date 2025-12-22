@@ -2116,6 +2116,7 @@ def run_engineer(state: AgentState) -> AgentState:
         header_cols = _read_csv_header(data_path, csv_encoding, csv_sep)
         aliasing = {}
         derived_present = []
+        sample_context = ""
         if header_cols:
             norm_map = {}
             norm_buckets = {}
@@ -2144,6 +2145,17 @@ def run_engineer(state: AgentState) -> AgentState:
             )
             data_audit_context = _merge_de_audit_override(data_audit_context, header_context)
             kwargs["data_audit_context"] = data_audit_context
+            required_input_cols = _resolve_required_input_columns(execution_contract, strategy)
+            sample_context = _build_required_sample_context(
+                data_path,
+                {"sep": csv_sep, "encoding": csv_encoding, "decimal": csv_decimal},
+                required_input_cols,
+                norm_map,
+                max_rows=80,
+            )
+            if sample_context:
+                data_audit_context = _merge_de_audit_override(data_audit_context, sample_context)
+                kwargs["data_audit_context"] = data_audit_context
         try:
             os.makedirs("artifacts", exist_ok=True)
             ctx_payload = {
@@ -2154,6 +2166,7 @@ def run_engineer(state: AgentState) -> AgentState:
                 "header_cols": header_cols,
                 "cleaned_aliasing_collisions": aliasing if header_cols else {},
                 "derived_columns_present": derived_present if header_cols else [],
+                "raw_required_sample_context": sample_context,
                 "required_features": strategy.get("required_columns", []),
                 "execution_contract": execution_contract,
                 "data_audit_context": data_audit_context,
@@ -2205,6 +2218,7 @@ def run_engineer(state: AgentState) -> AgentState:
                 "cleaned_column_inventory": header_cols,
                 "cleaned_aliasing_collisions": aliasing if header_cols else {},
                 "derived_columns_present": derived_present if header_cols else [],
+                "raw_required_sample_context": sample_context,
             },
             "budget_counters": counters,
         }

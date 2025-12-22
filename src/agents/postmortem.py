@@ -172,6 +172,11 @@ class PostmortemAgent:
                 return _decision("re_strategize", "Case alignment gate failed repeatedly; re-strategize.")
             return _decision("retry_ml_engineer", "Case alignment gate failed; retry ML with ranking loss + regularization.")
 
+        if "insufficient variance" in err_msg or "nunique=0" in err_msg:
+            if variance_count >= 2 and restrat < 2:
+                return _decision("re_strategize", "Repeated target variance failure; re-strategize.")
+            return _decision("retry_ml_engineer", "Target has insufficient variance; retry ML engineer.")
+
         if "target has no variance" in err_msg:
             if variance_count >= 2 and restrat < 2:
                 return _decision("re_strategize", "Repeated target variance failure; re-strategize.")
