@@ -5,12 +5,29 @@ import json
 import sys
 import time
 import glob
+import signal
 from datetime import datetime
 
 # Ensure src is in path
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
-from src.graph.graph import app_graph
+from src.graph.graph import app_graph, request_abort, clear_abort
+
+_SIGNAL_HANDLER_INSTALLED = False
+
+def _handle_shutdown(signum, frame):
+    request_abort(f"signal={signum}")
+    raise KeyboardInterrupt
+
+def _install_signal_handlers():
+    global _SIGNAL_HANDLER_INSTALLED
+    if _SIGNAL_HANDLER_INSTALLED:
+        return
+    signal.signal(signal.SIGINT, _handle_shutdown)
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    _SIGNAL_HANDLER_INSTALLED = True
+
+_install_signal_handlers()
 
 # 1. Configuración Visual
 st.set_page_config(
@@ -116,6 +133,7 @@ if start_btn:
         # Reset state for new run
         st.session_state["analysis_complete"] = False
         st.session_state["analysis_result"] = None
+        clear_abort()
         
         # Clean previous plots
         if os.path.exists("static/plots"):

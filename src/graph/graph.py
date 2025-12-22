@@ -3,6 +3,7 @@ import os
 import subprocess
 import re
 import json
+import threading
 from datetime import datetime
 from typing import TypedDict, Dict, Any, List, Literal
 from langgraph.graph import StateGraph, END
@@ -62,6 +63,31 @@ from src.utils.governance import write_governance_report, build_run_summary
 
 def _norm_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
+
+_ABORT_EVENT = threading.Event()
+
+def request_abort(reason: str | None = None) -> None:
+    _ABORT_EVENT.set()
+    if reason:
+        print(f"ABORT_REQUESTED: {reason}")
+
+def clear_abort() -> None:
+    _ABORT_EVENT.clear()
+
+def abort_requested() -> bool:
+    return _ABORT_EVENT.is_set()
+
+def _abort_if_requested(state: Dict[str, Any], stage: str) -> Dict[str, Any] | None:
+    if not _ABORT_EVENT.is_set():
+        return None
+    run_id = state.get("run_id") if isinstance(state, dict) else None
+    if run_id:
+        log_run_event(run_id, "abort_requested", {"stage": stage})
+    return {
+        "error_message": "ABORTED_BY_USER",
+        "cleaned_data_preview": "Error: Aborted",
+        "budget_counters": state.get("budget_counters", {}) if isinstance(state, dict) else {},
+    }
 
 def _extract_manifest_alerts(manifest: Dict[str, Any], derived_columns: List[str]) -> List[str]:
     if not isinstance(manifest, dict):
@@ -189,7 +215,7 @@ def _build_required_sample_context(
             raw_cols.append(raw)
     if not raw_cols:
         return ""
-    sample_df = sample_raw_columns(csv_path, dialect, raw_cols, nrows=max_rows)
+    sample_df = sample_raw_columns(csv_path, dialect, raw_cols, nrows=max_rows, dtype=str)
     if sample_df is None or getattr(sample_df, "empty", False):
         return ""
 
@@ -204,8 +230,8 @@ def _build_required_sample_context(
         percent_like = float(sample.str.contains("%").mean())
         comma_decimal = float(sample.str.contains(r"\d+,\d+").mean())
         dot_decimal = float(sample.str.contains(r"\d+\.\d+").mean())
-        numeric_like = float(sample.str.contains(r"^[\\s\\-\\+]*[\\d,.\\s%]+$").mean())
-        whitespace = float(sample.str.contains(r"^\\s+|\\s+$").mean())
+        numeric_like = float(sample.str.contains(r"^[\s\-\+]*[\d,.\s%]+$").mean())
+        whitespace = float(sample.str.contains(r"^\s+|\s+$").mean())
         return {
             "numeric_like_ratio": round(numeric_like, 4),
             "percent_like_ratio": round(percent_like, 4),
@@ -242,6 +268,18 @@ def _build_required_sample_context(
         return ""
     payload = {"sample_rows": int(len(sample_df)), "columns": samples}
     return "RAW_REQUIRED_COLUMN_SAMPLES:\n" + json.dumps(payload, ensure_ascii=True)
+
+def _build_required_raw_map(
+    required_cols: List[str],
+    norm_map: Dict[str, str],
+) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    for col in required_cols or []:
+        normed = _norm_name(col)
+        raw = norm_map.get(normed)
+        if raw:
+            mapping[col] = raw
+    return mapping
 
 def _filter_input_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     """Return a shallow copy of contract with data_requirements limited to source=='input'."""
@@ -835,6 +873,9 @@ postmortem_agent = PostmortemAgent()
 
 def run_steward(state: AgentState) -> AgentState:
     print("--- [1] Steward: Analyzing Data ---")
+    abort_state = _abort_if_requested(state, "steward")
+    if abort_state:
+        return abort_state
     run_id = state.get("run_id") if state else None
     if not run_id:
         run_id = uuid.uuid4().hex[:8]
@@ -933,6 +974,9 @@ def run_steward(state: AgentState) -> AgentState:
 
 def run_strategist(state: AgentState) -> AgentState:
     print("--- [2] Strategist: Formulating 3 Strategies (DeepSeek Reasoner) ---")
+    abort_state = _abort_if_requested(state, "strategist")
+    if abort_state:
+        return abort_state
     
     # Strategist now returns a dict with "strategies": [list of 3]
     user_context = state.get("strategist_context_override") or state.get("business_objective", "")
@@ -957,6 +1001,9 @@ def run_strategist(state: AgentState) -> AgentState:
 
 def run_domain_expert(state: AgentState) -> AgentState:
     print("--- [2.5] Domain Expert: Evaluating & Selecting Strategy ---")
+    abort_state = _abort_if_requested(state, "domain_expert")
+    if abort_state:
+        return abort_state
     
     strategies_wrapper = state.get('strategies', {})
     strategies_list = strategies_wrapper.get('strategies', [])
@@ -1007,6 +1054,9 @@ def run_domain_expert(state: AgentState) -> AgentState:
 
 def run_execution_planner(state: AgentState) -> AgentState:
     print("--- [2.7] Execution Planner: Building Contract ---")
+    abort_state = _abort_if_requested(state, "execution_planner")
+    if abort_state:
+        return abort_state
     strategy = state.get("selected_strategy", {})
     data_summary = state.get("data_summary", "")
     memory_context = state.get("dataset_memory_context")
@@ -1065,6 +1115,9 @@ def run_execution_planner(state: AgentState) -> AgentState:
 
 def run_data_engineer(state: AgentState) -> AgentState:
     print("--- [3] Data Engineer: Cleaning Data (E2B Sandbox) ---")
+    abort_state = _abort_if_requested(state, "data_engineer")
+    if abort_state:
+        return abort_state
     run_id = state.get("run_id")
     ok, counters, err_msg = _consume_budget(state, "de_calls", "max_de_calls", "Data Engineer")
     state["budget_counters"] = counters
@@ -1107,6 +1160,10 @@ def run_data_engineer(state: AgentState) -> AgentState:
         )
         data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, header_context)
         required_cols = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
+        required_raw_map = _build_required_raw_map(required_cols, norm_map)
+        if required_raw_map:
+            raw_map_payload = "REQUIRED_RAW_HEADER_MAP:\n" + json.dumps(required_raw_map, ensure_ascii=True)
+            data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, raw_map_payload)
         sample_context = _build_required_sample_context(csv_path, input_dialect, required_cols, norm_map)
         if sample_context:
             data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, sample_context)
@@ -1121,6 +1178,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "header_cols": header_cols,
             "required_input_columns": _resolve_required_input_columns(state.get("execution_contract", {}), selected),
             "required_all_columns": _resolve_contract_columns(state.get("execution_contract", {})),
+            "required_raw_header_map": required_raw_map,
             "raw_required_sample_context": sample_context,
             "data_engineer_audit_override": data_engineer_audit_override,
         }
@@ -1929,6 +1987,9 @@ def check_data_success(state: AgentState):
 
 def run_engineer(state: AgentState) -> AgentState:
     print(f"--- [4] ML Engineer: Generating Code (Iteration {state.get('iteration_count', 0) + 1}) ---")
+    abort_state = _abort_if_requested(state, "ml_engineer")
+    if abort_state:
+        return abort_state
     run_id = state.get("run_id")
     ok, counters, err_msg = _consume_budget(state, "ml_calls", "max_ml_calls", "ML Engineer")
     state["budget_counters"] = counters
@@ -2091,6 +2152,9 @@ def check_postmortem_action(state: AgentState):
 
 def run_reviewer(state: AgentState) -> AgentState:
     print("--- REVIEWER AGENT ---")
+    abort_state = _abort_if_requested(state, "reviewer")
+    if abort_state:
+        return abort_state
     run_id = state.get("run_id")
     ok, counters, err_msg = _consume_budget(state, "reviewer_calls", "max_reviewer_calls", "Reviewer")
     state["budget_counters"] = counters
@@ -2191,6 +2255,9 @@ def run_reviewer(state: AgentState) -> AgentState:
 
 def run_qa_reviewer(state: AgentState) -> AgentState:
     print("--- QA REVIEWER AGENT ---")
+    abort_state = _abort_if_requested(state, "qa_reviewer")
+    if abort_state:
+        return abort_state
     run_id = state.get("run_id")
     ok, counters, err_msg = _consume_budget(state, "qa_calls", "max_qa_calls", "QA Reviewer")
     state["budget_counters"] = counters
@@ -2297,6 +2364,9 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
 
 def run_ml_preflight(state: AgentState) -> AgentState:
     print("--- ML PREFLIGHT ---")
+    abort_state = _abort_if_requested(state, "ml_preflight")
+    if abort_state:
+        return abort_state
     code = state.get("generated_code", "")
     contract = state.get("execution_contract", {}) or {}
     required_deps = contract.get("required_dependencies", []) or []
@@ -2691,6 +2761,9 @@ def retry_handler(state: AgentState) -> AgentState:
     
 def run_result_evaluator(state: AgentState) -> AgentState:
     print("--- [5.5] Reviewer: Evaluating Results ---")
+    abort_state = _abort_if_requested(state, "result_evaluator")
+    if abort_state:
+        return abort_state
     run_id = state.get("run_id")
     if run_id:
         log_run_event(run_id, "result_evaluator_start", {})
@@ -2841,6 +2914,9 @@ def check_evaluation(state: AgentState):
 
 def run_translator(state: AgentState) -> AgentState:
     print("--- [6] Translator: Generating Report ---")
+    abort_state = _abort_if_requested(state, "translator")
+    if abort_state:
+        return abort_state
     run_id = state.get("run_id")
     if run_id:
         log_run_event(run_id, "translator_start", {})
@@ -2912,6 +2988,13 @@ def run_translator(state: AgentState) -> AgentState:
 
 def run_postmortem(state: AgentState) -> AgentState:
     print("--- [POSTMORTEM] Tech Lead Decision ---")
+    if abort_requested() or "ABORTED_BY_USER" in str(state.get("error_message", "")):
+        decision = {
+            "action": "stop",
+            "reason": "Run aborted by user.",
+            "context_patch": None,
+        }
+        return {"postmortem_decision": decision}
     run_id = state.get("run_id")
     if run_id:
         log_run_event(run_id, "postmortem_start", {})

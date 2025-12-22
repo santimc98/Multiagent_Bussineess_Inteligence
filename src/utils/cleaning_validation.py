@@ -171,7 +171,13 @@ def _digit_ratio(series: pd.Series) -> float:
 # Implementation snippet requested: public helper for sampling raw columns
 import pandas as pd
 
-def sample_raw_columns(csv_path: str, dialect: dict | None, usecols: list[str], nrows: int = 500) -> pd.DataFrame:
+def sample_raw_columns(
+    csv_path: str,
+    dialect: dict | None,
+    usecols: list[str],
+    nrows: int = 500,
+    dtype: str | None = None,
+) -> pd.DataFrame:
     """
     Best-effort: lee una muestra (nrows) del CSV raw usando dialecto, limitando a usecols.
     Nunca lanza excepción: si falla devuelve DataFrame vacío.
@@ -185,15 +191,16 @@ def sample_raw_columns(csv_path: str, dialect: dict | None, usecols: list[str], 
     decimal = d.get("decimal", ".")
 
     try:
-        return pd.read_csv(
-            csv_path,
-            encoding=encoding,
-            sep=sep,
-            decimal=decimal,
-            usecols=usecols,
-            nrows=nrows,
-            low_memory=False,
-        )
+            return pd.read_csv(
+                csv_path,
+                encoding=encoding,
+                sep=sep,
+                decimal=decimal,
+                usecols=usecols,
+                nrows=nrows,
+                dtype=dtype,
+                low_memory=False,
+            )
     except ValueError:
         # usecols no encaja -> intersectar con header real y reintentar
         try:
@@ -215,6 +222,7 @@ def sample_raw_columns(csv_path: str, dialect: dict | None, usecols: list[str], 
                 decimal=decimal,
                 usecols=present,
                 nrows=nrows,
+                dtype=dtype,
                 low_memory=False,
             )
         except Exception:
