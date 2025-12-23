@@ -2345,6 +2345,18 @@ def run_engineer(state: AgentState) -> AgentState:
             ops_payload = "\n\n".join(context_ops_blocks)
             data_audit_context = _merge_de_audit_override(data_audit_context, ops_payload)
             kwargs["data_audit_context"] = data_audit_context
+            try:
+                ops_preview = ops_payload
+                if len(ops_preview) > 1200:
+                    ops_preview = ops_preview[:1200] + "...(truncated)"
+                print("ML_CONTEXT_OPERATIVE_PREVIEW:\n" + ops_preview)
+                os.makedirs("artifacts", exist_ok=True)
+                with open(os.path.join("artifacts", "ml_engineer_context_ops.txt"), "w", encoding="utf-8") as f_ops:
+                    f_ops.write(ops_payload)
+                if run_id:
+                    log_run_event(run_id, "ml_context_ops_preview", {"preview": ops_preview})
+            except Exception as ops_err:
+                print(f"Warning: failed to persist ml_engineer_context_ops.txt: {ops_err}")
         code = ml_engineer.generate_code(**kwargs)
         try:
             os.makedirs("artifacts", exist_ok=True)
