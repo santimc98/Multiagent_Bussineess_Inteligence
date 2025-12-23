@@ -106,13 +106,51 @@ class BusinessTranslatorAgent:
             status = case_alignment_report.get("status")
             failures = case_alignment_report.get("failures", [])
             metrics = case_alignment_report.get("metrics", {})
+            thresholds = case_alignment_report.get("thresholds", {})
             return f"Status={status}; Failures={failures}; KeyMetrics={metrics}"
+
+        def _case_alignment_business_status():
+            if not case_alignment_report:
+                return {
+                    "label": "NO_DATA",
+                    "status": "UNKNOWN",
+                    "message": "No se encontró reporte de alineación de casos.",
+                    "recommendation": "Revisar si el proceso generó data/case_alignment_report.json.",
+                }
+            status = case_alignment_report.get("status")
+            failures = case_alignment_report.get("failures", [])
+            metrics = case_alignment_report.get("metrics", {})
+            thresholds = case_alignment_report.get("thresholds", {})
+            if status == "PASS":
+                return {
+                    "label": "APTO_CONDICIONAL",
+                    "status": "PASS",
+                    "message": "La alineación con la lógica de casos cumple los umbrales definidos.",
+                    "key_metrics": metrics,
+                }
+            # FAIL
+            details = []
+            for failure in failures:
+                metric_val = metrics.get(failure)
+                thresh_val = thresholds.get(failure.replace("case_means", "min"), thresholds.get(failure))
+                if metric_val is not None:
+                    details.append(f"{failure}={metric_val} (umbral={thresh_val})")
+                else:
+                    details.append(f"{failure} (umbral={thresh_val})")
+            return {
+                "label": "NO_APTO_PARA_PRODUCCION",
+                "status": "FAIL",
+                "message": "La solución no cumple los criterios de alineación por casos.",
+                "details": details,
+                "recommendation": "Priorizar reducción de violaciones entre casos antes de considerar producción.",
+            }
 
         contract_context = _summarize_contract()
         integrity_context = _summarize_integrity()
         output_contract_context = _summarize_output_contract()
         postmortem_context = _summarize_postmortem()
         case_alignment_context = _summarize_case_alignment()
+        case_alignment_business_status = _case_alignment_business_status()
 
         # Define Template
         SYSTEM_PROMPT_TEMPLATE = Template("""
@@ -137,6 +175,7 @@ class BusinessTranslatorAgent:
         - Output Contract: $output_contract_context
         - Postmortem: $postmortem_context
         - Case Alignment QA: $case_alignment_context
+        - Business Readiness (Case Alignment): $case_alignment_business_status
         
         ERROR CONDITION:
         $error_condition
@@ -154,7 +193,7 @@ class BusinessTranslatorAgent:
         2. Execution: What did the agents do? (Cleaned data, ran $analysis_type model).
         3. Explain the provided charts or results (found in the context below).
         4. Conclusion: Did we validate the hypothesis?
-        If Case Alignment QA failed (Status=FAIL), explicitly state "NO APTO PARA PRODUCCION" and summarize the main failure reasons.
+        If Business Readiness indicates NO_APTO_PARA_PRODUCCION, explicitly state it and summarize the main failure reasons and recommendation in executive language.
         
         OUTPUT: Markdown format (NO TABLES).
         """)
@@ -172,7 +211,8 @@ class BusinessTranslatorAgent:
             integrity_context=integrity_context,
             output_contract_context=output_contract_context,
             postmortem_context=postmortem_context,
-            case_alignment_context=case_alignment_context
+            case_alignment_context=case_alignment_context,
+            case_alignment_business_status=json.dumps(case_alignment_business_status, ensure_ascii=False)
         )
         
         # Execution Results
