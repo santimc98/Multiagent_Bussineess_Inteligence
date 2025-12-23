@@ -37,6 +37,8 @@ class ResultsAdvisorAgent:
         system_prompt = (
             "You are a senior ML reviewer focused on business alignment. "
             "Given evaluation artifacts and business alignment, produce improvement guidance. "
+            "Prioritize structural changes when alignment metrics fail (objective/constraints/penalties) "
+            "before tuning hyperparameters. Compare current vs previous iteration if provided. "
             "Return 3-6 short lines. Format each line as: "
             "ISSUE: <what failed>; WHY: <root cause>; FIX: <specific change>. "
             "Do NOT include code. Do NOT restate the full metrics dump."
@@ -71,10 +73,22 @@ class ResultsAdvisorAgent:
     def _fallback(self, context: Dict[str, Any]) -> str:
         lines: List[str] = []
         case_report = context.get("case_alignment_report", {}) or {}
+        prev_report = context.get("previous_case_alignment_report", {}) or {}
         failures = case_report.get("failures", []) or []
         metrics = case_report.get("metrics", {}) or {}
         weights = context.get("weights", {}) or {}
         output_report = context.get("output_contract_report", {}) or {}
+        if prev_report:
+            prev_metrics = prev_report.get("metrics", {}) or {}
+            try:
+                curr_spear = float(metrics.get("spearman_case_means", 0))
+                prev_spear = float(prev_metrics.get("spearman_case_means", 0))
+                if curr_spear < prev_spear:
+                    lines.append(
+                        "ISSUE: case-level alignment regressed vs prior run; WHY: objective still global-first; FIX: make case-order penalty primary and increase its weight."
+                    )
+            except Exception:
+                pass
 
         if failures:
             if "spearman_case_means" in failures:

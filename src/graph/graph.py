@@ -876,6 +876,30 @@ def _summarize_case_summary(path: str) -> Dict[str, Any]:
         "respects_order_false": false_count,
         "case_col": case_col,
     }
+
+def _persist_iteration_artifacts(iter_id: int) -> Dict[str, str]:
+    if not iter_id or iter_id < 1:
+        return {}
+    import shutil
+    os.makedirs(os.path.join("artifacts", "iterations"), exist_ok=True)
+    mappings = {
+        "case_alignment_report": ("data/case_alignment_report.json", f"case_alignment_report_iter_{iter_id}.json"),
+        "weights": ("data/weights.json", f"weights_iter_{iter_id}.json"),
+        "metrics": ("data/metrics.json", f"metrics_iter_{iter_id}.json"),
+        "case_summary": ("data/case_summary.csv", f"case_summary_iter_{iter_id}.csv"),
+        "scored_rows": ("data/scored_rows.csv", f"scored_rows_iter_{iter_id}.csv"),
+    }
+    saved: Dict[str, str] = {}
+    for key, (src, dst_name) in mappings.items():
+        if not os.path.exists(src):
+            continue
+        dst = os.path.join("artifacts", "iterations", dst_name)
+        try:
+            shutil.copyfile(src, dst)
+            saved[key] = dst
+        except Exception:
+            continue
+    return saved
 # 1. Define State
 class AgentState(TypedDict):
     csv_path: str
@@ -3005,6 +3029,8 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             json.dump(case_report, f, indent=2)
     except Exception as err:
         print(f"Warning: failed to persist case_alignment_report.json: {err}")
+    iter_id = int(state.get("iteration_count", 0)) + 1
+    saved_iter_artifacts = _persist_iteration_artifacts(iter_id)
 
     if case_report.get("status") == "FAIL":
         feedback = f"CASE_ALIGNMENT_GATE_FAILED: {case_report.get('explanation')}"
@@ -3090,7 +3116,12 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         result_state["budget_counters"] = review_counters
     if status == "NEEDS_IMPROVEMENT":
         try:
+            prev_case_report = _load_json_safe(
+                os.path.join("artifacts", "iterations", f"case_alignment_report_iter_{iter_id - 1}.json")
+            ) if iter_id > 1 else {}
             advisor_ctx = {
+                "iteration_id": iter_id,
+                "previous_case_alignment_report": prev_case_report,
                 "case_alignment_report": case_report,
                 "output_contract_report": oc_report,
                 "case_summary_stats": _summarize_case_summary("data/case_summary.csv"),
@@ -3098,6 +3129,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 "metrics": _load_json_safe("data/metrics.json"),
                 "business_alignment": contract.get("business_alignment", {}),
                 "spec_extraction": contract.get("spec_extraction", {}),
+                "saved_iteration_artifacts": saved_iter_artifacts,
             }
             advice = results_advisor.generate_ml_advice(advisor_ctx)
             if advice:
