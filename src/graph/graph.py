@@ -2236,6 +2236,7 @@ def run_engineer(state: AgentState) -> AgentState:
         aliasing = {}
         derived_present = []
         sample_context = ""
+        context_ops_blocks = []
         if header_cols:
             norm_map = {}
             norm_buckets = {}
@@ -2275,6 +2276,50 @@ def run_engineer(state: AgentState) -> AgentState:
             if sample_context:
                 data_audit_context = _merge_de_audit_override(data_audit_context, sample_context)
                 kwargs["data_audit_context"] = data_audit_context
+            try:
+                derived_cols = _resolve_contract_columns(execution_contract, sources={"derived"}) or []
+                output_cols = _resolve_contract_columns(execution_contract, sources={"output"}) or []
+                target_cols = [c for c in derived_cols + output_cols if c]
+                if target_cols:
+                    summary = {}
+                    for tgt in target_cols:
+                        norm = _norm_name(tgt)
+                        actual = norm_map.get(norm, tgt if tgt in header_cols else None)
+                        if not actual:
+                            continue
+                        series_stats = {"present": True}
+                        try:
+                            import pandas as pd
+                            df_preview = pd.read_csv(
+                                data_path,
+                                sep=csv_sep,
+                                decimal=csv_decimal,
+                                encoding=csv_encoding,
+                                usecols=[actual],
+                                nrows=200,
+                                low_memory=False,
+                            )
+                            series = df_preview[actual]
+                            series_stats["non_null"] = int(series.notna().sum())
+                            series_stats["nunique"] = int(series.nunique(dropna=False))
+                            series_stats["sample"] = [str(v) for v in series.dropna().head(3).tolist()]
+                        except Exception:
+                            pass
+                        summary[tgt] = series_stats
+                    if summary:
+                        context_ops_blocks.append(
+                            "DERIVED_OUTPUT_OBSERVATIONS:\n" + json.dumps(summary, ensure_ascii=True)
+                        )
+            except Exception:
+                pass
+            try:
+                business_alignment = (execution_contract or {}).get("business_alignment", {})
+                if business_alignment:
+                    context_ops_blocks.append(
+                        "BUSINESS_ALIGNMENT_OPERATIVE:\n" + json.dumps(business_alignment, ensure_ascii=True)
+                    )
+            except Exception:
+                pass
         try:
             os.makedirs("artifacts", exist_ok=True)
             ctx_payload = {
@@ -2286,6 +2331,7 @@ def run_engineer(state: AgentState) -> AgentState:
                 "cleaned_aliasing_collisions": aliasing if header_cols else {},
                 "derived_columns_present": derived_present if header_cols else [],
                 "raw_required_sample_context": sample_context,
+                "context_ops_blocks": context_ops_blocks,
                 "required_features": strategy.get("required_columns", []),
                 "execution_contract": execution_contract,
                 "data_audit_context": data_audit_context,
@@ -2295,6 +2341,10 @@ def run_engineer(state: AgentState) -> AgentState:
                 json.dump(ctx_payload, f_ctx, indent=2, ensure_ascii=False)
         except Exception as ctx_err:
             print(f"Warning: failed to persist ml_engineer_context.json: {ctx_err}")
+        if context_ops_blocks:
+            ops_payload = "\n\n".join(context_ops_blocks)
+            data_audit_context = _merge_de_audit_override(data_audit_context, ops_payload)
+            kwargs["data_audit_context"] = data_audit_context
         code = ml_engineer.generate_code(**kwargs)
         try:
             os.makedirs("artifacts", exist_ok=True)
