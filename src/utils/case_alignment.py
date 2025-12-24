@@ -196,6 +196,8 @@ def build_case_alignment_report(
     data_paths = data_paths or []
     contract = contract or {}
     gates = contract.get("quality_gates") or {}
+    if not isinstance(gates, dict):
+        gates = {}
 
     defaults = {
         "spearman_min": 0.85,

@@ -360,6 +360,132 @@ def _ensure_scored_rows_output(contract: Dict[str, Any]) -> Dict[str, Any]:
         contract["required_outputs"] = outputs
     return contract
 
+def _normalize_execution_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return {}
+    normalized = dict(contract)
+
+    quality_gates = normalized.get("quality_gates")
+    if isinstance(quality_gates, list):
+        normalized["quality_gates_raw"] = quality_gates
+        normalized["quality_gates"] = {}
+    elif not isinstance(quality_gates, dict):
+        normalized["quality_gates"] = {}
+
+    spec = normalized.get("spec_extraction")
+    if spec is None or not isinstance(spec, dict):
+        normalized["spec_extraction"] = {}
+        spec = normalized["spec_extraction"]
+
+    derived = spec.get("derived_columns")
+    if isinstance(derived, list) and derived:
+        if all(isinstance(item, str) for item in derived):
+            spec["derived_columns"] = [
+                {"name": name, "formula": None, "depends_on": [], "constraints": []}
+                for name in derived
+                if name
+            ]
+
+    if not spec.get("scoring_formula"):
+        formulas = spec.get("formulas")
+        if isinstance(formulas, list) and formulas:
+            chosen = None
+            for formula in formulas:
+                if isinstance(formula, str) and "score_nuevo" in formula.lower():
+                    chosen = formula
+                    break
+            if not chosen:
+                first = formulas[0]
+                chosen = first if isinstance(first, str) else None
+            if chosen:
+                spec["scoring_formula"] = chosen
+
+    ba = normalized.get("business_alignment")
+    if not isinstance(ba, dict):
+        ba = {}
+    optimization_priorities = ba.get("optimization_priorities")
+    if not isinstance(optimization_priorities, list) or not optimization_priorities:
+        target_type = str(spec.get("target_type") or "").lower()
+        derived_cols = spec.get("derived_columns") or []
+        derived_names = []
+        if isinstance(derived_cols, list):
+            for item in derived_cols:
+                if isinstance(item, dict):
+                    name = item.get("name")
+                else:
+                    name = item
+                if name:
+                    derived_names.append(str(name).lower())
+        has_cases = bool(spec.get("case_taxonomy")) or any("case" in name or "caso" in name for name in derived_names)
+        has_refscore = any("refscore" in name for name in derived_names)
+        if has_cases and (("rank" in target_type) or ("ordinal" in target_type) or has_refscore):
+            optimization_priorities = [
+                {
+                    "priority": 1,
+                    "goal": "minimize_case_order_violations",
+                    "metric": "case_order_violations",
+                    "direction": "minimize",
+                },
+                {
+                    "priority": 2,
+                    "goal": "maximize_case_level_rank_correlation",
+                    "metric": "case_level_spearman",
+                    "direction": "maximize",
+                },
+                {
+                    "priority": 3,
+                    "goal": "maximize_global_rank_correlation",
+                    "metric": "spearman",
+                    "direction": "maximize",
+                },
+            ]
+        else:
+            optimization_priorities = [
+                {
+                    "priority": 1,
+                    "goal": "maximize_global_rank_correlation",
+                    "metric": "spearman",
+                    "direction": "maximize",
+                }
+            ]
+    ba["optimization_priorities"] = optimization_priorities
+
+    acceptance = ba.get("acceptance_criteria")
+    if not isinstance(acceptance, dict):
+        acceptance = {}
+    gates = normalized.get("quality_gates") or {}
+    if isinstance(gates, dict):
+        if acceptance.get("spearman_min") is None and gates.get("spearman_min") is not None:
+            acceptance["spearman_min"] = gates.get("spearman_min")
+        if acceptance.get("case_order_violations_max") is None and gates.get("violations_max") is not None:
+            acceptance["case_order_violations_max"] = gates.get("violations_max")
+    ba["acceptance_criteria"] = acceptance
+    normalized["business_alignment"] = ba
+
+    return normalized
+
+def _detect_refscore_alias(execution_output: str, contract: Dict[str, Any]) -> bool:
+    if not execution_output or not isinstance(contract, dict):
+        return False
+    derived_target = False
+    for req in contract.get("data_requirements", []) or []:
+        if not isinstance(req, dict):
+            continue
+        name = (req.get("canonical_name") or req.get("name") or "").lower()
+        role = (req.get("role") or "").lower()
+        source = (req.get("source") or "input").lower()
+        if role == "target" and "refscore" in name and source == "derived":
+            derived_target = True
+            break
+    if not derived_target:
+        return False
+    alias_patterns = [
+        '"RefScore": "Score"',
+        "'RefScore': 'Score'",
+        "RefScore -> Score",
+    ]
+    return any(pat in execution_output for pat in alias_patterns)
+
 DEFAULT_RUN_BUDGET = {
     "max_de_calls": 4,
     "max_ml_calls": 5,
@@ -1329,6 +1455,7 @@ def run_execution_planner(state: AgentState) -> AgentState:
             "required_outputs": ["data/cleaned_data.csv"],
             "notes_for_engineers": ["Planner failed; use strategy + data_summary."],
         }
+    contract = _normalize_execution_contract(contract)
     contract = ensure_role_runbooks(contract)
     contract = _ensure_scored_rows_output(contract)
     try:
@@ -3329,6 +3456,15 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         feedback_missing = f"Missing required outputs per contract: {miss_text}"
         feedback = f"{feedback}\n{feedback_missing}" if feedback else feedback_missing
         new_history.append(f"OUTPUT_CONTRACT_MISSING: {miss_text}")
+
+    if _detect_refscore_alias(execution_output, contract):
+        status = "NEEDS_IMPROVEMENT"
+        alias_msg = (
+            "TARGET_MAPPING_ERROR: RefScore is derived per contract but was mapped to Score. "
+            "Derive RefScore from case taxonomy instead of aliasing Score."
+        )
+        feedback = f"{feedback}\n{alias_msg}" if feedback else alias_msg
+        new_history.append(alias_msg)
 
     # Post-exec code audit (non-blocking warnings)
     code = state.get("generated_code") or state.get("last_generated_code") or ""
