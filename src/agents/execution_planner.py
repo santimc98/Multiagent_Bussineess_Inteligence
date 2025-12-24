@@ -112,6 +112,85 @@ class ExecutionPlannerAgent:
                         kind_map[_norm(col)] = kind
             return kind_map
 
+        def _extract_formula_tokens(formula: str) -> List[str]:
+            if not formula:
+                return []
+            tokens = re.findall(r"[A-Za-z%_][A-Za-z0-9_%]*", formula)
+            ignore = {
+                "score_nuevo",
+                "scorenuevo",
+                "score",
+                "w",
+            }
+            cleaned: List[str] = []
+            for tok in tokens:
+                tok_norm = _norm(tok)
+                if not tok_norm:
+                    continue
+                if tok_norm in ignore:
+                    continue
+                if tok_norm.startswith("w") and tok_norm[1:].isdigit():
+                    continue
+                cleaned.append(tok)
+            # preserve order, unique
+            seen = set()
+            unique = []
+            for tok in cleaned:
+                tok_norm = _norm(tok)
+                if tok_norm in seen:
+                    continue
+                seen.add(tok_norm)
+                unique.append(tok)
+            return unique
+
+        def _guess_expected_range(name: str) -> List[float] | None:
+            if not name:
+                return None
+            lower = name.lower()
+            if "%" in name or "norm" in lower or "score" in lower or "impact" in lower:
+                return [0, 1]
+            return None
+
+        def _ensure_formula_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return {}
+            spec = contract.get("spec_extraction")
+            if not isinstance(spec, dict):
+                return contract
+            formula = spec.get("scoring_formula") or ""
+            if not isinstance(formula, str) or not formula.strip():
+                return contract
+            reqs = contract.get("data_requirements", []) or []
+            existing = {_norm(r.get("canonical_name") or r.get("name")) for r in reqs if isinstance(r, dict)}
+            derived_cols = spec.get("derived_columns") or []
+            derived_names = {
+                _norm(dc.get("name"))
+                for dc in derived_cols
+                if isinstance(dc, dict) and dc.get("name")
+            }
+            tokens = _extract_formula_tokens(formula)
+            for tok in tokens:
+                tok_norm = _norm(tok)
+                if not tok_norm or tok_norm in existing:
+                    continue
+                source = "derived" if tok_norm in derived_names else "input"
+                raw_match = _resolve_exact_header(tok)
+                canonical = raw_match or tok
+                reqs.append(
+                    {
+                        "name": tok,
+                        "role": "feature",
+                        "expected_range": _guess_expected_range(tok),
+                        "allowed_null_frac": None,
+                        "source": source,
+                        "expected_kind": "numeric",
+                        "canonical_name": canonical,
+                    }
+                )
+                existing.add(tok_norm)
+            contract["data_requirements"] = reqs
+            return contract
+
         def _apply_expected_kind(contract: Dict[str, Any]) -> Dict[str, Any]:
             if not isinstance(contract, dict):
                 return {}
@@ -643,6 +722,7 @@ class ExecutionPlannerAgent:
                 },
                 "planner_self_check": [],
             }
+            contract = _ensure_formula_requirements(contract)
             contract = _apply_inventory_source(contract)
             contract = _apply_expected_kind(contract)
             contract = _ensure_case_id_requirement(contract)
@@ -749,6 +829,7 @@ Return the contract JSON.
                     "regularization": {"l2": 0.05, "concentration_penalty": 0.1},
                     "ranking_loss": "hinge_pairwise",
                 }
+            contract = _ensure_formula_requirements(contract)
             contract = _apply_inventory_source(contract)
             contract = _apply_expected_kind(contract)
             contract = _ensure_case_id_requirement(contract)
