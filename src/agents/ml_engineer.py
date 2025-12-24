@@ -1,7 +1,7 @@
 import os
 from typing import Dict, Any, List
 from dotenv import load_dotenv
-from zai import ZaiClient
+from openai import OpenAI
 
 load_dotenv()
 
@@ -17,14 +17,18 @@ _scan_code_safety_ref = "scan_code_safety"
 class MLEngineerAgent:
     def __init__(self, api_key: str = None):
         """
-        Initializes the ML Engineer Agent with GLM 4.7.
+        Initializes the ML Engineer Agent with MIMO v2 Flash.
         """
-        self.api_key = api_key or os.getenv("GLM_API_KEY")
+        self.api_key = api_key or os.getenv("MIMO_API_KEY")
         if not self.api_key:
-            raise ValueError("GLM API Key is required.")
+            raise ValueError("MIMO API Key is required.")
 
-        self.client = ZaiClient(api_key=self.api_key)
-        self.model_name = "glm-4.7"
+        self.client = OpenAI(
+            api_key=self.api_key,
+            base_url="https://api.xiaomimimo.com/v1",
+            timeout=None,
+        )
+        self.model_name = "mimo-v2-flash"
 
     def generate_code(
         self,
@@ -299,20 +303,18 @@ class MLEngineerAgent:
             current_temp = 0.1
 
         from src.utils.retries import call_with_retries
-        from src.utils.llm_throttle import glm_call_slot
 
         def _call_model():
-            print(f"DEBUG: ML Engineer calling GLM Model ({self.model_name})...")
-            with glm_call_slot():
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_message}
-                    ],
-                    temperature=current_temp
-                )
-                content = response.choices[0].message.content
+            print(f"DEBUG: ML Engineer calling MIMO Model ({self.model_name})...")
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message}
+                ],
+                temperature=current_temp
+            )
+            content = response.choices[0].message.content
             
             # CRITICAL CHECK FOR SERVER ERRORS (HTML/504)
             if "504 Gateway Time-out" in content or "<html" in content.lower():
@@ -321,7 +323,7 @@ class MLEngineerAgent:
 
         try:
             content = call_with_retries(_call_model, max_retries=5, backoff_factor=2, initial_delay=2)
-            print("DEBUG: GLM response received.")
+            print("DEBUG: MIMO response received.")
             code = self._clean_code(content)
             if code.strip().startswith("{") or code.strip().startswith("["):
                 return "# Error: ML_CODE_REQUIRED"
