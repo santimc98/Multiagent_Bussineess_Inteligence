@@ -293,6 +293,29 @@ def _filter_input_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     new_contract["data_requirements"] = filtered
     return new_contract
 
+def _filter_contract_for_data_engineer(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a shallow copy of contract without model output-only requirements."""
+    if not isinstance(contract, dict):
+        return {}
+    reqs = contract.get("data_requirements", []) or []
+    filtered = []
+    canonical_cols: List[str] = []
+    for req in reqs:
+        if not isinstance(req, dict):
+            continue
+        role = (req.get("role") or "").lower()
+        if role == "output":
+            continue
+        filtered.append(req)
+        name = req.get("canonical_name") or req.get("name")
+        if name:
+            canonical_cols.append(name)
+    new_contract = dict(contract)
+    new_contract["data_requirements"] = filtered
+    if canonical_cols:
+        new_contract["canonical_columns"] = canonical_cols
+    return new_contract
+
 def _resolve_required_input_columns(contract: Dict[str, Any], strategy: Dict[str, Any]) -> List[str]:
     if contract and isinstance(contract, dict):
         contract_reqs = contract.get("data_requirements", []) or []
@@ -1381,6 +1404,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
         if sample_context:
             data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, sample_context)
     state["data_engineer_audit_override"] = data_engineer_audit_override
+    de_contract = _filter_contract_for_data_engineer(state.get("execution_contract", {}))
     try:
         os.makedirs("artifacts", exist_ok=True)
         context_payload = {
@@ -1390,7 +1414,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "csv_decimal": csv_decimal,
             "header_cols": header_cols,
             "required_input_columns": _resolve_required_input_columns(state.get("execution_contract", {}), selected),
-            "required_all_columns": _resolve_contract_columns(state.get("execution_contract", {})),
+            "required_all_columns": _resolve_contract_columns(de_contract),
             "required_raw_header_map": required_raw_map,
             "raw_required_sample_context": sample_context,
             "data_engineer_audit_override": data_engineer_audit_override,
@@ -1409,7 +1433,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
         csv_encoding=csv_encoding,
         csv_sep=csv_sep,
         csv_decimal=csv_decimal,
-        execution_contract=state.get("execution_contract", {}),
+        execution_contract=de_contract,
     )
     try:
         os.makedirs("artifacts", exist_ok=True)
