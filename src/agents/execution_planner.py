@@ -127,6 +127,23 @@ class ExecutionPlannerAgent:
                         kind_map[_norm(col)] = kind
             return kind_map
 
+        def _guess_kind_from_name(name: str) -> str | None:
+            if not name:
+                return None
+            raw = str(name)
+            norm_name = _norm(raw)
+            if not norm_name:
+                return None
+            if any(tok in norm_name for tok in ["date", "time", "fecha", "day", "month", "year"]):
+                return "datetime"
+            if any(tok in norm_name for tok in ["salesrep", "owner", "channel", "sector", "category", "type", "status", "phase", "segment", "email", "phone", "country", "city", "region", "industry", "name"]):
+                return "categorical"
+            if any(tok in norm_name for tok in ["id", "uuid", "code", "ref"]):
+                return "categorical"
+            if "%" in raw or any(tok in norm_name for tok in ["pct", "percent", "ratio", "rate", "prob", "score", "amount", "price", "size", "debt", "count", "number", "num", "qty"]):
+                return "numeric"
+            return None
+
         def _extract_formula_tokens(formula: str) -> List[str]:
             if not formula:
                 return []
@@ -221,8 +238,12 @@ class ExecutionPlannerAgent:
                 if norm_name in kind_map:
                     req["expected_kind"] = kind_map[norm_name]
                     continue
+                inferred = _guess_kind_from_name(name or "")
+                if inferred:
+                    req["expected_kind"] = inferred
+                    continue
                 role = (req.get("role") or "").lower()
-                if role in {"percentage", "feature", "risk_score", "probability", "ratio"}:
+                if role in {"percentage", "risk_score", "probability", "ratio"}:
                     req["expected_kind"] = "numeric"
                 elif role == "categorical":
                     req["expected_kind"] = "categorical"
@@ -262,6 +283,37 @@ class ExecutionPlannerAgent:
                     req["source"] = "derived"
                 updated_reqs.append(req)
             contract["data_requirements"] = updated_reqs
+            return contract
+
+        def _ensure_strategy_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            required = strategy.get("required_columns", []) if isinstance(strategy, dict) else []
+            if not required:
+                return contract
+            reqs = contract.get("data_requirements", []) or []
+            existing = {_norm(r.get("canonical_name") or r.get("name")) for r in reqs if isinstance(r, dict)}
+            for col in required:
+                if not col:
+                    continue
+                norm = _norm(col)
+                if not norm or norm in existing:
+                    continue
+                raw_match = _resolve_exact_header(col)
+                canonical = raw_match or _canonicalize_name(col)
+                reqs.append(
+                    {
+                        "name": col,
+                        "role": "feature",
+                        "expected_range": _guess_expected_range(col),
+                        "allowed_null_frac": None,
+                        "source": "input",
+                        "expected_kind": None,
+                        "canonical_name": canonical,
+                    }
+                )
+                existing.add(norm)
+            contract["data_requirements"] = reqs
             return contract
 
         def _attach_canonical_names(contract: Dict[str, Any]) -> Dict[str, Any]:
@@ -305,6 +357,21 @@ class ExecutionPlannerAgent:
                 contract["notes_for_engineers"] = notes
             return contract
 
+        def _propagate_business_alignment(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            ba = contract.get("business_alignment")
+            if not isinstance(ba, dict):
+                return contract
+            runbooks = contract.get("role_runbooks")
+            if isinstance(runbooks, dict):
+                ml_runbook = runbooks.get("ml_engineer")
+                if isinstance(ml_runbook, dict):
+                    ml_runbook["business_alignment"] = ba
+                    runbooks["ml_engineer"] = ml_runbook
+                    contract["role_runbooks"] = runbooks
+            return contract
+
         def _ensure_case_id_requirement(contract: Dict[str, Any]) -> Dict[str, Any]:
             if not isinstance(contract, dict):
                 return contract
@@ -342,6 +409,27 @@ class ExecutionPlannerAgent:
             if note not in notes:
                 notes.append(note)
             contract["notes_for_engineers"] = notes
+            return contract
+
+        def _attach_strategy_context(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            strategy_ctx = {
+                "title": strategy.get("title") if isinstance(strategy, dict) else None,
+                "analysis_type": strategy.get("analysis_type") if isinstance(strategy, dict) else None,
+                "hypothesis": strategy.get("hypothesis") if isinstance(strategy, dict) else None,
+                "techniques": strategy.get("techniques", []) if isinstance(strategy, dict) else [],
+                "required_columns": strategy.get("required_columns", []) if isinstance(strategy, dict) else [],
+                "estimated_difficulty": strategy.get("estimated_difficulty") if isinstance(strategy, dict) else None,
+            }
+            contract["strategy_context"] = strategy_ctx
+            runbooks = contract.get("role_runbooks")
+            if isinstance(runbooks, dict):
+                ml_runbook = runbooks.get("ml_engineer")
+                if isinstance(ml_runbook, dict):
+                    ml_runbook["strategy_context"] = strategy_ctx
+                    runbooks["ml_engineer"] = ml_runbook
+                    contract["role_runbooks"] = runbooks
             return contract
 
         def _detect_canonical_collisions() -> List[tuple[str, List[str]]]:
@@ -574,6 +662,133 @@ class ExecutionPlannerAgent:
             contract["notes_for_engineers"] = notes
             return contract
 
+        def _build_feature_semantics(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
+            if not isinstance(contract, dict):
+                return []
+            reqs = contract.get("data_requirements", []) or []
+            semantics: List[Dict[str, Any]] = []
+            for req in reqs:
+                if not isinstance(req, dict):
+                    continue
+                name = req.get("canonical_name") or req.get("name")
+                if not name:
+                    continue
+                role = req.get("role")
+                kind = req.get("expected_kind")
+                norm_name = _norm(name)
+                meaning = None
+                expectation = None
+                risk = None
+
+                if any(tok in norm_name for tok in ["amount", "price", "value", "revenue", "importe", "monto"]):
+                    meaning = "monetary value of the contract or deal size"
+                    expectation = "larger values typically indicate higher revenue; treat as outcome or pricing target"
+                elif any(tok in norm_name for tok in ["size", "turnover", "facturacion", "ingresos"]):
+                    meaning = "client scale or capacity (turnover / size)"
+                    expectation = "larger clients may support higher contract values; conversion impact may be non-linear"
+                elif any(tok in norm_name for tok in ["debt", "debtor", "risk", "riim"]):
+                    meaning = "risk or exposure proxy tied to client behavior"
+                    expectation = "higher risk may reduce conversion or price tolerance"
+                elif any(tok in norm_name for tok in ["sector", "industry"]):
+                    meaning = "industry segment describing client context"
+                    expectation = "segment effects are categorical; compare within sector"
+                elif any(tok in norm_name for tok in ["phase", "status", "contract"]):
+                    meaning = "deal outcome or stage indicator"
+                    expectation = "use to derive success labels, not as a predictive feature for conversion"
+                    risk = "post-outcome fields can leak target information"
+                elif any(tok in norm_name for tok in ["probability", "score"]):
+                    meaning = "prior probability or scoring output"
+                    expectation = "validate whether it is input signal or model output before use"
+                elif any(tok in norm_name for tok in ["date", "time", "day", "month", "year"]):
+                    meaning = "temporal marker for event timing"
+                    expectation = "use to derive cycle duration or ordering; avoid leaking post-outcome dates"
+                    risk = "post-event dates can leak conversion outcome"
+                elif any(tok in norm_name for tok in ["channel", "salesrep", "owner", "agent"]):
+                    meaning = "operational or assignment attribute"
+                    expectation = "high-cardinality categorical; may require grouping to avoid overfitting"
+                elif any(tok in norm_name for tok in ["reason", "comment", "note", "desc"]):
+                    meaning = "free-text context or explanation"
+                    expectation = "high-cardinality text; use with caution or exclude in small samples"
+
+                if meaning is None:
+                    meaning = "feature or identifier relevant to the business context"
+
+                semantics.append(
+                    {
+                        "column": name,
+                        "role": role,
+                        "expected_kind": kind,
+                        "business_meaning": meaning,
+                        "directional_expectation": expectation,
+                        "risk_notes": risk,
+                    }
+                )
+            return semantics
+
+        def _build_business_sanity_checks(
+            contract: Dict[str, Any],
+            feature_semantics: List[Dict[str, Any]],
+        ) -> List[str]:
+            if not isinstance(contract, dict):
+                return []
+            checks: List[str] = []
+            roles = [str(req.get("role") or "").lower() for req in contract.get("data_requirements", []) if isinstance(req, dict)]
+            has_reg_target = any("target_regression" in role or role == "target" for role in roles)
+            has_cls_target = any("target_classification" in role for role in roles)
+            if has_reg_target and has_cls_target:
+                checks.append(
+                    "If a conversion model is trained, ensure contract-value fields are not used as predictors when they only exist after success."
+                )
+            for item in feature_semantics:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("risk_notes"):
+                    checks.append(f"Review potential leakage for column '{item.get('column')}'.")
+            checks.append("If predicted conversion rises with higher price in most segments, re-check leakage or label leakage.")
+            checks.append("If recommendations exceed historical max by a large margin, treat as a hypothesis and justify with evidence.")
+            checks.append("If a segment has very few samples, aggregate or downweight before recommending prices.")
+            return checks
+
+        def _attach_semantic_guidance(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            semantics = contract.get("feature_semantics")
+            if not isinstance(semantics, list) or not semantics:
+                semantics = _build_feature_semantics(contract)
+                contract["feature_semantics"] = semantics
+            sanity = contract.get("business_sanity_checks")
+            if not isinstance(sanity, list) or not sanity:
+                contract["business_sanity_checks"] = _build_business_sanity_checks(contract, semantics)
+            return contract
+
+        def _normalize_quality_gates(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            gates = contract.get("quality_gates")
+            if isinstance(gates, dict) and gates:
+                return contract
+            raw = contract.get("quality_gates_raw")
+            if not isinstance(raw, list):
+                return contract
+            normalized: Dict[str, Any] = {}
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                metric = item.get("metric")
+                threshold = item.get("threshold")
+                if metric and threshold is not None:
+                    normalized[str(metric)] = threshold
+            if normalized:
+                contract["quality_gates"] = normalized
+                planner_self_check = contract.get("planner_self_check")
+                if not isinstance(planner_self_check, list):
+                    planner_self_check = []
+                msg = "Derived quality_gates from quality_gates_raw for downstream gating."
+                if msg not in planner_self_check:
+                    planner_self_check.append(msg)
+                contract["planner_self_check"] = planner_self_check
+            return contract
+
         def _attach_spec_extraction_to_runbook(contract: Dict[str, Any]) -> Dict[str, Any]:
             if not isinstance(contract, dict):
                 return contract
@@ -592,71 +807,7 @@ class ExecutionPlannerAgent:
             return contract
 
         def _attach_business_alignment(contract: Dict[str, Any]) -> Dict[str, Any]:
-            if not isinstance(contract, dict):
-                return contract
-            spec = contract.get("spec_extraction", {}) if isinstance(contract.get("spec_extraction"), dict) else {}
-            target_type = str(spec.get("target_type") or "").lower()
-            has_cases = bool(spec.get("case_taxonomy"))
-            quality_gates = contract.get("quality_gates", {}) if isinstance(contract.get("quality_gates"), dict) else {}
-            priorities: List[Dict[str, Any]] = []
-            acceptance: Dict[str, Any] = {}
-            notes: List[str] = []
-
-            if has_cases and target_type in {"ordinal", "ranking"}:
-                priorities.append(
-                    {
-                        "priority": 1,
-                        "goal": "minimize_case_order_violations",
-                        "metric": "case_order_violations",
-                        "direction": "minimize",
-                    }
-                )
-                priorities.append(
-                    {
-                        "priority": 2,
-                        "goal": "maximize_case_level_rank_correlation",
-                        "metric": "case_level_spearman",
-                        "direction": "maximize",
-                    }
-                )
-                priorities.append(
-                    {
-                        "priority": 3,
-                        "goal": "maximize_global_rank_correlation",
-                        "metric": "spearman",
-                        "direction": "maximize",
-                    }
-                )
-                acceptance["case_order_violations_max"] = quality_gates.get("violations_max", 0)
-                acceptance["spearman_min"] = quality_gates.get("spearman_min")
-                notes.append(
-                    "Primary objective is case ordering consistency; global ranking is secondary when case taxonomy is defined."
-                )
-            else:
-                priorities.append(
-                    {
-                        "priority": 1,
-                        "goal": "maximize_global_rank_correlation",
-                        "metric": "spearman",
-                        "direction": "maximize",
-                    }
-                )
-                acceptance["spearman_min"] = quality_gates.get("spearman_min")
-
-            contract["business_alignment"] = {
-                "optimization_priorities": priorities,
-                "acceptance_criteria": acceptance,
-                "notes": notes,
-            }
-
-            runbooks = contract.get("role_runbooks")
-            if isinstance(runbooks, dict):
-                ml_runbook = runbooks.get("ml_engineer")
-                if isinstance(ml_runbook, dict):
-                    ml_runbook["business_alignment"] = contract["business_alignment"]
-                    runbooks["ml_engineer"] = ml_runbook
-                    contract["role_runbooks"] = runbooks
-            return contract
+            return _propagate_business_alignment(contract)
 
         def _fallback() -> Dict[str, Any]:
             required_cols = strategy.get("required_columns", []) or []
@@ -738,6 +889,7 @@ class ExecutionPlannerAgent:
                 "planner_self_check": [],
             }
             contract = _ensure_formula_requirements(contract)
+            contract = _ensure_strategy_requirements(contract)
             contract = _apply_inventory_source(contract)
             contract = _apply_expected_kind(contract)
             contract = _ensure_case_id_requirement(contract)
@@ -746,8 +898,11 @@ class ExecutionPlannerAgent:
             contract = ensure_role_runbooks(contract)
             contract = _attach_data_risks(contract)
             contract = _attach_spec_extraction_issues(contract)
+            contract = _normalize_quality_gates(contract)
             contract = _ensure_spec_extraction(contract)
             contract = _attach_business_alignment(contract)
+            contract = _attach_strategy_context(contract)
+            contract = _attach_semantic_guidance(contract)
             return _attach_spec_extraction_to_runbook(contract)
 
         if not self.client:
@@ -775,11 +930,21 @@ Requirements:
 - Include role_runbooks to guide reasoning (goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist).
 - COLUMN INVENTORY (detected from CSV header) to help decide source input/derived: $column_inventory
 - required_dependencies is optional; include only if strongly implied by the strategy title or data_summary.
-- Include quality_gates and optimization_preferences when relevant.
-- Include business_alignment with ordered optimization priorities and acceptance criteria.
+- ALWAYS include quality_gates with explicit metrics + thresholds for this specific business objective.
+  Do NOT leave quality_gates empty. Do NOT rely on defaults.
+- If you use quality_gates_raw (list form), also populate quality_gates (metric -> threshold) so evaluators can act.
+- ALWAYS include business_alignment with ordered optimization priorities and acceptance criteria.
+  This must be derived from the objective (not generic).
 - SPEC EXTRACTION: map explicit formulas, derived columns, cases, constraints, deliverables, target_type, leakage_policy.
   If not stated, leave empty/null; do not invent.
-- SELF CHECK: short statements validating that spec_extraction and validations match the stated objective.
+- Infer expected_kind using evidence from data_summary and column inventory. If a column looks like a person/role/channel/sector
+  or identifier, treat as categorical; if it looks like a date/time, treat as datetime; otherwise use numeric only when justified.
+- Provide feature_semantics (short business meaning per column) and business_sanity_checks (checks to interpret results).
+  These are reasoning aids, not hard rules.
+- If the objective involves pricing, segmentation, or threshold-based recommendations, consider whether a derived tier/segment
+  column (e.g., size deciles or sector groups) would materially improve downstream reasoning; include it only if justified
+  by the strategy and data. Do not treat tiering as universally required.
+- SELF CHECK: short statements confirming you defined quality_gates and business_alignment consistent with the objective.
   """
         ).substitute(column_inventory=column_inventory_json)
         user_prompt_template = Template(
@@ -816,20 +981,11 @@ Return the contract JSON.
             if "required_dependencies" not in contract:
                 contract["required_dependencies"] = []
             if "quality_gates" not in contract:
-                contract["quality_gates"] = {
-                    "spearman_min": 0.85,
-                    "violations_max": 0,
-                    "inactive_share_max": 0.01,
-                    "max_weight_max": 0.70,
-                    "hhi_max": 0.60,
-                    "near_zero_max": 1,
-                }
+                contract["quality_gates"] = {}
             if "optimization_preferences" not in contract:
-                contract["optimization_preferences"] = {
-                    "regularization": {"l2": 0.05, "concentration_penalty": 0.1},
-                    "ranking_loss": "hinge_pairwise",
-                }
+                contract["optimization_preferences"] = {}
             contract = _ensure_formula_requirements(contract)
+            contract = _ensure_strategy_requirements(contract)
             contract = _apply_inventory_source(contract)
             contract = _apply_expected_kind(contract)
             contract = _ensure_case_id_requirement(contract)
@@ -838,8 +994,11 @@ Return the contract JSON.
             contract = ensure_role_runbooks(contract)
             contract = _attach_data_risks(contract)
             contract = _attach_spec_extraction_issues(contract)
+            contract = _normalize_quality_gates(contract)
             contract = _ensure_spec_extraction(contract)
             contract = _attach_business_alignment(contract)
+            contract = _attach_strategy_context(contract)
+            contract = _attach_semantic_guidance(contract)
             return _attach_spec_extraction_to_runbook(contract)
         except Exception:
             return _fallback()

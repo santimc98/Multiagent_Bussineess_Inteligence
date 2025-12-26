@@ -71,6 +71,7 @@ class BusinessTranslatorAgent:
         integrity_audit = _safe_load_json("data/integrity_audit_report.json") or {}
         output_contract_report = _safe_load_json("data/output_contract_report.json") or {}
         case_alignment_report = _safe_load_json("data/case_alignment_report.json") or {}
+        plot_insights = _safe_load_json("data/plot_insights.json") or {}
 
         def _summarize_integrity():
             issues = integrity_audit.get("issues", []) if isinstance(integrity_audit, dict) else []
@@ -115,6 +116,13 @@ class BusinessTranslatorAgent:
             failures = case_alignment_report.get("failures", [])
             metrics = case_alignment_report.get("metrics", {})
             thresholds = case_alignment_report.get("thresholds", {})
+            if status == "SKIPPED":
+                return {
+                    "label": "PENDIENTE_DEFINICION_GATES",
+                    "status": "SKIPPED",
+                    "message": "No se definieron gates de alineación de casos en el contrato.",
+                    "recommendation": "Definir métricas y umbrales en el contrato para evaluar preparación de negocio.",
+                }
             if status == "PASS":
                 return {
                     "label": "APTO_CONDICIONAL",
@@ -168,6 +176,7 @@ class BusinessTranslatorAgent:
         - Output Contract: $output_contract_context
         - Case Alignment QA: $case_alignment_context
         - Business Readiness (Case Alignment): $case_alignment_business_status
+        - Plot Insights (data-driven): $plot_insights_json
         
         ERROR CONDITION:
         $error_condition
@@ -185,6 +194,8 @@ class BusinessTranslatorAgent:
         2. Execution: What did the agents do? (Cleaned data, ran $analysis_type model).
         3. Explain the provided charts or results (found in the context below).
         4. Conclusion: Did we validate the hypothesis?
+        Use Plot Insights to describe what each chart *shows* (key numbers, shifts, thresholds), not just
+        what the chart type is.
         If Business Readiness indicates NO_APTO_PARA_PRODUCCION, explicitly state it and summarize the main failure reasons and recommendation in executive language.
         
         OUTPUT: Markdown format (NO TABLES).
@@ -203,7 +214,8 @@ class BusinessTranslatorAgent:
             integrity_context=integrity_context,
             output_contract_context=output_contract_context,
             case_alignment_context=case_alignment_context,
-            case_alignment_business_status=json.dumps(case_alignment_business_status, ensure_ascii=False)
+            case_alignment_business_status=json.dumps(case_alignment_business_status, ensure_ascii=False),
+            plot_insights_json=json.dumps(plot_insights, ensure_ascii=False)
         )
         
         # Execution Results

@@ -105,6 +105,8 @@ class MLEngineerAgent:
         - Required Outputs: $required_outputs
         - Canonical Columns: $canonical_columns
         - Business Alignment: $business_alignment_json
+        - Feature Semantics (business meaning): $feature_semantics_json
+        - Business Sanity Checks (interpretation aids): $business_sanity_checks_json
         - Execution Contract (json): $execution_contract_json
         - Spec Extraction (source-of-truth): $spec_extraction_json
         - ROLE RUNBOOK (ML Engineer): $ml_engineer_runbook (adhere to goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist)
@@ -134,6 +136,7 @@ class MLEngineerAgent:
         - Use the execution contract to decide which columns/roles to include, expected ranges, null thresholds, and required artifacts. Do NOT invent hardcoded rules.
         - Validate results against the contract; if a validation fails, print `FAIL_CONTRACT:<reason>` and explain.
         - If the contract marks a target as `source="derived"` or the target column is absent, derive it explicitly (document formula/logic) before training and log `DERIVED_TARGET:<name>` to stdout.
+        - Treat Feature Semantics and Business Sanity Checks as context for interpretation, not rigid constraints; if results contradict them, reconsider feature selection or leakage risks.
         
         *** DERIVED COLUMN HANDLING (MANDATORY) ***
         - If the cleaned dataset already contains derived columns listed in the execution contract (source="derived"), use them directly and do NOT recompute or overwrite them.
@@ -185,6 +188,8 @@ class MLEngineerAgent:
         - Headless: `matplotlib.use('Agg')` BEFORE importing pyplot.
         - Fail-Soft: Wrap plots in `try-except`.
         - Guarantee: Save at least one plot (`target_dist.png` or `confusion_matrix.png`).
+        - If you generate plots, also create data/plot_insights.json with data-driven takeaways per plot
+          (file name, purpose, key findings, and any metrics used). Skip if no plots are produced.
 
         *** REQUIRED CHECKS & OUTPUTS ***
         - Include the target variance guard using `y.nunique() <= 1` before training.
@@ -227,6 +232,8 @@ class MLEngineerAgent:
             required_outputs=json.dumps((execution_contract or {}).get("required_outputs", [])),
             canonical_columns=json.dumps((execution_contract or {}).get("canonical_columns", [])),
             business_alignment_json=json.dumps((execution_contract or {}).get("business_alignment", {}), indent=2),
+            feature_semantics_json=json.dumps((execution_contract or {}).get("feature_semantics", []), indent=2),
+            business_sanity_checks_json=json.dumps((execution_contract or {}).get("business_sanity_checks", []), indent=2),
             data_path=data_path,
             csv_encoding=csv_encoding,
             csv_sep=csv_sep,
