@@ -770,6 +770,15 @@ class ExecutionPlannerAgent:
                 contract["availability_summary"] = ""
             return contract
 
+        def _ensure_iteration_policy(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            if not isinstance(contract.get("compliance_checklist"), list):
+                contract["compliance_checklist"] = []
+            if not isinstance(contract.get("iteration_policy"), dict):
+                contract["iteration_policy"] = {}
+            return contract
+
         def _normalize_quality_gates(contract: Dict[str, Any]) -> Dict[str, Any]:
             if not isinstance(contract, dict):
                 return contract
@@ -865,6 +874,12 @@ class ExecutionPlannerAgent:
                 "required_dependencies": required_deps,
                 "feature_availability": [],
                 "availability_summary": "Planner fallback used; no explicit availability reasoning provided.",
+                "compliance_checklist": [],
+                "iteration_policy": {
+                    "compliance_bootstrap_max": 2,
+                    "metric_improvement_max": 6,
+                    "runtime_fix_max": 3,
+                },
                 "quality_gates": {
                     "spearman_min": 0.85,
                     "violations_max": 0,
@@ -915,6 +930,7 @@ class ExecutionPlannerAgent:
             contract = _attach_strategy_context(contract)
             contract = _attach_semantic_guidance(contract)
             contract = _ensure_availability_reasoning(contract)
+            contract = _ensure_iteration_policy(contract)
             return _attach_spec_extraction_to_runbook(contract)
 
         if not self.client:
@@ -929,7 +945,8 @@ downstream AI engineers reason better (guidance, not rigid imperative rules).
 Requirements:
 - Output JSON ONLY (no markdown/code fences).
 - Include: contract_version, strategy_title, business_objective, required_outputs, data_requirements, validations,
-  notes_for_engineers, required_dependencies, data_risks, spec_extraction, planner_self_check.
+  notes_for_engineers, required_dependencies, data_risks, spec_extraction, planner_self_check,
+  compliance_checklist, iteration_policy.
 - Include feature_availability (list of {column, availability, rationale}) and availability_summary (string).
   Use this to reason about pre-decision vs post-outcome fields and leakage risk. This is a reasoning aid, not a rule.
 - data_requirements: list of {name, role, expected_range, allowed_null_frac, source, expected_kind}.
@@ -955,6 +972,13 @@ Requirements:
   or identifier, treat as categorical; if it looks like a date/time, treat as datetime; otherwise use numeric only when justified.
 - Provide feature_semantics (short business meaning per column) and business_sanity_checks (checks to interpret results).
   These are reasoning aids, not hard rules.
+- Include compliance_checklist (list of concrete compliance items that must pass before metric tuning begins).
+  Derive it from the contract itself (quality_gates, required_outputs, leakage policy) rather than generic boilerplate.
+- Include iteration_policy with:
+  * compliance_bootstrap_max (iterations to fix compliance issues),
+  * metric_improvement_max (iterations to improve metrics),
+  * runtime_fix_max (runtime error retries).
+  Choose values appropriate to the task difficulty and budget.
 - If the objective involves pricing, segmentation, or threshold-based recommendations, consider whether a derived tier/segment
   column (e.g., size deciles or sector groups) would materially improve downstream reasoning; include it only if justified
   by the strategy and data. Do not treat tiering as universally required.
@@ -1014,6 +1038,7 @@ Return the contract JSON.
             contract = _attach_strategy_context(contract)
             contract = _attach_semantic_guidance(contract)
             contract = _ensure_availability_reasoning(contract)
+            contract = _ensure_iteration_policy(contract)
             return _attach_spec_extraction_to_runbook(contract)
         except Exception:
             return _fallback()

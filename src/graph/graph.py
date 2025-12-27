@@ -504,7 +504,51 @@ def _normalize_execution_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
         ba = {}
     normalized["business_alignment"] = ba
 
+    iteration_policy = normalized.get("iteration_policy")
+    if not isinstance(iteration_policy, dict):
+        normalized["iteration_policy"] = {}
+    if not isinstance(normalized.get("compliance_checklist"), list):
+        normalized["compliance_checklist"] = []
+
     return normalized
+
+def _get_iteration_policy(state: Dict[str, Any]) -> Dict[str, int] | None:
+    contract = state.get("execution_contract") or {}
+    policy = contract.get("iteration_policy")
+    if not isinstance(policy, dict):
+        return None
+    compliance_max = policy.get("compliance_bootstrap_max")
+    metric_max = policy.get("metric_improvement_max")
+    runtime_max = policy.get("runtime_fix_max")
+    out: Dict[str, int] = {}
+    for key, val in {
+        "compliance_bootstrap_max": compliance_max,
+        "metric_improvement_max": metric_max,
+        "runtime_fix_max": runtime_max,
+    }.items():
+        if val is None:
+            continue
+        try:
+            out[key] = max(1, int(val))
+        except Exception:
+            continue
+    return out or None
+
+def _classify_iteration_type(
+    status: str,
+    audit_rejected: bool,
+    oc_report: Dict[str, Any] | None,
+    feedback: str | None,
+) -> str | None:
+    if status != "NEEDS_IMPROVEMENT":
+        return None
+    if audit_rejected:
+        return "compliance"
+    if oc_report and oc_report.get("missing"):
+        return "compliance"
+    if feedback and any(token in feedback for token in ["CODE_AUDIT_REJECTED", "OUTPUT_CONTRACT_MISSING"]):
+        return "compliance"
+    return "metric"
 
 def _detect_refscore_alias(execution_output: str, contract: Dict[str, Any]) -> bool:
     if not execution_output or not isinstance(contract, dict):
@@ -1610,6 +1654,10 @@ def run_steward(state: AgentState) -> AgentState:
         "csv_decimal": decimal,
         "csv_decimal": decimal,
         "iteration_count": 0,
+        "compliance_iterations": 0,
+        "metric_iterations": 0,
+        "compliance_passed": False,
+        "last_iteration_type": None,
         "feedback_history": [],
         "has_partial_visuals": False,
         "plots_local": [],
@@ -1766,7 +1814,17 @@ def run_execution_planner(state: AgentState) -> AgentState:
             "execution_planner_complete",
             {"required_outputs": contract.get("required_outputs", [])},
         )
-    return {"execution_contract": contract}
+    policy = contract.get("iteration_policy") if isinstance(contract, dict) else {}
+    result = {"execution_contract": contract}
+    if isinstance(policy, dict) and policy:
+        result["iteration_policy"] = policy
+        runtime_fix_max = policy.get("runtime_fix_max")
+        if runtime_fix_max is not None:
+            try:
+                result["max_runtime_fix_attempts"] = max(1, int(runtime_fix_max))
+            except Exception:
+                pass
+    return result
 
 
 
@@ -2897,6 +2955,10 @@ def run_engineer(state: AgentState) -> AgentState:
     csv_sep = state.get('csv_sep', ',')
     csv_decimal = state.get('csv_decimal', '.')
     execution_contract = state.get("execution_contract", {})
+    compliance_checklist = (execution_contract or {}).get("compliance_checklist", [])
+    if compliance_checklist and not state.get("compliance_passed", False):
+        checklist_payload = "COMPLIANCE_BOOTSTRAP_CHECKLIST:\n" + json.dumps(compliance_checklist, ensure_ascii=True)
+        data_audit_context = _merge_de_audit_override(data_audit_context, checklist_payload)
 
     # Patch Mode Inputs
     previous_code = state.get('last_generated_code')
@@ -3977,6 +4039,20 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     if status == "NEEDS_IMPROVEMENT":
         print(f"Advice: {feedback}")
 
+    iteration_type = _classify_iteration_type(status, audit_rejected, oc_report, feedback)
+    if iteration_type:
+        gate_context["iteration_type"] = iteration_type
+    compliance_iterations = int(state.get("compliance_iterations", 0))
+    metric_iterations = int(state.get("metric_iterations", 0))
+    compliance_passed = bool(state.get("compliance_passed", False))
+    if status == "NEEDS_IMPROVEMENT":
+        if iteration_type == "compliance":
+            compliance_iterations += 1
+            compliance_passed = False
+        elif iteration_type == "metric":
+            metric_iterations += 1
+            compliance_passed = True
+
     review_feedback = feedback or state.get("review_feedback", "")
     result_state = {
         "review_verdict": status,
@@ -3989,10 +4065,14 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "metrics_signature": metrics_signature,
         "weights_signature": weights_signature,
         "last_gate_context": gate_context,
+        "compliance_iterations": compliance_iterations,
+        "metric_iterations": metric_iterations,
+        "compliance_passed": compliance_passed,
+        "last_iteration_type": iteration_type,
     }
     if review_counters:
         result_state["budget_counters"] = review_counters
-    if status == "NEEDS_IMPROVEMENT":
+    if status == "NEEDS_IMPROVEMENT" and iteration_type == "metric":
         try:
             prev_case_report = _load_json_safe(
                 os.path.join("artifacts", "iterations", f"case_alignment_report_iter_{iter_id - 1}.json")
@@ -4173,11 +4253,29 @@ def finalize_runtime_failure(state: AgentState) -> AgentState:
     return result
 
 def check_evaluation(state: AgentState):
-    if state.get('iteration_count', 0) >= 6:
-        print("WARNING: Max iterations reached. Proceeding with current results.")
-        return "approved"
+    policy = _get_iteration_policy(state)
+    last_iter_type = state.get("last_iteration_type")
+    if policy:
+        compliance_max = policy.get("compliance_bootstrap_max")
+        metric_max = policy.get("metric_improvement_max")
+        if last_iter_type == "compliance" and compliance_max:
+            if state.get("compliance_iterations", 0) >= compliance_max:
+                print("WARNING: Compliance bootstrap limit reached. Proceeding with current results.")
+                return "approved"
+        if last_iter_type != "compliance" and metric_max:
+            if state.get("metric_iterations", 0) >= metric_max:
+                print("WARNING: Metric-iteration limit reached. Proceeding with current results.")
+                return "approved"
+    else:
+        if state.get('iteration_count', 0) >= 6:
+            print("WARNING: Max iterations reached. Proceeding with current results.")
+            return "approved"
 
     # Adaptive stop: if case alignment degrades or stagnates, stop early.
+    if last_iter_type == "compliance":
+        if state.get('review_verdict') == "NEEDS_IMPROVEMENT":
+            return "retry"
+        return "approved"
     case_report = state.get("case_alignment_report", {}) or {}
     metrics = case_report.get("metrics", {}) if isinstance(case_report, dict) else {}
     try:
