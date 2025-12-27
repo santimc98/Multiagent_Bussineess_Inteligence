@@ -58,6 +58,9 @@ class StrategistAgent:
         - Provide ONE strategy that maximizes business alignment AND is feasible for the AI engineers to execute.
         - Think about the capabilities/constraints of the system (cleaning, mapping, optimization, reporting).
         - State which variables are required and which data science techniques should be used.
+        - In your reasoning, explicitly assess feature availability timing (pre-decision vs post-outcome),
+          leakage risk, and signal sufficiency. If you see risk, propose a fallback approach (e.g., descriptive
+          segmentation instead of predictive modeling). This is reasoning guidance, not a rigid rule.
         
         *** DATA SCIENCE FIRST PRINCIPLES (UNIVERSAL REASONING) ***
         1. **REPRESENTATIVENESS (The "Bias" Check):**

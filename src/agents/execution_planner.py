@@ -761,6 +761,15 @@ class ExecutionPlannerAgent:
                 contract["business_sanity_checks"] = _build_business_sanity_checks(contract, semantics)
             return contract
 
+        def _ensure_availability_reasoning(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            if "feature_availability" not in contract:
+                contract["feature_availability"] = []
+            if "availability_summary" not in contract:
+                contract["availability_summary"] = ""
+            return contract
+
         def _normalize_quality_gates(contract: Dict[str, Any]) -> Dict[str, Any]:
             if not isinstance(contract, dict):
                 return contract
@@ -854,6 +863,8 @@ class ExecutionPlannerAgent:
                 "required_outputs": outputs,
                 "data_requirements": data_requirements,
                 "required_dependencies": required_deps,
+                "feature_availability": [],
+                "availability_summary": "Planner fallback used; no explicit availability reasoning provided.",
                 "quality_gates": {
                     "spearman_min": 0.85,
                     "violations_max": 0,
@@ -903,6 +914,7 @@ class ExecutionPlannerAgent:
             contract = _attach_business_alignment(contract)
             contract = _attach_strategy_context(contract)
             contract = _attach_semantic_guidance(contract)
+            contract = _ensure_availability_reasoning(contract)
             return _attach_spec_extraction_to_runbook(contract)
 
         if not self.client:
@@ -918,6 +930,8 @@ Requirements:
 - Output JSON ONLY (no markdown/code fences).
 - Include: contract_version, strategy_title, business_objective, required_outputs, data_requirements, validations,
   notes_for_engineers, required_dependencies, data_risks, spec_extraction, planner_self_check.
+- Include feature_availability (list of {column, availability, rationale}) and availability_summary (string).
+  Use this to reason about pre-decision vs post-outcome fields and leakage risk. This is a reasoning aid, not a rule.
 - data_requirements: list of {name, role, expected_range, allowed_null_frac, source, expected_kind}.
   expected_kind in {numeric, datetime, categorical, unknown}.
 - Each data_requirement may include source: "input" | "derived" (default input).
@@ -999,6 +1013,7 @@ Return the contract JSON.
             contract = _attach_business_alignment(contract)
             contract = _attach_strategy_context(contract)
             contract = _attach_semantic_guidance(contract)
+            contract = _ensure_availability_reasoning(contract)
             return _attach_spec_extraction_to_runbook(contract)
         except Exception:
             return _fallback()
