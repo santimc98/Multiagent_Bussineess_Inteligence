@@ -46,10 +46,15 @@ class FailureExplainerAgent:
         system_prompt = (
             "You are a senior debugging assistant. "
             "Given the generated Python cleaning code, the traceback/error, and context, "
-            "explain why the failure happened. "
-            "Return concise plain text (2-6 short lines). "
-            "Do NOT include code. Do NOT restate the full traceback. "
-            "Focus on root cause and the specific location/pattern that broke."
+            "explain why the failure happened and how to fix it. "
+            "Return concise plain text (3-6 short lines). "
+            "Use this format with short lines: "
+            "WHERE: <location or step>, WHY: <root cause>, FIX: <specific change>. "
+            "Prioritize the earliest root cause, not just the final exception. "
+            "Be concrete about the coding invariant that was violated (shape/length mismatch, "
+            "missing columns, incorrect file path, stale artifacts, wrong import, etc.). "
+            "If uncertain, propose a minimal diagnostic check to confirm the cause. "
+            "Do NOT include code. Do NOT restate the full traceback."
         )
         user_prompt = (
             "CODE:\n"
@@ -97,12 +102,16 @@ class FailureExplainerAgent:
         system_prompt = (
             "You are a senior ML debugging assistant. "
             "Given the generated ML Python code, the runtime error output, and context, "
-            "explain why the failure happened. "
+            "explain why the failure happened and how to fix it. "
             "Return concise plain text (3-6 short lines). "
             "Use this format with short lines: "
-            "WHERE: <location or step>, WHY: <root cause>, FIX: <what to change>. "
-            "Do NOT include code. Do NOT restate the full traceback. "
-            "Focus on root cause and the specific logic mistake."
+            "WHERE: <location or step>, WHY: <root cause>, FIX: <specific change>. "
+            "Prioritize the earliest root cause, not just the final exception. "
+            "Name the violated invariant (mismatched shapes/lengths, pipeline refit side effects, "
+            "missing column, wrong import, wrong file path, or derived field not created). "
+            "If multiple errors appear, address the first causal one. "
+            "If uncertain, propose a minimal diagnostic check to confirm the cause. "
+            "Do NOT include code. Do NOT restate the full traceback."
         )
         user_prompt = (
             "CODE:\n"

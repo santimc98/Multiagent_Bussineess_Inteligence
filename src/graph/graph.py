@@ -4484,6 +4484,10 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
             payload = "ML_FAILURE_EXPLANATION:\n" + expl_text.strip()
             payload += "\nRUNTIME_ERROR_TAIL:\n" + str(error_details)[-2000:]
             ml_override = _merge_de_audit_override(ml_override, payload)
+            expl_lines = [line.strip() for line in expl_text.splitlines() if line.strip()]
+            if expl_lines:
+                fix_summary = "ML_FAILURE_EXPLANATION: " + " | ".join(expl_lines)
+                error_context["required_fixes"].append(fix_summary)
             try:
                 os.makedirs("artifacts", exist_ok=True)
                 with open(os.path.join("artifacts", "ml_engineer_failure_explainer.txt"), "w", encoding="utf-8") as f_exp:
