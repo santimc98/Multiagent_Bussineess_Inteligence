@@ -2884,7 +2884,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     cleaned_stats = {}
                     cleaned_samples = {}
                     cleaned_value_counts = {}
-                    for col in required_cols:
+                    review_columns = list(dict.fromkeys(required_cols + list(contract_derived_cols or [])))
+                    for col in review_columns:
                         if col not in df_mapped.columns:
                             continue
                         series = df_mapped[col]
@@ -2911,6 +2912,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
 
                     raw_samples = {}
                     raw_pattern_stats = {}
+                    raw_value_counts = {}
                     try:
                         sample_df = sample_raw_columns(csv_path, input_dialect, required_cols, nrows=200, dtype=str)
                         if not sample_df.empty:
@@ -2919,6 +2921,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                 raw_samples[col] = raw_series.head(6).tolist()
                                 if not raw_series.empty:
                                     total = len(raw_series)
+                                    try:
+                                        vc = raw_series.value_counts().head(6)
+                                        raw_value_counts[col] = {str(k): int(v) for k, v in vc.items()}
+                                    except Exception:
+                                        raw_value_counts[col] = {}
                                     raw_pattern_stats[col] = {
                                         "numeric_like_ratio": float(sum(any(ch.isdigit() for ch in val) for val in raw_series) / total),
                                         "dot_ratio": float(sum("." in val for val in raw_series) / total),
@@ -2929,6 +2936,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     except Exception:
                         raw_samples = {}
                         raw_pattern_stats = {}
+                        raw_value_counts = {}
 
                     review_context = {
                         "business_objective": business_objective,
@@ -2937,6 +2945,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         "input_dialect": input_dialect,
                         "raw_samples": raw_samples,
                         "raw_pattern_stats": raw_pattern_stats,
+                        "raw_value_counts": raw_value_counts,
                         "cleaned_stats": cleaned_stats,
                         "cleaned_samples": cleaned_samples,
                         "cleaned_value_counts": cleaned_value_counts,
@@ -2948,6 +2957,9 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             "data_requirements": contract.get("data_requirements", []),
                             "validations": contract.get("validations", []),
                             "feature_availability": contract.get("feature_availability", []),
+                            "spec_extraction": contract.get("spec_extraction", {}),
+                            "business_alignment": contract.get("business_alignment", {}),
+                            "notes_for_engineers": contract.get("notes_for_engineers", []),
                         },
                         "cleaning_code_excerpt": code[:4000],
                     }
