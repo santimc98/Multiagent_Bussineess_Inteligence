@@ -43,7 +43,7 @@ class ResultsAdvisorAgent:
             "ISSUE: <what failed>; WHY: <root cause>; FIX: <specific change>. "
             "Do NOT include code. Do NOT restate the full metrics dump."
         )
-        user_prompt = f"CONTEXT:\n{context_snippet}\n"
+        user_prompt = "CONTEXT:\n" + context_snippet + "\n"
 
         def _call_model():
             response = self.client.chat.completions.create(

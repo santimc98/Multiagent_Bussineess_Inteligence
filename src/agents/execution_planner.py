@@ -1009,7 +1009,7 @@ Return the contract JSON.
             column_inventory=json.dumps(column_inventory or []),
         )
         try:
-            full_prompt = f"{system_prompt}\n\nUSER_INPUT:\n{user_prompt}"
+            full_prompt = system_prompt + "\n\nUSER_INPUT:\n" + user_prompt
             response = self.client.generate_content(full_prompt)
             content = response.text
             content = content.replace("```json", "").replace("```", "").strip()

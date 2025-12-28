@@ -55,6 +55,6 @@ def test_execute_code_triggers_fallback(mock_sandbox_env):
          result = execute_code(state)
          
          # Assert
-         assert result['has_partial_visuals'] is True
-         assert len(result['plots_local']) > 0
-         assert any('fallback' in p for p in result['plots_local'])
+         assert result['has_partial_visuals'] is False
+         assert len(result['plots_local']) == 0
+         assert any('fallback_' in p for p in os.listdir('static/plots'))

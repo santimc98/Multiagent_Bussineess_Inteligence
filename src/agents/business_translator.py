@@ -497,7 +497,7 @@ class BusinessTranslatorAgent:
             final_state_str=str(state)
         )
 
-        full_prompt = f"{system_prompt}\n\n{user_message}"
+        full_prompt = system_prompt + "\n\n" + user_message
 
         try:
             response = self.model.generate_content(full_prompt)

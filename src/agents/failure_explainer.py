@@ -53,11 +53,11 @@ class FailureExplainerAgent:
         )
         user_prompt = (
             "CODE:\n"
-            f"{code_snippet}\n\n"
+            + code_snippet + "\n\n"
             "ERROR:\n"
-            f"{error_snippet}\n\n"
+            + error_snippet + "\n\n"
             "CONTEXT:\n"
-            f"{context_snippet}\n"
+            + context_snippet + "\n"
         )
 
         def _call_model():
@@ -106,11 +106,11 @@ class FailureExplainerAgent:
         )
         user_prompt = (
             "CODE:\n"
-            f"{code_snippet}\n\n"
+            + code_snippet + "\n\n"
             "ERROR:\n"
-            f"{error_snippet}\n\n"
+            + error_snippet + "\n\n"
             "CONTEXT:\n"
-            f"{context_snippet}\n"
+            + context_snippet + "\n"
         )
 
         def _call_model():

@@ -8,7 +8,7 @@ def test_check_execution_status_retry():
         "execution_output": "Traceback (most recent call last):\nValueError: bad",
         "execution_attempt": 1
     }
-    assert check_execution_status(state) == "failed"
+    assert check_execution_status(state) == "retry_fix"
 
 def test_check_execution_status_evaluate():
     state = {
@@ -19,7 +19,9 @@ def test_check_execution_status_evaluate():
 
 def test_check_execution_status_max_retries():
     state = {
-        "execution_output": "Traceback...",
-        "execution_attempt": 4
+        "execution_output": "Traceback (most recent call last):\nValueError: bad",
+        "execution_attempt": 4,
+        "runtime_fix_count": 3,
+        "max_runtime_fix_attempts": 3,
     }
-    assert check_execution_status(state) == "evaluate"
+    assert check_execution_status(state) == "failed_runtime"

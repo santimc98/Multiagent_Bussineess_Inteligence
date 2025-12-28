@@ -17,18 +17,32 @@ _scan_code_safety_ref = "scan_code_safety"
 class MLEngineerAgent:
     def __init__(self, api_key: str = None):
         """
-        Initializes the ML Engineer Agent with DeepSeek Reasoner.
+        Initializes the ML Engineer Agent with the configured provider.
         """
-        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
-        if not self.api_key:
-            raise ValueError("DeepSeek API Key is required.")
+        self.provider = (os.getenv("ML_ENGINEER_PROVIDER", "deepseek") or "deepseek").strip().lower()
+        if self.provider == "zai":
+            self.api_key = api_key or os.getenv("ZAI_API_KEY") or os.getenv("GLM_API_KEY")
+            if not self.api_key:
+                raise ValueError("Z.ai API Key is required.")
+            self.client = OpenAI(
+                api_key=self.api_key,
+                base_url="https://api.z.ai/api/paas/v4/",
+                timeout=None,
+            )
+            self.model_name = os.getenv("ML_ENGINEER_MODEL", "glm-4.7") or "glm-4.7"
+        elif self.provider == "deepseek":
+            self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
+            if not self.api_key:
+                raise ValueError("DeepSeek API Key is required.")
 
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url="https://api.deepseek.com/v1",
-            timeout=None,
-        )
-        self.model_name = "deepseek-reasoner"
+            self.client = OpenAI(
+                api_key=self.api_key,
+                base_url="https://api.deepseek.com/v1",
+                timeout=None,
+            )
+            self.model_name = "deepseek-reasoner"
+        else:
+            raise ValueError(f"Unsupported ML_ENGINEER_PROVIDER: {self.provider}")
 
     def generate_code(
         self,
@@ -331,17 +345,30 @@ class MLEngineerAgent:
             current_temp = 0.1
 
         from src.utils.retries import call_with_retries
+        provider_label = "Z.ai" if self.provider == "zai" else "DeepSeek"
 
         def _call_model():
-            print(f"DEBUG: ML Engineer calling DeepSeek Model ({self.model_name})...")
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message}
-                ],
-                temperature=current_temp
-            )
+            print(f"DEBUG: ML Engineer calling {provider_label} Model ({self.model_name})...")
+            if self.provider == "zai":
+                from src.utils.llm_throttle import glm_call_slot
+                with glm_call_slot():
+                    response = self.client.chat.completions.create(
+                        model=self.model_name,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_message}
+                        ],
+                        temperature=current_temp,
+                    )
+            else:
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message}
+                    ],
+                    temperature=current_temp,
+                )
             content = response.choices[0].message.content
             
             # CRITICAL CHECK FOR SERVER ERRORS (HTML/504)
@@ -351,7 +378,7 @@ class MLEngineerAgent:
 
         try:
             content = call_with_retries(_call_model, max_retries=5, backoff_factor=2, initial_delay=2)
-            print("DEBUG: DeepSeek response received.")
+            print(f"DEBUG: {provider_label} response received.")
             code = self._clean_code(content)
             if code.strip().startswith("{") or code.strip().startswith("["):
                 return "# Error: ML_CODE_REQUIRED"

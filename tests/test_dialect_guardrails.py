@@ -35,17 +35,11 @@ def test_output_dialect_override_used_before_ml(monkeypatch, tmp_path):
         strategy,
         data_path,
         feedback_history,
-        previous_code=None,
-        gate_context=None,
-        csv_encoding=None,
-        csv_sep=None,
-        csv_decimal=None,
-        data_audit_context="",
-        business_objective="",
+        **kwargs,
     ):
-        calls["csv_encoding"] = csv_encoding
-        calls["csv_sep"] = csv_sep
-        calls["csv_decimal"] = csv_decimal
+        calls["csv_encoding"] = kwargs.get("csv_encoding")
+        calls["csv_sep"] = kwargs.get("csv_sep")
+        calls["csv_decimal"] = kwargs.get("csv_decimal")
         return "# ok"
 
     monkeypatch.setattr(

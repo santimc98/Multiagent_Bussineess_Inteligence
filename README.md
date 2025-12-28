@@ -69,6 +69,16 @@ Our system mimics a high-performing human data team:
     ```env
     GOOGLE_API_KEY=your_api_key_here
     ```
+    Optional: configure the ML Engineer LLM provider (default is deepseek). For Z.ai GLM-4.7:
+    ```env
+    ML_ENGINEER_PROVIDER=zai
+    ZAI_API_KEY=your_api_key_here
+    # Alternatively: GLM_API_KEY=your_api_key_here
+    ML_ENGINEER_MODEL=glm-4.7
+    GLM_MAX_CONCURRENCY=2
+    GLM_USE_FILE_LOCK=1
+    ```
+    Note: set `GLM_MAX_CONCURRENCY=2` for GLM-4.7.
 
 4.  **Run the Foundry**
     ```bash
