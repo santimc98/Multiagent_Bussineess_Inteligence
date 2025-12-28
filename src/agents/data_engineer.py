@@ -75,6 +75,9 @@ class DataEngineerAgent:
         - Use canonical_name from the contract for all column references.
         - Derive required columns using clear, deterministic logic.
         - Build a header map for lookup (normalize only for matching), but preserve canonical_name exactly (including spaces/symbols) in the output.
+        - Canonical columns must contain cleaned values (do not leave raw strings in canonical columns while writing cleaned_* shadows).
+        - Print a CLEANING_VALIDATION section that reports dtype/null_frac and basic range checks for each required column.
+        - Use DATA AUDIT + steward summary to avoid destructive parsing (null explosions) and misinterpreted number formats.
         """
         
         # USER TEMPLATE (Static)

@@ -11,6 +11,10 @@ DEFAULT_DATA_ENGINEER_RUNBOOK: Dict[str, Any] = {
     "must": [
         "First pd.read_csv must use dialect variables (sep/decimal/encoding) from contract/manifest; do not hardcode literals.",
         "Respect expected_kind: numeric -> pd.to_numeric; datetime -> pd.to_datetime; categorical -> keep as string.",
+        "Canonical columns must contain the cleaned values; do not leave raw strings in canonical columns while writing cleaned_* shadows.",
+        "If you create cleaned_* helper columns, overwrite the canonical column with cleaned values before saving.",
+        "Derive required columns from spec_extraction and ensure they exist in the output.",
+        "Perform a post-cleaning self-audit: for each required column report dtype, null_frac, and basic range checks vs expected_range.",
         "Do not import sys.",
         "Preserve exact canonical_name strings (including spaces/symbols); do not normalize away punctuation.",
         "Do not drop required/derived columns solely for being constant; record as constant in manifest.",
@@ -18,9 +22,11 @@ DEFAULT_DATA_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "If a required source column for derivations is missing, raise a clear ValueError (do not default all rows).",
         "Do not validate required columns before canonicalization; match after normalization mapping.",
         "Only enforce existence for source='input' columns; source='derived' must be created after mapping.",
+        "Ensure _json_default handles numpy scalar types (np.bool_, np.integer, np.floating) before json.dump.",
     ],
     "must_not": [
         "Do not blindly strip '.'; infer thousands/decimal from patterns.",
+        "Do not leave numeric columns as object when expected_kind is numeric; fix or abort with clear error.",
         "Do not create downstream ML artifacts (weights/metrics); only cleaned_data.csv + cleaning_manifest.json.",
     ],
     "safe_idioms": [
@@ -32,6 +38,7 @@ DEFAULT_DATA_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "If canonical_name includes spaces or symbols, keep it exact when selecting columns.",
         "Verify required columns after normalization/mapping; do not treat pre-mapped absence as missing.",
         "If a numeric-looking column is typed as object/string, treat conversion as a risk before comparisons/normalization.",
+        "If the dialect indicates decimal=',' and raw samples show dots, treat dots as thousands unless evidence suggests decimals.",
         "If data_risks mention canonicalization collisions, ensure column selection remains unambiguous.",
         "If normalization causes name collisions, choose deterministically and log a warning for traceability.",
         "If conversion yields too many NaN, revert and log instead of dropping required columns.",
