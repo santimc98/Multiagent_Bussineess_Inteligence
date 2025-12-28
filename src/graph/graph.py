@@ -370,6 +370,81 @@ def _build_required_sample_context(
     payload = {"sample_rows": int(len(sample_df)), "columns": samples}
     return "RAW_REQUIRED_COLUMN_SAMPLES:\n" + json.dumps(payload, ensure_ascii=True)
 
+def _extract_manifest_row_count(manifest: Dict[str, Any]) -> int | None:
+    if not isinstance(manifest, dict):
+        return None
+    row_counts = manifest.get("row_counts")
+    if isinstance(row_counts, dict):
+        for key in ("after_cleaning", "final", "output", "cleaned", "rows"):
+            value = row_counts.get(key)
+            if isinstance(value, (int, float)) and value >= 0:
+                return int(value)
+    for key in ("row_count", "rows", "n_rows", "cleaned_row_count", "output_row_count"):
+        value = manifest.get(key)
+        if isinstance(value, (int, float)) and value >= 0:
+            return int(value)
+    return None
+
+def _estimate_row_count(csv_path: str, encoding: str = "utf-8") -> int | None:
+    if not csv_path or not os.path.exists(csv_path):
+        return None
+    try:
+        with open(csv_path, "r", encoding=encoding, errors="ignore") as f:
+            total = sum(1 for _ in f)
+        return max(total - 1, 0)
+    except Exception:
+        return None
+
+def _build_signal_summary_context(
+    csv_path: str,
+    dialect: Dict[str, Any],
+    required_cols: List[str],
+    norm_map: Dict[str, str],
+    header_cols: List[str],
+) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {}
+    manifest = _load_json_safe("data/cleaning_manifest.json")
+    row_count = _extract_manifest_row_count(manifest) or _estimate_row_count(csv_path, dialect.get("encoding", "utf-8"))
+    if row_count is not None:
+        summary["row_count"] = row_count
+    if header_cols:
+        summary["column_count"] = len(header_cols)
+    if required_cols:
+        summary["required_columns"] = required_cols
+        raw_cols = []
+        canon_to_raw: Dict[str, str] = {}
+        for col in required_cols:
+            normed = _norm_name(col)
+            raw = norm_map.get(normed)
+            if raw:
+                canon_to_raw[col] = raw
+                raw_cols.append(raw)
+        sample_df = sample_raw_columns(csv_path, dialect, raw_cols, nrows=200, dtype=str)
+        if sample_df is not None and not sample_df.empty:
+            stats: Dict[str, Any] = {}
+            for canon, raw in canon_to_raw.items():
+                if raw not in sample_df.columns:
+                    continue
+                series = sample_df[raw]
+                try:
+                    values = series.astype(str)
+                    non_null_ratio = float(values.replace("", None).notna().mean())
+                    nunique = int(values.dropna().nunique())
+                    examples = [str(v) for v in values.dropna().head(3).tolist()]
+                except Exception:
+                    non_null_ratio = None
+                    nunique = None
+                    examples = []
+                stats[canon] = {
+                    "raw_column": raw,
+                    "sample_non_null_ratio": non_null_ratio,
+                    "sample_nunique": nunique,
+                    "sample_examples": examples,
+                }
+            if stats:
+                summary["required_column_sample_stats"] = stats
+    return summary
+
 def _build_required_raw_map(
     required_cols: List[str],
     norm_map: Dict[str, str],
@@ -2955,6 +3030,10 @@ def run_engineer(state: AgentState) -> AgentState:
     csv_sep = state.get('csv_sep', ',')
     csv_decimal = state.get('csv_decimal', '.')
     execution_contract = state.get("execution_contract", {})
+    feature_availability = (execution_contract or {}).get("feature_availability", [])
+    availability_summary = (execution_contract or {}).get("availability_summary", "")
+    iteration_memory = list(state.get("ml_iteration_memory", []) or [])
+    iteration_memory_block = state.get("ml_iteration_memory_block", "")
     compliance_checklist = (execution_contract or {}).get("compliance_checklist", [])
     if compliance_checklist and not state.get("compliance_passed", False):
         checklist_payload = "COMPLIANCE_BOOTSTRAP_CHECKLIST:\n" + json.dumps(compliance_checklist, ensure_ascii=True)
@@ -2982,6 +3061,11 @@ def run_engineer(state: AgentState) -> AgentState:
             csv_decimal=csv_decimal,
             data_audit_context=data_audit_context,
             business_objective=business_objective,
+            feature_availability=feature_availability,
+            availability_summary=availability_summary,
+            signal_summary={},
+            iteration_memory=iteration_memory,
+            iteration_memory_block=iteration_memory_block,
         )
         sig = inspect.signature(ml_engineer.generate_code)
         if "execution_contract" in sig.parameters:
@@ -2991,6 +3075,19 @@ def run_engineer(state: AgentState) -> AgentState:
         derived_present = []
         sample_context = ""
         context_ops_blocks = []
+        if feature_availability or availability_summary:
+            availability_payload = {
+                "availability_summary": availability_summary,
+                "feature_availability": feature_availability,
+            }
+            context_ops_blocks.append(
+                "FEATURE_AVAILABILITY_CONTEXT:\n" + json.dumps(availability_payload, ensure_ascii=True)
+            )
+        if iteration_memory:
+            memory_slice = iteration_memory[-2:]
+            context_ops_blocks.append(
+                "ITERATION_MEMORY_CONTEXT:\n" + json.dumps(memory_slice, ensure_ascii=True)
+            )
         if header_cols:
             norm_map = {}
             norm_buckets = {}
@@ -3030,6 +3127,18 @@ def run_engineer(state: AgentState) -> AgentState:
             if sample_context:
                 data_audit_context = _merge_de_audit_override(data_audit_context, sample_context)
                 kwargs["data_audit_context"] = data_audit_context
+            signal_summary = _build_signal_summary_context(
+                data_path,
+                {"sep": csv_sep, "encoding": csv_encoding, "decimal": csv_decimal},
+                required_input_cols,
+                norm_map,
+                header_cols,
+            )
+            if signal_summary:
+                context_ops_blocks.append(
+                    "SIGNAL_SUMMARY_CONTEXT:\n" + json.dumps(signal_summary, ensure_ascii=True)
+                )
+                kwargs["signal_summary"] = signal_summary
             try:
                 derived_cols = _resolve_contract_columns(execution_contract, sources={"derived"}) or []
                 output_cols = _resolve_contract_columns(execution_contract, sources={"output"}) or []
@@ -3090,6 +3199,11 @@ def run_engineer(state: AgentState) -> AgentState:
                 "execution_contract": execution_contract,
                 "data_audit_context": data_audit_context,
                 "ml_engineer_audit_override": ml_audit_override,
+                "feature_availability": feature_availability,
+                "availability_summary": availability_summary,
+                "signal_summary": kwargs.get("signal_summary", {}),
+                "iteration_memory": iteration_memory,
+                "iteration_memory_block": iteration_memory_block,
             }
             with open(os.path.join("artifacts", "ml_engineer_context.json"), "w", encoding="utf-8") as f_ctx:
                 json.dump(ctx_payload, f_ctx, indent=2, ensure_ascii=False)

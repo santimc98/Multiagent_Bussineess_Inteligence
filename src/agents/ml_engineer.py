@@ -43,6 +43,11 @@ class MLEngineerAgent:
         data_audit_context: str = "",
         business_objective: str = "",
         execution_contract: Dict[str, Any] | None = None,
+        feature_availability: List[Dict[str, Any]] | None = None,
+        availability_summary: str = "",
+        signal_summary: Dict[str, Any] | None = None,
+        iteration_memory: List[Dict[str, Any]] | None = None,
+        iteration_memory_block: str = "",
     ) -> str:
 
         SYSTEM_PROMPT_TEMPLATE = """
@@ -110,6 +115,17 @@ class MLEngineerAgent:
         - Execution Contract (json): $execution_contract_json
         - Spec Extraction (source-of-truth): $spec_extraction_json
         - ROLE RUNBOOK (ML Engineer): $ml_engineer_runbook (adhere to goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist)
+        - Feature Availability: $feature_availability_json
+        - Availability Summary: $availability_summary
+        - Signal Summary (data health): $signal_summary_json
+        - Iteration Memory (recent deltas): $iteration_memory_json
+        - Iteration Delta Notes: $iteration_memory_block
+
+        *** REASONING CONTEXT (NOT RULES) ***
+        - Use availability to decide which fields are valid at decision time vs post-outcome.
+        - Use feature semantics to interpret directionality and detect leakage.
+        - Use signal summary to choose modeling complexity and avoid overfitting.
+        - Use iteration memory to adjust the prior solution rather than restarting from scratch.
         
         *** FEASIBILITY & CAUSALITY CHECK (CRITICAL) ***
         - Before modeling, CHECK CAUSALITY TRAPS:
@@ -242,6 +258,11 @@ class MLEngineerAgent:
             execution_contract_json=json.dumps(execution_contract or {}, indent=2),
             spec_extraction_json=spec_extraction_json,
             ml_engineer_runbook=ml_runbook_json,
+            feature_availability_json=json.dumps(feature_availability or [], indent=2),
+            availability_summary=availability_summary or "",
+            signal_summary_json=json.dumps(signal_summary or {}, indent=2),
+            iteration_memory_json=json.dumps(iteration_memory or [], indent=2),
+            iteration_memory_block=iteration_memory_block or "",
         )
         
         # USER TEMPLATES (Static)
