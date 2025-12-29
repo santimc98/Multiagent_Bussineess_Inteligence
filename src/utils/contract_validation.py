@@ -75,10 +75,13 @@ DEFAULT_ML_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "If a baseline_metric exists, compare it to the computed score (e.g., correlation/MAE) and report the result.",
         "If derived outputs are present in the contract, save per-row scored output to data/scored_rows.csv.",
         "When writing JSON artifacts, use json.dump(..., default=_json_default) to handle numpy/pandas types.",
+        "If contract includes decision_variables, treat them as decision inputs (not leakage by default) and document any selection-bias risks.",
+        "If contract includes missing_sentinels, treat sentinel values as missing during modeling and consider adding an observed-flag feature.",
     ],
     "must_not": [
         "Do not import sys.",
         "Do not add noise/jitter to target.",
+        "Do not treat decision_variables as forbidden leakage unless the contract explicitly marks them post-outcome with no decision context.",
     ],
     "safe_idioms": [
         "For optimization/LP prefer scipy.optimize.linprog/minimize; avoid pulp/cvxpy.",
@@ -90,6 +93,8 @@ DEFAULT_ML_ENGINEER_RUNBOOK: Dict[str, Any] = {
         "If target_type is ordinal/ranking, avoid predictive regression as the primary objective.",
         "Validate weight constraints and explain any regularization choices.",
         "Ensure outputs satisfy the explicitly requested deliverables.",
+        "If decision_variables exist, explain how elasticity/optimization uses them and whether they are observed for all rows.",
+        "If missing_sentinels exist, ensure sentinel handling does not bias training or scoring.",
     ],
     "methodology": {
         "ranking_loss": "Use ranking-aware loss for ordinal scoring when applicable.",

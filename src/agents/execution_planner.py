@@ -761,6 +761,165 @@ class ExecutionPlannerAgent:
                 contract["business_sanity_checks"] = _build_business_sanity_checks(contract, semantics)
             return contract
 
+        def _detect_decision_context(text: str) -> bool:
+            if not text:
+                return False
+            norm_text = _norm(text)
+            if not norm_text:
+                return False
+            tokens = [
+                "price",
+                "pricing",
+                "precio",
+                "tarifa",
+                "quote",
+                "offer",
+                "cotizacion",
+                "importe",
+                "amount",
+                "valor",
+                "premium",
+                "rate",
+                "fee",
+                "cost",
+            ]
+            token_norms = [_norm(tok) for tok in tokens if tok]
+            return any(tok and tok in norm_text for tok in token_norms)
+
+        def _is_price_like(name: str) -> bool:
+            if not name:
+                return False
+            norm_name = _norm(name)
+            tokens = [
+                "price",
+                "precio",
+                "amount",
+                "importe",
+                "valor",
+                "fee",
+                "tarifa",
+                "premium",
+                "rate",
+                "cost",
+            ]
+            token_norms = [_norm(tok) for tok in tokens if tok]
+            return any(tok and tok in norm_name for tok in token_norms)
+
+        def _extract_missing_sentinel(text: str) -> float | int | None:
+            if not text:
+                return None
+            phrases = [
+                "no offer",
+                "not offered",
+                "sin oferta",
+                "sin propuesta",
+                "no quote",
+                "no proposal",
+                "no bid",
+                "sin precio",
+            ]
+            lower = text.lower()
+            for sentence in re.split(r"[\n\.]", lower):
+                if not any(p in sentence for p in phrases):
+                    continue
+                match = re.search(r"(?<!\d)(\d+(?:[.,]\d+)?)", sentence)
+                if not match:
+                    continue
+                raw_val = match.group(1).replace(",", ".")
+                try:
+                    return float(raw_val) if "." in raw_val else int(raw_val)
+                except ValueError:
+                    continue
+            return None
+
+        def _attach_variable_semantics(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            combined_text = "\n".join(
+                [
+                    business_objective or "",
+                    data_summary or "",
+                    json.dumps(strategy, ensure_ascii=True) if isinstance(strategy, dict) else "",
+                ]
+            )
+            decision_context = _detect_decision_context(combined_text)
+            decision_vars: List[str] = []
+            if decision_context:
+                for req in contract.get("data_requirements", []) or []:
+                    if not isinstance(req, dict):
+                        continue
+                    name = req.get("canonical_name") or req.get("name")
+                    if not name:
+                        continue
+                    if _is_price_like(name) or (req.get("role") or "").lower() == "target_regression":
+                        req["decision_variable"] = True
+                        decision_vars.append(name)
+
+            if decision_vars:
+                unique_vars: List[str] = []
+                seen = set()
+                for item in decision_vars:
+                    key = _norm(item)
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    unique_vars.append(item)
+                contract["decision_variables"] = unique_vars
+
+                feature_availability = contract.get("feature_availability")
+                if not isinstance(feature_availability, list):
+                    feature_availability = []
+                avail_map = {
+                    _norm(item.get("column")): item
+                    for item in feature_availability
+                    if isinstance(item, dict) and item.get("column")
+                }
+                for col in unique_vars:
+                    key = _norm(col)
+                    entry = avail_map.get(key)
+                    if not entry:
+                        entry = {"column": col}
+                        feature_availability.append(entry)
+                    entry["availability"] = "decision"
+                    entry.setdefault(
+                        "rationale",
+                        "Decision variable controlled by the business; usable for optimization or elasticity modeling.",
+                    )
+                contract["feature_availability"] = feature_availability
+
+                summary = contract.get("availability_summary") or ""
+                if "decision" not in summary.lower():
+                    summary = (summary + " " if summary else "") + (
+                        "Decision variables may be used in optimization/elasticity modeling when available."
+                    )
+                contract["availability_summary"] = summary
+
+                sentinel_value = _extract_missing_sentinel(combined_text)
+                if sentinel_value is not None:
+                    missing_sentinels = []
+                    for col in unique_vars:
+                        missing_sentinels.append(
+                            {
+                                "column": col,
+                                "sentinel": sentinel_value,
+                                "meaning": "not_observed",
+                                "action": "treat_as_missing",
+                            }
+                        )
+                    contract["missing_sentinels"] = missing_sentinels
+                    notes = contract.get("notes_for_engineers")
+                    if not isinstance(notes, list):
+                        notes = []
+                    note = (
+                        "Missing sentinel detected for decision variables; treat sentinel values as missing "
+                        "when modeling elasticity and document any derived observed flags."
+                    )
+                    if note not in notes:
+                        notes.append(note)
+                    contract["notes_for_engineers"] = notes
+
+            return contract
+
         def _ensure_availability_reasoning(contract: Dict[str, Any]) -> Dict[str, Any]:
             if not isinstance(contract, dict):
                 return contract
@@ -929,6 +1088,7 @@ class ExecutionPlannerAgent:
             contract = _attach_business_alignment(contract)
             contract = _attach_strategy_context(contract)
             contract = _attach_semantic_guidance(contract)
+            contract = _attach_variable_semantics(contract)
             contract = _ensure_availability_reasoning(contract)
             contract = _ensure_iteration_policy(contract)
             return _attach_spec_extraction_to_runbook(contract)
@@ -1037,6 +1197,7 @@ Return the contract JSON.
             contract = _attach_business_alignment(contract)
             contract = _attach_strategy_context(contract)
             contract = _attach_semantic_guidance(contract)
+            contract = _attach_variable_semantics(contract)
             contract = _ensure_availability_reasoning(contract)
             contract = _ensure_iteration_policy(contract)
             return _attach_spec_extraction_to_runbook(contract)

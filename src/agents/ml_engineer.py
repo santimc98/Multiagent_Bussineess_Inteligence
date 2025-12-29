@@ -107,6 +107,8 @@ class MLEngineerAgent:
         - Do not import dependencies not requested by the contract.
 
         *** PRICING / BUSINESS OBJECTIVE LOGIC ***
+        - If execution_contract includes decision_variables, treat them as decision inputs for elasticity/optimization.
+        - If decision_variables include missing_sentinels, treat sentinel values as missing during modeling and consider an observed-flag feature.
         - If price is a decision variable, prefer modeling P(success | x, price) and run a price sweep to find expected revenue optima. Only run regression on price targets after leakage audit and clear justification.
 
         *** IMBALANCE & METRICS ***
@@ -143,7 +145,7 @@ class MLEngineerAgent:
         
         *** FEASIBILITY & CAUSALITY CHECK (CRITICAL) ***
         - Before modeling, CHECK CAUSALITY TRAPS:
-          * If predicting "Success/Conversion", and a feature like "Price" or "Amount" is ONLY present when Success=True (e.g. "Invoice Amount" only exists for sold items), YOU MUST NOT USE IT AS PREDICTOR.
+          * If predicting "Success/Conversion", and a feature like "Price" or "Amount" is ONLY present when Success=True (e.g. "Invoice Amount" only exists for sold items), YOU MUST NOT USE IT AS PREDICTOR unless the contract marks it as a decision_variable with observed rows for non-success cases.
           * If this happens: Detect it => STOP => Print a clear explanation ("Price is a leaky feature") + Suggest Alternative (e.g. "Predict probability of a lead becoming a sale without Price", or "Analyze Price distribution only for successes").
         
         *** COLUMN MAPPING OUTCOMES (REQUIRED) ***
