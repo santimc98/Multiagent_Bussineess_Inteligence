@@ -3,6 +3,7 @@ import json
 import os
 from typing import Any, Dict, List, Tuple
 
+import numpy as np
 import pandas as pd
 
 
@@ -195,9 +196,10 @@ def _align_quality_gates(
 def _find_target_column(contract: Dict[str, Any], df: pd.DataFrame | None) -> str | None:
     reqs = contract.get("data_requirements", []) or []
     target_candidates = []
+    target_roles = {"derived_label", "target_label", "target", "target_regression", "target_classification"}
     for req in reqs:
         role = str(req.get("role", "")).lower()
-        if role in {"derived_label", "target_label"}:
+        if role in target_roles:
             name = req.get("canonical_name") or req.get("name")
             if name:
                 target_candidates.append(str(name))
@@ -205,6 +207,140 @@ def _find_target_column(contract: Dict[str, Any], df: pd.DataFrame | None) -> st
         if df is not None and candidate in df.columns:
             return candidate
     return target_candidates[0] if target_candidates else None
+
+
+def _infer_target_kind(series: pd.Series | None) -> str:
+    if series is None:
+        return "unknown"
+    try:
+        non_null = series.dropna()
+        nunique = int(non_null.nunique())
+    except Exception:
+        return "unknown"
+    if nunique <= 2:
+        return "binary"
+    try:
+        numeric = pd.to_numeric(non_null, errors="coerce")
+        if numeric.notna().mean() >= 0.9:
+            return "numeric"
+    except Exception:
+        pass
+    if nunique <= 12:
+        return "categorical"
+    return "numeric"
+
+
+def _binary_auc(y: np.ndarray, scores: np.ndarray) -> float | None:
+    try:
+        y = np.asarray(y)
+        scores = np.asarray(scores)
+        mask = np.isfinite(scores)
+        y = y[mask]
+        scores = scores[mask]
+        if y.size == 0:
+            return None
+        pos = y == 1
+        n_pos = int(pos.sum())
+        n_neg = int(len(y) - n_pos)
+        if n_pos == 0 or n_neg == 0:
+            return None
+        ranks = pd.Series(scores).rank(method="average").to_numpy()
+        sum_ranks_pos = float(ranks[pos].sum())
+        auc = (sum_ranks_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+        return float(auc)
+    except Exception:
+        return None
+
+
+def _best_auc_proxy(df: pd.DataFrame, target: pd.Series, feature_cols: List[str]) -> Dict[str, Any]:
+    best_auc = None
+    best_feature = None
+    if df is None or target is None:
+        return {"best_auc": None, "best_feature": None}
+    try:
+        target_values = pd.to_numeric(target, errors="coerce")
+        uniq = sorted(target_values.dropna().unique())
+        if len(uniq) != 2:
+            return {"best_auc": None, "best_feature": None}
+        mapping = {uniq[0]: 0, uniq[1]: 1}
+        y = target_values.map(mapping).to_numpy()
+    except Exception:
+        return {"best_auc": None, "best_feature": None}
+    for col in feature_cols:
+        if col not in df.columns:
+            continue
+        series = df[col]
+        numeric = pd.to_numeric(series, errors="coerce")
+        if numeric.notna().sum() < 20:
+            continue
+        auc = _binary_auc(y, numeric.to_numpy())
+        if auc is None:
+            continue
+        auc = max(auc, 1.0 - auc)
+        if best_auc is None or auc > best_auc:
+            best_auc = auc
+            best_feature = col
+    if best_auc is None:
+        for col in feature_cols:
+            if col not in df.columns:
+                continue
+            series = df[col]
+            if series.dropna().nunique() > max(50, int(len(series) * 0.2)):
+                continue
+            try:
+                means = target.groupby(series).mean()
+                scores = series.map(means)
+            except Exception:
+                continue
+            auc = _binary_auc(y, pd.to_numeric(scores, errors="coerce").to_numpy())
+            if auc is None:
+                continue
+            auc = max(auc, 1.0 - auc)
+            if best_auc is None or auc > best_auc:
+                best_auc = auc
+                best_feature = col
+    return {"best_auc": best_auc, "best_feature": best_feature}
+
+
+def _best_regression_proxy(df: pd.DataFrame, target: pd.Series, feature_cols: List[str]) -> Dict[str, Any]:
+    best_spearman = None
+    best_feature = None
+    best_r2 = None
+    if df is None or target is None:
+        return {"best_abs_spearman": None, "best_feature": None, "best_r2_proxy": None}
+    target_numeric = pd.to_numeric(target, errors="coerce")
+    if target_numeric.notna().sum() < 20:
+        return {"best_abs_spearman": None, "best_feature": None, "best_r2_proxy": None}
+    for col in feature_cols:
+        if col not in df.columns:
+            continue
+        series = df[col]
+        numeric = pd.to_numeric(series, errors="coerce")
+        if numeric.notna().sum() >= 20:
+            try:
+                corr = numeric.corr(target_numeric, method="spearman")
+            except Exception:
+                corr = None
+            if corr is not None and np.isfinite(corr):
+                abs_corr = float(abs(corr))
+                if best_spearman is None or abs_corr > best_spearman:
+                    best_spearman = abs_corr
+                    best_feature = col
+        if series.dropna().nunique() <= max(50, int(len(series) * 0.2)):
+            try:
+                means = target_numeric.groupby(series).mean()
+                overall = float(target_numeric.mean())
+                counts = series.value_counts(dropna=True)
+                between = sum(counts.get(idx, 0) * (mean - overall) ** 2 for idx, mean in means.items())
+                total = float(np.nanvar(target_numeric.to_numpy())) * len(target_numeric.dropna())
+                if total > 0:
+                    r2_proxy = float(between / total)
+                    if best_r2 is None or r2_proxy > best_r2:
+                        best_r2 = r2_proxy
+            except Exception:
+                pass
+    best_r2 = best_r2 if best_r2 is not None else (best_spearman ** 2 if best_spearman is not None else None)
+    return {"best_abs_spearman": best_spearman, "best_feature": best_feature, "best_r2_proxy": best_r2}
 
 
 def _calc_lift(baseline: float | None, model: float | None, higher_is_better: bool) -> float | None:
@@ -276,6 +412,32 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             class_balance = None
 
+    feature_cols: List[str] = []
+    if isinstance(contract, dict):
+        for req in contract.get("data_requirements", []) or []:
+            if not isinstance(req, dict):
+                continue
+            role = str(req.get("role") or "").lower()
+            if "feature" in role or role in {"predictor", "driver"}:
+                name = req.get("canonical_name") or req.get("name")
+                if name:
+                    feature_cols.append(str(name))
+    if cleaned is not None and (not feature_cols):
+        if target_col:
+            feature_cols = [col for col in cleaned.columns if col != target_col]
+        else:
+            feature_cols = list(cleaned.columns)
+
+    target_series = cleaned[target_col] if cleaned is not None and target_col in cleaned.columns else None
+    target_kind = _infer_target_kind(target_series) if target_series is not None else "unknown"
+    auc_proxy = {"best_auc": None, "best_feature": None}
+    reg_proxy = {"best_abs_spearman": None, "best_feature": None, "best_r2_proxy": None}
+    if cleaned is not None and target_series is not None:
+        if target_kind == "binary":
+            auc_proxy = _best_auc_proxy(cleaned, target_series, feature_cols)
+        else:
+            reg_proxy = _best_regression_proxy(cleaned, target_series, feature_cols)
+
     quality_gates = contract.get("quality_gates", {}) if isinstance(contract, dict) else {}
     if not isinstance(quality_gates, dict):
         quality_gates = {}
@@ -297,6 +459,12 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         "class_balance": class_balance,
         "small_segment_fraction": small_segment_frac,
         "small_segment_count": small_segment_count,
+        "target_kind": target_kind,
+        "signal_ceiling_auc_proxy": auc_proxy.get("best_auc"),
+        "signal_ceiling_auc_feature": auc_proxy.get("best_feature"),
+        "signal_ceiling_abs_spearman": reg_proxy.get("best_abs_spearman"),
+        "signal_ceiling_r2_proxy": reg_proxy.get("best_r2_proxy"),
+        "signal_ceiling_feature": reg_proxy.get("best_feature"),
         "f1_score_cv_mean": f1,
         "baseline_f1": f1_baseline,
         "f1_lift": f1_lift,
@@ -336,10 +504,27 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
     if small_segment_frac is not None and small_segment_frac > 0.3:
         reasons.append("segments_too_small")
 
-    data_limited = len(
-        [r for r in reasons if not r.endswith("_missing")]
-    ) >= 2 or (
-        (cls_lift is not None and cls_lift < 0.02) and (reg_lift is not None and reg_lift < 0.05)
+    if auc_proxy.get("best_auc") is not None:
+        if auc_proxy["best_auc"] < 0.6:
+            reasons.append("signal_ceiling_low")
+        if cls_metric is not None and cls_metric_name and "auc" in _normalize_key(cls_metric_name):
+            if auc_proxy["best_auc"] is not None and cls_metric >= 0.95 * auc_proxy["best_auc"]:
+                reasons.append("signal_ceiling_reached")
+    if reg_proxy.get("best_r2_proxy") is not None:
+        if reg_proxy["best_r2_proxy"] < 0.05:
+            reasons.append("signal_ceiling_low")
+        if reg_metric_name and "r2" in _normalize_key(reg_metric_name):
+            if reg_metric is not None and reg_metric >= 0.95 * reg_proxy["best_r2_proxy"]:
+                reasons.append("signal_ceiling_reached")
+
+    data_limited = (
+        len([r for r in reasons if not r.endswith("_missing")]) >= 2
+        or "signal_ceiling_reached" in reasons
+        or "signal_ceiling_low" in reasons
+        or (
+            (cls_lift is not None and cls_lift < 0.02)
+            and (reg_lift is not None and reg_lift < 0.05)
+        )
     )
 
     recommendations: List[str] = []
@@ -353,6 +538,10 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         recommendations.append("Improve class balance by collecting more rare outcomes or sampling evenly.")
     if "segments_too_small" in reasons:
         recommendations.append("Aggregate segments or collect more cases per segment before recommending prices.")
+    if "signal_ceiling_low" in reasons:
+        recommendations.append("Increase feature richness or improve data capture to raise the achievable signal ceiling.")
+    if "signal_ceiling_reached" in reasons:
+        recommendations.append("Current performance is near the data signal ceiling; improvements likely require better data, not tuning.")
     if "classification_metric_missing" in reasons or "regression_metric_missing" in reasons:
         recommendations.append("Persist model performance metrics alongside weights.json for data adequacy checks.")
     if "classification_baseline_missing" in reasons or "regression_baseline_missing" in reasons:

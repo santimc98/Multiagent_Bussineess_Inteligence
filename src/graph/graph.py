@@ -1247,6 +1247,75 @@ def _load_json_safe(path: str) -> Dict[str, Any]:
     except Exception:
         return {}
 
+def _normalize_alignment_check(
+    alignment_check: Dict[str, Any],
+    alignment_requirements: List[Dict[str, Any]],
+) -> tuple[Dict[str, Any], List[str]]:
+    issues: List[str] = []
+    normalized = dict(alignment_check or {})
+    status = str(normalized.get("status") or "").upper()
+    if status not in {"PASS", "WARN", "FAIL"}:
+        status = "WARN"
+        issues.append("alignment_status_invalid")
+
+    requirements_payload = normalized.get("requirements")
+    per_req = normalized.get("per_requirement")
+    evidence_map = normalized.get("evidence")
+
+    normalized_reqs: List[Dict[str, Any]] = []
+    missing_status = 0
+    missing_evidence = 0
+    for req in alignment_requirements or []:
+        req_id = req.get("id")
+        if not req_id:
+            continue
+        req_status = None
+        req_evidence: List[str] = []
+        if isinstance(requirements_payload, list):
+            for item in requirements_payload:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("id") == req_id:
+                    req_status = str(item.get("status") or item.get("result") or "").upper()
+                    evidence_val = item.get("evidence") or item.get("notes") or []
+                    if isinstance(evidence_val, list):
+                        req_evidence = [str(v) for v in evidence_val if v]
+                    break
+        if req_status is None and isinstance(per_req, dict):
+            raw = per_req.get(req_id)
+            if raw is not None:
+                req_status = str(raw).upper()
+        if not req_evidence and isinstance(evidence_map, dict):
+            raw_ev = evidence_map.get(req_id)
+            if isinstance(raw_ev, list):
+                req_evidence = [str(v) for v in raw_ev if v]
+        if not req_status:
+            missing_status += 1
+            req_status = "MISSING"
+        if not req_evidence:
+            missing_evidence += 1
+        normalized_reqs.append(
+            {"id": req_id, "status": req_status, "evidence": req_evidence}
+        )
+
+    if missing_status:
+        issues.append("alignment_missing_requirement_status")
+    if missing_evidence:
+        issues.append("alignment_missing_evidence")
+
+    failure_mode = normalized.get("failure_mode")
+    if not failure_mode and issues:
+        failure_mode = "method_choice"
+
+    normalized["status"] = status
+    normalized["failure_mode"] = failure_mode
+    normalized["requirements"] = normalized_reqs
+    if issues:
+        summary = normalized.get("summary") or ""
+        issue_text = ", ".join(sorted(set(issues)))
+        normalized["summary"] = f"{summary} Alignment issues: {issue_text}".strip()
+    return normalized, issues
+
 def _hash_json(payload: Any) -> str | None:
     if not payload:
         return None
@@ -4430,9 +4499,26 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             feedback = f"{feedback}\n{msg}" if feedback else msg
             new_history.append(msg)
         else:
+            normalized_alignment, alignment_issues = _normalize_alignment_check(
+                alignment_check, alignment_requirements
+            )
+            if normalized_alignment != alignment_check:
+                alignment_check = normalized_alignment
+                try:
+                    with open("data/alignment_check.json", "w", encoding="utf-8") as f_align:
+                        json.dump(alignment_check, f_align, indent=2, ensure_ascii=False)
+                except Exception:
+                    pass
             raw_status = str(alignment_check.get("status", "")).upper()
             failure_mode = str(alignment_check.get("failure_mode", "")).lower()
             summary = alignment_check.get("summary") or alignment_check.get("notes") or ""
+            if alignment_issues and raw_status == "PASS":
+                raw_status = "WARN"
+                summary = f"{summary} Alignment evidence missing." if summary else "Alignment evidence missing."
+                failure_mode = failure_mode or "method_choice"
+                alignment_check["status"] = raw_status
+                alignment_check["summary"] = summary
+                alignment_check["failure_mode"] = failure_mode
             data_modes = {"data_limited", "data", "insufficient_data", "data_limitations"}
             method_modes = {"method_choice", "method", "strategy", "approach"}
             msg = f"ALIGNMENT_CHECK_{raw_status}: failure_mode={failure_mode}; summary={summary}"
@@ -4539,6 +4625,20 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         else:
             feedback = "CODE_AUDIT_REJECTED: reviewer/QA rejection requires fixes."
         new_history.append("CODE_AUDIT_REJECTED: reviewer/QA rejection requires fixes.")
+        if alignment_requirements:
+            if "alignment_method_choice" not in alignment_failed_gates:
+                alignment_failed_gates.append("alignment_method_choice")
+        if alignment_check:
+            try:
+                alignment_check["status"] = "FAIL"
+                alignment_check["failure_mode"] = "method_choice"
+                summary = alignment_check.get("summary") or ""
+                note = "Reviewer/QA rejection indicates method choice misalignment."
+                alignment_check["summary"] = f"{summary} {note}".strip()
+                with open("data/alignment_check.json", "w", encoding="utf-8") as f_align:
+                    json.dump(alignment_check, f_align, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
 
     failed_gates = case_report.get("failures", []) if case_report.get("status") == "FAIL" else []
     required_fixes = list(failed_gates)
