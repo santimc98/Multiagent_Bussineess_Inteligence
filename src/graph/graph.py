@@ -2884,6 +2884,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     cleaned_stats = {}
                     cleaned_samples = {}
                     cleaned_value_counts = {}
+                    cleaned_range_stats = {}
+                    cleaned_preview_rows = []
                     review_columns = list(dict.fromkeys(required_cols + list(contract_derived_cols or [])))
                     for col in review_columns:
                         if col not in df_mapped.columns:
@@ -2900,6 +2902,14 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             "non_null_count": int((~null_like).sum()),
                             "unique_count": int(series.nunique(dropna=True)),
                         }
+                        if pd.api.types.is_numeric_dtype(series):
+                            try:
+                                cleaned_range_stats[col] = {
+                                    "min": float(series.min()),
+                                    "max": float(series.max()),
+                                }
+                            except Exception:
+                                cleaned_range_stats[col] = {}
                         try:
                             cleaned_samples[col] = series.dropna().astype(str).head(6).tolist()
                         except Exception:
@@ -2909,16 +2919,34 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             cleaned_value_counts[col] = {str(k): int(v) for k, v in vc.items()}
                         except Exception:
                             cleaned_value_counts[col] = {}
+                    try:
+                        preview_df = df_mapped[review_columns].head(6).copy()
+                        cleaned_preview_rows = preview_df.astype(str).to_dict(orient="records")
+                    except Exception:
+                        cleaned_preview_rows = []
 
                     raw_samples = {}
                     raw_pattern_stats = {}
                     raw_value_counts = {}
+                    raw_null_stats = {}
+                    raw_vs_clean_null_delta = {}
                     try:
                         sample_df = sample_raw_columns(csv_path, input_dialect, required_cols, nrows=200, dtype=str)
                         if not sample_df.empty:
                             for col in sample_df.columns:
                                 raw_series = sample_df[col].dropna().astype(str)
                                 raw_samples[col] = raw_series.head(6).tolist()
+                                try:
+                                    raw_str = sample_df[col].astype(str).str.strip()
+                                    null_like = sample_df[col].isna() | raw_str.eq("") | raw_str.str.lower().isin(["nan", "null", "none"])
+                                    raw_null_stats[col] = {
+                                        "null_frac": float(null_like.mean()) if len(sample_df) else 0.0,
+                                        "sample_rows": int(len(sample_df)),
+                                    }
+                                    if col in cleaned_stats:
+                                        raw_vs_clean_null_delta[col] = float(cleaned_stats[col]["null_frac"] - raw_null_stats[col]["null_frac"])
+                                except Exception:
+                                    raw_null_stats[col] = {}
                                 if not raw_series.empty:
                                     total = len(raw_series)
                                     try:
@@ -2946,9 +2974,14 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         "raw_samples": raw_samples,
                         "raw_pattern_stats": raw_pattern_stats,
                         "raw_value_counts": raw_value_counts,
+                        "raw_null_stats": raw_null_stats,
+                        "raw_vs_clean_null_delta": raw_vs_clean_null_delta,
                         "cleaned_stats": cleaned_stats,
                         "cleaned_samples": cleaned_samples,
                         "cleaned_value_counts": cleaned_value_counts,
+                        "cleaned_range_stats": cleaned_range_stats,
+                        "cleaned_preview_rows": cleaned_preview_rows,
+                        "cleaning_manifest": manifest_obj,
                         "manifest_conversions": conversions,
                         "manifest_type_checks": type_checks,
                         "leakage_check": leakage_check,

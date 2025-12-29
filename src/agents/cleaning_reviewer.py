@@ -39,16 +39,18 @@ class CleaningReviewerAgent:
 
         system_prompt = (
             "You are a Senior Data Cleaning Reviewer. "
-            "Audit the cleaning output using the manifest, raw samples, and cleaned stats. "
+            "Audit the cleaning output using the manifest, raw samples, cleaned previews, and summary stats. "
             "Your job is to detect destructive parsing (null explosions), misinterpreted number formats "
             "(thousands/decimal separators), incorrect imputation, and missing/aliased columns. "
             "Use the execution_contract (data_requirements, expected_kind, expected_range, feature_availability, "
-            "spec_extraction) as ground truth for what each variable means and whether it is pre/post decision. "
+            "spec_extraction, decision_variables, missing_sentinels) as ground truth for variable meaning. "
             "Use steward_summary as authoritative context for domain semantics. "
+            "Reason like a senior: base decisions on evidence, explain interpretation and impact, then decide. "
             "If results are unsafe for downstream modeling, REJECT with clear, actionable fixes. "
+            "If evidence is mixed, prefer APPROVE_WITH_WARNINGS rather than rejecting. "
             "Incorporate steward_summary and raw_pattern_stats to infer expected formats and units. "
             "If cleaned_value_counts suggest binarization or collapse, call it out explicitly, but do not "
-            "reject if the cleaned range matches the expected_range and the contract allows sentinel imputation. "
+            "reject if the cleaned range matches expected_range and the contract allows sentinel imputation. "
             "Differentiate between warnings and hard failures: "
             "- REJECT only if required columns are missing, derived columns in spec_extraction are absent, "
             "or numeric parsing causes large-scale corruption (null explosions or order-of-magnitude shifts). "
@@ -58,7 +60,7 @@ class CleaningReviewerAgent:
             "unless the cleaning step used a post-decision field to derive a pre-decision column. "
             "- If a field is flagged as post-decision in feature_availability, treat leakage as a WARNING "
             "unless the column was used for deriving pre-decision features. "
-            "Do NOT provide code. Provide reasoning like a senior data engineer."
+            "Do NOT provide code. Provide reasoning with Evidence -> Interpretation -> Impact -> Decision."
         )
 
         output_format = (
