@@ -666,6 +666,72 @@ def _normalize_execution_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
 
     return normalized
 
+def _normalize_required_fixes(items: List[Any] | None) -> List[str]:
+    fixes: List[str] = []
+    for item in items or []:
+        if item is None:
+            continue
+        if isinstance(item, str):
+            cleaned = item.strip()
+            if cleaned:
+                fixes.append(cleaned)
+        else:
+            fixes.append(str(item))
+    return fixes
+
+def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[Any] | None) -> List[str]:
+    fixes = _normalize_required_fixes(required_fixes)
+    tokens = [str(item) for item in (failed_gates or []) if item]
+    tokens.extend(fixes)
+
+    guidance_map = {
+        "MAPPING_SUMMARY": [
+            "Print `Mapping Summary: Target=<...>, Features=<...>, SegFeatures=<...>` immediately after column mapping.",
+        ],
+        "TARGET_VARIANCE_GUARD": [
+            "Add `if y.nunique() <= 1: raise ValueError(...)` before any training or optimization.",
+        ],
+        "HIGH_CARDINALITY_HANDLING": [
+            "Build X strictly from contract feature_cols or drop high-cardinality ID columns using nunique ratio.",
+        ],
+        "TARGET_NOT_IN_X": [
+            "Ensure target column is excluded from features when building X.",
+        ],
+        "CROSS_VALIDATION_REQUIRED": [
+            "Use cross-validation (StratifiedKFold/KFold) and report mean/std; avoid only train_test_split.",
+        ],
+        "ALIGNMENT_CHECK_OUTPUT": [
+            "Write data/alignment_check.json with per-requirement status and evidence (metrics, artifacts, or logs).",
+        ],
+        "alignment_check_missing": [
+            "Create data/alignment_check.json and include it in required outputs.",
+        ],
+        "alignment_method_choice": [
+            "Revise methodology to align with contract requirements (segmentation, decision variables, validation).",
+        ],
+    }
+
+    for token in tokens:
+        for key, additions in guidance_map.items():
+            if key in token:
+                fixes.extend(additions)
+
+    deduped: List[str] = []
+    seen = set()
+    for fix in fixes:
+        if fix not in seen:
+            seen.add(fix)
+            deduped.append(fix)
+    return deduped
+
+def _build_fix_instructions(required_fixes: List[str]) -> str:
+    if not required_fixes:
+        return ""
+    lines = ["PATCH TARGETS (apply minimal edits):"]
+    for fix in required_fixes:
+        lines.append(f"- {fix}")
+    return "\n".join(lines)
+
 def _get_iteration_policy(state: Dict[str, Any]) -> Dict[str, int] | None:
     contract = state.get("execution_contract") or {}
     policy = contract.get("iteration_policy")
@@ -3723,8 +3789,11 @@ def run_reviewer(state: AgentState) -> AgentState:
             "status": review['status'],
             "feedback": review['feedback'],
             "failed_gates": review.get('failed_gates', []),
-            "required_fixes": review.get('required_fixes', [])
+            "required_fixes": _expand_required_fixes(review.get('required_fixes', []), review.get('failed_gates', []))
         }
+        fix_block = _build_fix_instructions(gate_context["required_fixes"])
+        if fix_block:
+            gate_context["edit_instructions"] = fix_block
 
         if review['status'] == "REJECTED":
             new_history.append(f"REVIEWER FEEDBACK (Attempt {current_iter+1}): {review['feedback']}")
@@ -3839,8 +3908,11 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
             "status": status,
             "feedback": feedback,
             "failed_gates": failed_gates,
-            "required_fixes": required_fixes
+            "required_fixes": _expand_required_fixes(required_fixes, failed_gates)
         }
+        fix_block = _build_fix_instructions(gate_context["required_fixes"])
+        if fix_block:
+            gate_context["edit_instructions"] = fix_block
         
         if status == "REJECTED":
             current_history.append(f"QA TEAM FEEDBACK (Critical): {feedback}")
@@ -3932,6 +4004,7 @@ def run_ml_preflight(state: AgentState) -> AgentState:
 
     issues = ml_quality_preflight(code)
     if issues:
+        expanded = _expand_required_fixes(issues, issues)
         feedback = f"ML_PREFLIGHT_MISSING: {', '.join(issues)}"
         history = list(state.get("feedback_history", []))
         history.append(feedback)
@@ -3940,8 +4013,11 @@ def run_ml_preflight(state: AgentState) -> AgentState:
             "status": "REJECTED",
             "feedback": feedback,
             "failed_gates": issues,
-            "required_fixes": issues,
+            "required_fixes": expanded,
         }
+        fix_block = _build_fix_instructions(expanded)
+        if fix_block:
+            gate_context["edit_instructions"] = fix_block
         return {
             "ml_preflight_failed": True,
             "feedback_history": history,
@@ -4633,12 +4709,13 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 pass
 
     failed_gates = case_report.get("failures", []) if case_report.get("status") == "FAIL" else []
-    required_fixes = list(failed_gates)
+    required_fixes = _expand_required_fixes(failed_gates, failed_gates)
     if alignment_failed_gates:
         for item in alignment_failed_gates:
             if item not in failed_gates:
                 failed_gates.append(item)
                 required_fixes.append(item)
+    required_fixes = _expand_required_fixes(required_fixes, failed_gates)
     if case_report.get("status") == "FAIL":
         gate_source = "case_alignment_gate"
     elif alignment_failed_gates:
@@ -4652,6 +4729,9 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "failed_gates": failed_gates,
         "required_fixes": required_fixes,
     }
+    fix_block = _build_fix_instructions(required_fixes)
+    if fix_block:
+        gate_context["edit_instructions"] = fix_block
 
     print(f"Reviewer Verdict: {status}")
     if status == "NEEDS_IMPROVEMENT":
