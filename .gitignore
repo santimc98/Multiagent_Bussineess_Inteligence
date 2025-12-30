@@ -47,6 +47,7 @@ data/weights.json
 data/metrics.json
 data/case_summary.csv
 data/scored_rows.csv
+data/alignment_check.json
 data/run_summary.json
 data/governance_report.json
 data/data_adequacy_report.json
