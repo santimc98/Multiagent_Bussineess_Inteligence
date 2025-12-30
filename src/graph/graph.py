@@ -29,7 +29,6 @@ from src.agents.failure_explainer import FailureExplainerAgent
 from src.agents.results_advisor import ResultsAdvisorAgent
 from src.utils.pdf_generator import convert_report_to_pdf
 from src.utils.static_safety_scan import scan_code_safety
-from src.utils.visuals import generate_fallback_plots
 from src.utils.dialect_guardrails import (
     assert_not_single_column_delimiter_mismatch,
     get_output_dialect_from_manifest,
@@ -1017,6 +1016,18 @@ def ml_quality_preflight(code: str) -> List[str]:
 
     if not (has_x_from_feature_cols or has_high_card_filter):
         issues.append("HIGH_CARDINALITY_HANDLING")
+
+    cv_markers = [
+        "cross_val_score",
+        "cross_validate",
+        "kfold",
+        "stratifiedkfold",
+        "groupkfold",
+        "timeseriessplit",
+        "stratifiedgroupkfold",
+    ]
+    if "train_test_split" in code_lower and not any(marker in code_lower for marker in cv_markers):
+        issues.append("CROSS_VALIDATION_REQUIRED")
 
     return issues
 
@@ -4191,26 +4202,6 @@ def execute_code(state: AgentState) -> AgentState:
     plots_local = glob.glob("static/plots/*.png")
     
     fallback_plots_local = []
-    # Fallback Plotting (Robustness)
-    if not plots_local:
-        print("Warning: No plots found from sandbox. Attempting fallback generation on host.")
-        try:
-             # Ensure data exists locally
-             if os.path.exists("data/cleaned_data.csv"):
-                 fallback_plots = generate_fallback_plots(
-                     "data/cleaned_data.csv",
-                     sep=state.get("csv_sep", ","),
-                     decimal=state.get("csv_decimal", "."),
-                     encoding=state.get("csv_encoding", "utf-8")
-                 )
-                 if fallback_plots:
-                     fallback_plots_local = list(fallback_plots)
-                     plots_local.extend(fallback_plots)
-                     print(f"Fallback successful. Added {len(fallback_plots)} plots.")
-             else:
-                 print("Critical: Cannot run fallback plots, 'data/cleaned_data.csv' missing.")
-        except Exception as fb_err:
-             print(f"Fallback generation failed: {fb_err}")
              
     has_partial_visuals = len(plots_local) > 0
     
@@ -4598,12 +4589,13 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         try:
             ok, counters, err_msg = _consume_budget(state, "qa_calls", "max_qa_calls", "QA Reviewer")
             review_counters = counters
+            qa_result = None
             if ok:
                 qa_result = qa_reviewer.review_code(code, strategy, business_objective)
-            if qa_result and qa_result.get("status") != "APPROVED":
-                review_warnings.append(
-                    f"QA_CODE_AUDIT[{qa_result.get('status')}]: {qa_result.get('feedback')}"
-                )
+                if qa_result and qa_result.get("status") != "APPROVED":
+                    review_warnings.append(
+                        f"QA_CODE_AUDIT[{qa_result.get('status')}]: {qa_result.get('feedback')}"
+                    )
             else:
                 review_warnings.append(f"QA_CODE_AUDIT_SKIPPED: {err_msg}")
         except Exception as qa_err:

@@ -418,6 +418,7 @@ def execute_cleaning_plan(plan: Dict[str, Any], contract: Dict[str, Any]) -> Dic
         "type_checks": [],
         "rows_before": rows_before,
         "rows_after": len(df),
+        "row_counts": {"initial": rows_before, "final": len(df)},
         "warnings": warnings,
     }
 

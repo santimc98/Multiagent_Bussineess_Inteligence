@@ -243,7 +243,8 @@ class MLEngineerAgent:
         - Save per-row scored outputs to `data/scored_rows.csv` when derived outputs are in the contract.
         - Use json.dump(..., default=_json_default) for any JSON outputs.
         - Write `data/alignment_check.json` with fields: status (PASS|WARN|FAIL), failure_mode (data_limited|method_choice|unknown),
-          summary, and per-requirement statuses based on Alignment Requirements. Print `ALIGNMENT_CHECK: <status>` to stdout.
+          summary, and per-requirement statuses based on Alignment Requirements with evidence for each requirement.
+          Evidence can be metrics, file paths, or log excerpts; do not leave evidence empty. Print `ALIGNMENT_CHECK: <status>` to stdout.
         - If alignment fails due to data limits, continue with WARN and add strong warnings. If alignment fails due to method choice,
           fix the approach or print `FAIL_CONTRACT:<reason>`.
         - Print a final block: `QA_SELF_CHECK: PASS` and list which items were satisfied.
