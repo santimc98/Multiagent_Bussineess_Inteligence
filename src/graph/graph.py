@@ -4179,6 +4179,7 @@ def run_ml_preflight(state: AgentState) -> AgentState:
     if abort_state:
         return abort_state
     code = state.get("generated_code", "")
+    evaluation_spec = state.get("evaluation_spec") or (state.get("execution_contract", {}) or {}).get("evaluation_spec") or {}
     if code and not is_syntax_valid(code):
         feedback = "ML_PREFLIGHT_SYNTAX_ERROR: Generated code is not valid Python syntax."
         history = list(state.get("feedback_history", []))
