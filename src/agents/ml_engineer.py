@@ -19,7 +19,7 @@ class MLEngineerAgent:
         """
         Initializes the ML Engineer Agent with the configured provider.
         """
-        self.provider = (os.getenv("ML_ENGINEER_PROVIDER", "deepseek") or "deepseek").strip().lower()
+        self.provider = (os.getenv("ML_ENGINEER_PROVIDER", "google") or "google").strip().lower()
         if self.provider == "zai":
             self.api_key = api_key or os.getenv("ZAI_API_KEY") or os.getenv("GLM_API_KEY")
             if not self.api_key:
@@ -41,6 +41,14 @@ class MLEngineerAgent:
                 timeout=None,
             )
             self.model_name = "deepseek-reasoner"
+        elif self.provider in {"google", "gemini"}:
+            self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
+            if not self.api_key:
+                raise ValueError("Google API Key is required.")
+            import google.generativeai as genai
+            genai.configure(api_key=self.api_key)
+            self.client = genai
+            self.model_name = os.getenv("ML_ENGINEER_MODEL", "gemini-3-flash-preview") or "gemini-3-flash-preview"
         else:
             raise ValueError(f"Unsupported ML_ENGINEER_PROVIDER: {self.provider}")
 
@@ -354,7 +362,12 @@ class MLEngineerAgent:
             current_temp = 0.1
 
         from src.utils.retries import call_with_retries
-        provider_label = "Z.ai" if self.provider == "zai" else "DeepSeek"
+        if self.provider in {"google", "gemini"}:
+            provider_label = "Google"
+        elif self.provider == "zai":
+            provider_label = "Z.ai"
+        else:
+            provider_label = "DeepSeek"
 
         def _call_model():
             print(f"DEBUG: ML Engineer calling {provider_label} Model ({self.model_name})...")
@@ -369,6 +382,29 @@ class MLEngineerAgent:
                         ],
                         temperature=current_temp,
                     )
+                content = response.choices[0].message.content
+            elif self.provider in {"google", "gemini"}:
+                from google.generativeai.types import HarmCategory, HarmBlockThreshold
+                generation_config = {
+                    "temperature": current_temp,
+                    "top_p": 0.9,
+                    "top_k": 40,
+                    "max_output_tokens": 8192,
+                }
+                safety_settings = {
+                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+                }
+                model = self.client.GenerativeModel(
+                    model_name=self.model_name,
+                    generation_config=generation_config,
+                    safety_settings=safety_settings,
+                )
+                full_prompt = system_prompt + "\n\nUSER INPUT:\n" + user_message
+                response = model.generate_content(full_prompt)
+                content = getattr(response, "text", "")
             else:
                 response = self.client.chat.completions.create(
                     model=self.model_name,
@@ -378,7 +414,7 @@ class MLEngineerAgent:
                     ],
                     temperature=current_temp,
                 )
-            content = response.choices[0].message.content
+                content = response.choices[0].message.content
             
             # CRITICAL CHECK FOR SERVER ERRORS (HTML/504)
             if "504 Gateway Time-out" in content or "<html" in content.lower():
