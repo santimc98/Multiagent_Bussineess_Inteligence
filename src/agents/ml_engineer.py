@@ -140,6 +140,7 @@ class MLEngineerAgent:
         1. OUTPUT VALID PYTHON CODE ONLY (no markdown/code fences).
         2. Do NOT output JSON plans or pseudo-code.
         3. If the audit includes RUNTIME_ERROR_CONTEXT, fix the root cause and regenerate the full script.
+        4. NEVER generate synthetic or placeholder data. Always load the provided dataset from $data_path.
 
         *** EXECUTION STYLE (FREEDOM WITH GUARDRAILS) ***
         - You are free to design the code structure and modeling approach; do NOT follow a rigid template.
@@ -268,6 +269,11 @@ class MLEngineerAgent:
         *** DATA CONTEXT (TYPES & STATS) ***
         $data_audit_context
 
+        *** DATA SOURCE NON-NEGOTIABLE ***
+        - Use pd.read_csv to load the provided dataset.
+        - Do NOT fabricate datasets, demo data, or simulated inputs.
+        - If required columns are missing after mapping, raise ValueError; do not substitute synthetic columns.
+
         *** MODELING PRINCIPLES (SENIOR STANDARD) ***
         1. PIPELINES WHEN MODELING:
            - Prefer `sklearn.pipeline.Pipeline` and `ColumnTransformer` if training a model.
@@ -385,6 +391,7 @@ class MLEngineerAgent:
         $fixes_bullets
         - [ ] VERIFY COLUMN MAPPING: Ensure fuzzy match + aliasing check found in Protocol v2. No case-sensitive filtering.
         - [ ] VERIFY RENAMING: Ensure DataFrame columns are renamed to canonical required names.
+        - [ ] DO NOT GENERATE SYNTHETIC DATA: Load the provided dataset from $data_path.
         
         *** PREVIOUS OUTPUT (TO PATCH) ***
         $previous_code

@@ -717,8 +717,20 @@ def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[
         "DATA_LOAD_MISSING": [
             "Load the cleaned dataset using pd.read_csv with the detected dialect before processing.",
         ],
+        "DATA_PATH_NOT_USED": [
+            "Read from data/cleaned_data.csv or data/cleaned_full.csv (or data.csv in sandbox) using pd.read_csv.",
+        ],
         "REQUIRED_OUTPUTS_MISSING": [
             "Write all required outputs to the exact contract paths before exiting.",
+        ],
+        "REQUIRED_COLUMNS_NOT_USED": [
+            "Use the required business columns from the contract (e.g., Size, Debtors, Sector) in mapping/processing.",
+        ],
+        "SYNTHETIC_DATA_DETECTED": [
+            "Remove synthetic data generation; load and use the provided cleaned dataset only.",
+        ],
+        "ALIGNMENT_REQUIREMENTS_MISSING": [
+            "Populate alignment_check.json with per-requirement status + evidence list.",
         ],
         "AST_PARSE_FAILED": [
             "Return valid Python syntax; do not output partial code or truncated blocks.",
@@ -1133,6 +1145,66 @@ def ml_quality_preflight(code: str) -> List[str]:
         issues.append("CROSS_VALIDATION_REQUIRED")
 
     return issues
+
+def _analyze_read_csv_usage(code: str) -> Dict[str, Any]:
+    import ast
+
+    result = {"has_read_csv": False, "paths": []}
+    if not code:
+        return result
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return result
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            is_read = False
+            if isinstance(func, ast.Attribute) and func.attr == "read_csv":
+                if isinstance(func.value, ast.Name) and func.value.id in {"pd", "pandas"}:
+                    is_read = True
+            if isinstance(func, ast.Name) and func.id == "read_csv":
+                is_read = True
+            if not is_read:
+                continue
+            result["has_read_csv"] = True
+            if node.args:
+                arg0 = node.args[0]
+                if isinstance(arg0, ast.Constant) and isinstance(arg0.value, str):
+                    result["paths"].append(arg0.value)
+    return result
+
+def _required_columns_coverage(code: str, required_columns: List[str]) -> Dict[str, Any]:
+    if not code or not required_columns:
+        return {"hits": [], "missing": []}
+    code_lower = code.lower()
+    hits = []
+    for col in required_columns:
+        if not col:
+            continue
+        if str(col).lower() in code_lower:
+            hits.append(col)
+    missing = [col for col in required_columns if col and col not in hits]
+    return {"hits": hits, "missing": missing}
+
+def _detect_synthetic_data(code: str) -> bool:
+    if not code:
+        return False
+    code_lower = code.lower()
+    synthetic_markers = [
+        "np.random",
+        "random.",
+        "make_classification",
+        "make_regression",
+        "make_blobs",
+        "faker",
+        "synthetic data",
+        "generate synthetic",
+        "load_iris",
+        "load_breast_cancer",
+        "load_wine",
+    ]
+    return any(marker in code_lower for marker in synthetic_markers)
 
 def _missing_required_output_refs(code: str, outputs: List[str]) -> List[str]:
     if not code or not outputs:
@@ -4083,14 +4155,38 @@ def run_ml_preflight(state: AgentState) -> AgentState:
         }
 
     issues = ml_quality_preflight(code)
-    missing_outputs = _missing_required_output_refs(code, contract.get("required_outputs", []) or [])
+    required_columns = contract.get("required_columns") or strategy.get("required_columns", []) or []
+    required_outputs = contract.get("required_outputs", []) or []
+    missing_outputs = _missing_required_output_refs(code, required_outputs)
     if missing_outputs:
         issues.append("REQUIRED_OUTPUTS_MISSING")
+    read_csv_info = _analyze_read_csv_usage(code)
+    has_read_csv = read_csv_info.get("has_read_csv")
+    if not has_read_csv:
+        issues.append("DATA_LOAD_MISSING")
+    else:
+        allowed_paths = ("data/cleaned_data.csv", "data/cleaned_full.csv", "data.csv")
+        path_hits = [p for p in read_csv_info.get("paths", []) if any(a in p for a in allowed_paths)]
+        if not path_hits and "data_path" not in (code or "").lower():
+            issues.append("DATA_PATH_NOT_USED")
+    col_coverage = _required_columns_coverage(code, required_columns)
+    if required_columns:
+        min_abs = 2 if len(required_columns) >= 4 else 1
+        min_ratio = int(len(required_columns) * 0.5 + 0.5)
+        min_required = max(min_abs, min_ratio)
+        if len(col_coverage.get("hits", [])) < min_required:
+            issues.append("REQUIRED_COLUMNS_NOT_USED")
+    if _detect_synthetic_data(code) and not has_read_csv:
+        issues.append("SYNTHETIC_DATA_DETECTED")
+    if "alignment_check.json" in (code or "") and "\"requirements\"" not in (code or "") and "'requirements'" not in (code or ""):
+        issues.append("ALIGNMENT_REQUIREMENTS_MISSING")
     if issues:
         expanded = _expand_required_fixes(issues, issues)
         feedback = f"ML_PREFLIGHT_MISSING: {', '.join(issues)}"
         if missing_outputs:
             feedback += f" | Missing output refs: {missing_outputs}"
+        if col_coverage.get("hits") is not None and required_columns:
+            feedback += f" | Required columns hits: {col_coverage.get('hits')}"
         history = list(state.get("feedback_history", []))
         history.append(feedback)
         gate_context = {
