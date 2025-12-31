@@ -5532,6 +5532,12 @@ def execute_code(state: AgentState) -> AgentState:
                 sandbox.commands.run(extra_cmd)
             sandbox.commands.run("mkdir -p static/plots") # Ensure plots dir exists
             sandbox.commands.run("mkdir -p data") # Ensure data dir exists for outputs
+            sandbox.commands.run(
+                "rm -rf analysis models static/plots "
+                "data/metrics.json data/scored_rows.csv data/alignment_check.json "
+                "data/output_contract_report.json data/qa_static_facts.json "
+                "data/weights.json data/case_summary.csv"
+            )
             
             local_csv = state.get("ml_data_path") or "data/cleaned_data.csv"
             if not os.path.exists(local_csv) and local_csv != "data/cleaned_data.csv":
