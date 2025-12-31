@@ -1843,6 +1843,35 @@ Return the contract JSON.
         business_objective: str = "",
         column_inventory: list[str] | None = None,
     ) -> Dict[str, Any]:
+        def _derive_flag_defaults(spec: Dict[str, Any]) -> Dict[str, Any]:
+            objective_type = str(spec.get("objective_type") or "").lower()
+            requires_target = spec.get("requires_target")
+            if requires_target is None:
+                requires_target = objective_type in {"predictive", "prescriptive", "forecasting"}
+            requires_time_series_split = spec.get("requires_time_series_split")
+            if requires_time_series_split is None:
+                requires_time_series_split = objective_type == "forecasting"
+            requires_supervised_split = spec.get("requires_supervised_split")
+            if requires_supervised_split is None:
+                requires_supervised_split = bool(requires_target)
+            requires_row_scoring = spec.get("requires_row_scoring")
+            if requires_row_scoring is None:
+                deliverables = (contract.get("spec_extraction") or {}).get("deliverables") if isinstance(contract, dict) else []
+                requires_row_scoring = False
+                if isinstance(deliverables, list):
+                    for item in deliverables:
+                        if isinstance(item, dict) and item.get("path") == "data/scored_rows.csv":
+                            requires_row_scoring = bool(item.get("required", True))
+                            break
+                        if isinstance(item, str) and item == "data/scored_rows.csv":
+                            requires_row_scoring = True
+                            break
+            spec["requires_target"] = bool(requires_target)
+            spec["requires_time_series_split"] = bool(requires_time_series_split)
+            spec["requires_supervised_split"] = bool(requires_supervised_split)
+            spec["requires_row_scoring"] = bool(requires_row_scoring)
+            return spec
+
         def _fallback() -> Dict[str, Any]:
             # Reuse the heuristic builder inside generate_contract scope via a lightweight copy
             objective_text = (contract.get("business_objective") or business_objective or "").lower()
@@ -1900,7 +1929,7 @@ Return the contract JSON.
             else:
                 evidence_requirements = [{"artifact": out, "required": True} for out in contract.get("required_outputs", [])]
 
-            return {
+            spec = {
                 "objective_type": objective_type,
                 "segmentation": {
                     "required": segmentation_required,
@@ -1929,6 +1958,7 @@ Return the contract JSON.
                 "confidence": 0.4,
                 "justification": "Fallback evaluation spec derived heuristically from contract and strategy."
             }
+            return _derive_flag_defaults(spec)
 
         if not self.client:
             return _fallback()
@@ -1943,6 +1973,10 @@ Return the contract JSON.
             "reviewer_gates": [],
             "alignment_requirements": [],
             "evidence_requirements": [],
+            "requires_target": False,
+            "requires_supervised_split": False,
+            "requires_time_series_split": False,
+            "requires_row_scoring": False,
             "confidence": 0.0,
             "justification": ""
         }
@@ -1955,7 +1989,8 @@ Return the contract JSON.
             "Gate vocabulary (use only these ids): "
             "mapping_summary, consistency_checks, target_variance_guard, leakage_prevention, outputs_required, "
             "segmentation_predecision, decision_variable_handling, validation_required, price_optimization, "
-            "methodology_alignment, business_value."
+            "methodology_alignment, business_value. "
+            "Include requires_target/requires_supervised_split/requires_time_series_split/requires_row_scoring flags."
         )
         user_payload = {
             "business_objective": business_objective,
@@ -1980,6 +2015,6 @@ Return the contract JSON.
             spec = json.loads(content) if content else {}
             if not isinstance(spec, dict):
                 return _fallback()
-            return spec
+            return _derive_flag_defaults(spec)
         except Exception:
             return _fallback()

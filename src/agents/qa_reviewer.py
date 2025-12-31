@@ -69,21 +69,21 @@ class QAReviewerAgent:
         
         QUALITY GATES (SPEC-DRIVEN):
         
-        1. MAPPING SUMMARY (Mandatory):
+        1. MAPPING SUMMARY (only if gate enabled):
            - The code MUST print a "Mapping Summary" or similar dict showing which features map to which columns.
            - Example: print(f"Mapping: Target={{target_col}}, Features={{features}}")
            
-        2. CONSISTENCY CHECKS (Mandatory):
+        2. CONSISTENCY CHECKS (only if gate enabled):
            - Check for column aliasing (two features mapping to same column).
            - Check for empty DataFrame.
            - Check target variation (nunique > 1).
            
-        3. DATA LEAKAGE PREVENTION (Mandatory):
+        3. DATA LEAKAGE PREVENTION (only if gate enabled):
            - Target column must NOT be in X (features).
            - High cardinality columns (IDs) must be excluded unless justified.
            - If X is explicitly built from contract feature_cols and excludes extra columns, this is sufficient.
            
-        4. OUTPUT SAFETY (Mandatory):
+        4. OUTPUT SAFETY (only if gate enabled):
            - If saving plots, `os.makedirs('static/plots', exist_ok=True)` MUST be called.
            
         INPUT CONTEXT:

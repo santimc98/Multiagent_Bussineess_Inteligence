@@ -787,12 +787,31 @@ def _ensure_contract_deliverable(
     contract["required_outputs"] = required_outputs
     return contract
 
-def _ensure_scored_rows_output(contract: Dict[str, Any]) -> Dict[str, Any]:
+def _ensure_scored_rows_output(
+    contract: Dict[str, Any],
+    evaluation_spec: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
     if not isinstance(contract, dict):
         return {}
-    reqs = contract.get("data_requirements", []) or []
-    needs_scored = any(isinstance(r, dict) and r.get("source") == "derived" for r in reqs)
-    if needs_scored:
+    spec = contract.get("spec_extraction") or {}
+    deliverables = spec.get("deliverables")
+    required_outputs = contract.get("required_outputs", []) or []
+    requires_row_scoring = False
+    if isinstance(evaluation_spec, dict):
+        requires_row_scoring = bool(evaluation_spec.get("requires_row_scoring"))
+    explicit_required = False
+    if isinstance(deliverables, list):
+        for item in deliverables:
+            if isinstance(item, dict) and item.get("path") == "data/scored_rows.csv":
+                if bool(item.get("required")):
+                    explicit_required = True
+                break
+            if isinstance(item, str) and item == "data/scored_rows.csv":
+                explicit_required = True
+                break
+    if "data/scored_rows.csv" in required_outputs:
+        explicit_required = True
+    if explicit_required or requires_row_scoring:
         contract = _ensure_contract_deliverable(
             contract,
             "data/scored_rows.csv",
@@ -800,6 +819,32 @@ def _ensure_scored_rows_output(contract: Dict[str, Any]) -> Dict[str, Any]:
             kind="dataset",
             description="Row-level scores and key features.",
         )
+        return contract
+    if isinstance(deliverables, list):
+        for item in deliverables:
+            if isinstance(item, dict) and item.get("path") == "data/scored_rows.csv":
+                item["required"] = False
+        required_outputs = []
+        seen: set[str] = set()
+        for item in deliverables:
+            if isinstance(item, dict) and item.get("required"):
+                path = item.get("path")
+            elif isinstance(item, str):
+                path = item
+            else:
+                path = None
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            required_outputs.append(path)
+        contract["required_outputs"] = required_outputs
+        spec["deliverables"] = deliverables
+        contract["spec_extraction"] = spec
+    else:
+        if "data/scored_rows.csv" in required_outputs:
+            contract["required_outputs"] = [
+                path for path in required_outputs if path != "data/scored_rows.csv"
+            ]
     return contract
 
 def _ensure_alignment_check_output(contract: Dict[str, Any]) -> Dict[str, Any]:
@@ -952,6 +997,9 @@ def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[
         ],
         "CROSS_VALIDATION_REQUIRED": [
             "Use cross-validation (StratifiedKFold/KFold) and report mean/std; avoid only train_test_split.",
+        ],
+        "TIME_SERIES_SPLIT_REQUIRED": [
+            "Use a time-based split (TimeSeriesSplit or chronological holdout with shuffle=False) for forecasting.",
         ],
         "DATA_LOAD_MISSING": [
             "Load the cleaned dataset using pd.read_csv with the detected dialect before processing.",
@@ -1243,7 +1291,40 @@ def contains_json_null_literal(code: str) -> bool:
             return True
     return False
 
-def ml_quality_preflight(code: str) -> List[str]:
+def _resolve_eval_flags(evaluation_spec: Dict[str, Any] | None) -> Dict[str, bool]:
+    if not isinstance(evaluation_spec, dict) or not evaluation_spec:
+        return {
+            "requires_target": True,
+            "requires_supervised_split": True,
+            "requires_time_series_split": False,
+            "requires_row_scoring": False,
+        }
+    objective_type = str(evaluation_spec.get("objective_type") or "").lower()
+    requires_target = None
+    requires_supervised_split = None
+    requires_time_series_split = None
+    requires_row_scoring = None
+    if isinstance(evaluation_spec, dict):
+        requires_target = evaluation_spec.get("requires_target")
+        requires_supervised_split = evaluation_spec.get("requires_supervised_split")
+        requires_time_series_split = evaluation_spec.get("requires_time_series_split")
+        requires_row_scoring = evaluation_spec.get("requires_row_scoring")
+    if requires_target is None:
+        requires_target = objective_type in {"predictive", "prescriptive", "forecasting"}
+    if requires_time_series_split is None:
+        requires_time_series_split = objective_type == "forecasting"
+    if requires_supervised_split is None:
+        requires_supervised_split = bool(requires_target)
+    if requires_row_scoring is None:
+        requires_row_scoring = False
+    return {
+        "requires_target": bool(requires_target),
+        "requires_supervised_split": bool(requires_supervised_split),
+        "requires_time_series_split": bool(requires_time_series_split),
+        "requires_row_scoring": bool(requires_row_scoring),
+    }
+
+def ml_quality_preflight(code: str, evaluation_spec: Dict[str, Any] | None = None) -> List[str]:
     """
     Static ML quality checks to prevent QA loops before reviewer/sandbox.
     Returns list of missing gates.
@@ -1409,6 +1490,30 @@ def ml_quality_preflight(code: str) -> List[str]:
     ]
     if "train_test_split" in code_lower and not any(marker in code_lower for marker in cv_markers):
         issues.append("CROSS_VALIDATION_REQUIRED")
+
+    flags = _resolve_eval_flags(evaluation_spec)
+    if not flags["requires_target"]:
+        issues = [
+            issue
+            for issue in issues
+            if issue not in {"TARGET_NOT_IN_X", "TARGET_VARIANCE_GUARD", "CROSS_VALIDATION_REQUIRED", "TIME_SERIES_SPLIT_REQUIRED"}
+        ]
+    if not flags["requires_supervised_split"]:
+        issues = [
+            issue
+            for issue in issues
+            if issue not in {"CROSS_VALIDATION_REQUIRED", "TIME_SERIES_SPLIT_REQUIRED"}
+        ]
+    if flags["requires_time_series_split"]:
+        has_time_series_split = (
+            "timeseriessplit" in code_lower
+            or ("train_test_split" in code_lower and "shuffle=false" in code_lower)
+            or "rolling" in code_lower
+            or "expanding" in code_lower
+        )
+        if not has_time_series_split:
+            issues.append("TIME_SERIES_SPLIT_REQUIRED")
+        issues = [issue for issue in issues if issue != "CROSS_VALIDATION_REQUIRED"]
 
     return issues
 
@@ -1584,7 +1689,13 @@ def _missing_required_output_refs(code: str, outputs: List[str]) -> List[str]:
         return []
     missing: List[str] = []
     for output in outputs:
-        if output and output not in code:
+        if not output:
+            continue
+        if any(ch in output for ch in ["*", "?", "["]):
+            continue
+        if output.endswith(("/", "\\")):
+            continue
+        if output not in code:
             missing.append(output)
     return missing
 
@@ -2689,7 +2800,6 @@ def run_execution_planner(state: AgentState) -> AgentState:
         }
     contract = _normalize_execution_contract(contract)
     contract = ensure_role_runbooks(contract)
-    contract = _ensure_scored_rows_output(contract)
     contract = _ensure_alignment_check_output(contract)
     strategy_spec = state.get("strategy_spec") or _load_json_safe("data/strategy_spec.json")
     objective_type = None
@@ -2719,6 +2829,7 @@ def run_execution_planner(state: AgentState) -> AgentState:
         evaluation_spec = {}
     if evaluation_spec:
         contract["evaluation_spec"] = evaluation_spec
+    contract = _ensure_scored_rows_output(contract, evaluation_spec if evaluation_spec else None)
     try:
         os.makedirs("data", exist_ok=True)
         with open("data/execution_contract.json", "w", encoding="utf-8") as f:
@@ -4598,17 +4709,26 @@ def run_ml_preflight(state: AgentState) -> AgentState:
             "review_feedback": feedback,
         }
 
-    issues = ml_quality_preflight(code)
+    flags = _resolve_eval_flags(evaluation_spec)
+    issues = ml_quality_preflight(code, evaluation_spec)
     if isinstance(evaluation_spec, dict):
         obj_type = str(evaluation_spec.get("objective_type") or "").lower()
         validation_policy = evaluation_spec.get("validation_policy") or {}
         require_cv = bool(validation_policy.get("require_cv")) if isinstance(validation_policy, dict) else False
-        if not require_cv and "CROSS_VALIDATION_REQUIRED" in issues:
+        if (not require_cv or not flags["requires_supervised_split"]) and "CROSS_VALIDATION_REQUIRED" in issues:
             issues = [i for i in issues if i != "CROSS_VALIDATION_REQUIRED"]
+        if flags["requires_time_series_split"] and "TIME_SERIES_SPLIT_REQUIRED" not in issues:
+            pass
         qa_gates = evaluation_spec.get("qa_gates") or evaluation_spec.get("gates") or []
         require_variance = "target_variance_guard" in qa_gates or obj_type in {"predictive", "prescriptive"}
         if not require_variance and "TARGET_VARIANCE_GUARD" in issues:
             issues = [i for i in issues if i != "TARGET_VARIANCE_GUARD"]
+    if not flags["requires_target"]:
+        issues = [
+            i
+            for i in issues
+            if i not in {"TARGET_NOT_IN_X", "TARGET_VARIANCE_GUARD", "CROSS_VALIDATION_REQUIRED", "TIME_SERIES_SPLIT_REQUIRED"}
+        ]
     required_columns = contract.get("required_columns") or strategy.get("required_columns", []) or []
     feature_availability = contract.get("feature_availability", []) or []
     evaluation_spec = state.get("evaluation_spec") or contract.get("evaluation_spec") or {}
@@ -4618,6 +4738,10 @@ def run_ml_preflight(state: AgentState) -> AgentState:
         if isinstance(item, dict) and str(item.get("availability", "")).lower() == "pre-decision"
     ]
     required_outputs = contract.get("required_outputs", []) or []
+    if not flags["requires_row_scoring"]:
+        required_outputs = [
+            path for path in required_outputs if path != "data/scored_rows.csv"
+        ]
     missing_outputs = _missing_required_output_refs(code, required_outputs)
     if missing_outputs:
         issues.append("REQUIRED_OUTPUTS_MISSING")

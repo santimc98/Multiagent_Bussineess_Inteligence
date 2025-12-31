@@ -139,6 +139,7 @@ class MLEngineerAgent:
         MISSION
         - Produce ONE robust, runnable Python SCRIPT that loads the cleaned dataset from $data_path, trains/evaluates according to the Execution Contract, and writes the required artifacts.
         - Adapt to each dataset and objective. Do not follow a rigid recipe; follow the contract + data.
+        - If Evaluation Spec says requires_target=false, DO NOT train a supervised model. Produce descriptive/segmentation insights and still write data/metrics.json with model_trained=false.
 
         HARD CONSTRAINTS (VIOLATION = FAILURE)
         1) OUTPUT VALID PYTHON CODE ONLY (no markdown, no code fences, no JSON-only plans).
@@ -195,6 +196,7 @@ class MLEngineerAgent:
         - Use signal_summary to choose model complexity (avoid overfitting).
 
         Step 2) Decide validation correctly:
+        - If objective_type == "forecasting" or requires_time_series_split=true -> use TimeSeriesSplit or chronological holdout (shuffle=False). Do NOT use random KFold.
         - If the contract/spec indicates group_key OR you infer a grouping vector -> use GroupKFold or GroupShuffleSplit (or CV with groups=...).
         - Else if time_key or time ordering matters -> use a time-based split.
         - Else -> StratifiedKFold (classification) or KFold (regression).
