@@ -24,7 +24,7 @@ from src.agents.data_engineer import DataEngineerAgent
 from src.agents.cleaning_reviewer import CleaningReviewerAgent
 from src.agents.reviewer import ReviewerAgent
 from src.agents.qa_reviewer import QAReviewerAgent # New QA Gate
-from src.agents.execution_planner import ExecutionPlannerAgent
+from src.agents.execution_planner import ExecutionPlannerAgent, build_execution_plan, build_dataset_profile
 from src.agents.failure_explainer import FailureExplainerAgent
 from src.agents.results_advisor import ResultsAdvisorAgent
 from src.utils.pdf_generator import convert_report_to_pdf
@@ -64,6 +64,7 @@ from src.utils.dataset_memory import (
 from src.utils.governance import write_governance_report, build_run_summary
 from src.utils.data_adequacy import build_data_adequacy_report, write_data_adequacy_report
 from src.utils.code_extract import is_syntax_valid
+from src.utils.visuals import generate_fallback_plots
 
 def _norm_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
@@ -601,16 +602,204 @@ def _resolve_contract_columns_for_cleaning(contract: Dict[str, Any], sources: se
             out.append(name)
     return out
 
+def _infer_artifact_type(path: str, deliverable_kind: str | None = None) -> str:
+    if deliverable_kind:
+        return str(deliverable_kind)
+    lower = str(path or "").lower()
+    if "plot" in lower or lower.endswith((".png", ".jpg", ".jpeg", ".svg")):
+        return "plot"
+    if lower.endswith(".csv"):
+        if "pred" in lower or "score" in lower:
+            return "predictions"
+        if "summary" in lower:
+            return "summary"
+        return "dataset"
+    if lower.endswith(".json"):
+        if "weight" in lower:
+            return "weights"
+        if "metrics" in lower:
+            return "metrics"
+        if "forecast" in lower:
+            return "forecast"
+        if "importance" in lower:
+            return "feature_importances"
+        if "error" in lower or "residual" in lower:
+            return "error_analysis"
+        if "alignment" in lower or "report" in lower:
+            return "report"
+        if "insights" in lower:
+            return "insights"
+        if "strategy_spec" in lower:
+            return "strategy_spec"
+        if "plan" in lower:
+            return "execution_plan"
+        return "json"
+    if lower.endswith(".md"):
+        return "executive_summary"
+    return "artifact"
+
+def _infer_produced_by(path: str) -> str:
+    lower = str(path or "").lower()
+    if "clean" in lower or "cleaning" in lower:
+        return "data_engineer"
+    if "strategy_spec" in lower:
+        return "strategist"
+    if "plan" in lower:
+        return "execution_planner"
+    if "insights" in lower:
+        return "results_advisor"
+    if "executive_summary" in lower:
+        return "business_translator"
+    if "alignment" in lower or "report" in lower:
+        return "system"
+    return "ml_engineer"
+
+def _build_artifact_index(
+    paths: List[str],
+    deliverables: List[Dict[str, Any]] | None = None,
+) -> List[Dict[str, Any]]:
+    by_path = {}
+    deliverable_lookup: Dict[str, Dict[str, Any]] = {}
+    for item in deliverables or []:
+        if isinstance(item, dict) and item.get("path"):
+            deliverable_lookup[item["path"]] = item
+    for path in paths or []:
+        if not path:
+            continue
+        deliverable = deliverable_lookup.get(path) or {}
+        artifact_type = _infer_artifact_type(path, deliverable.get("kind"))
+        produced_by = _infer_produced_by(path)
+        by_path[path] = {
+            "artifact_type": artifact_type,
+            "path": path,
+            "schema_version": "1",
+            "produced_by": produced_by,
+        }
+    return list(by_path.values())
+
+def _merge_artifact_index_entries(
+    base: List[Dict[str, Any]],
+    additions: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for item in base or []:
+        path = item.get("path") if isinstance(item, dict) else None
+        if path:
+            merged[path] = item
+    for item in additions or []:
+        path = item.get("path") if isinstance(item, dict) else None
+        if path:
+            merged[path] = item
+    return list(merged.values())
+
+def _deliverable_id_from_path(path: str) -> str:
+    base = os.path.basename(str(path)) or str(path)
+    cleaned = re.sub(r"[^0-9a-zA-Z]+", "_", base).strip("_").lower()
+    return cleaned or "deliverable"
+
+def _infer_deliverable_kind(path: str) -> str:
+    lower = str(path).lower()
+    if "plots" in lower or lower.endswith((".png", ".jpg", ".jpeg", ".svg")):
+        return "plot"
+    if lower.endswith(".csv"):
+        return "dataset"
+    if lower.endswith(".json"):
+        if "metrics" in lower:
+            return "metrics"
+        if "weights" in lower:
+            return "weights"
+        if "alignment" in lower or "report" in lower:
+            return "report"
+        return "json"
+    return "artifact"
+
+def _ensure_contract_deliverable(
+    contract: Dict[str, Any],
+    path: str,
+    required: bool = True,
+    kind: str | None = None,
+    description: str | None = None,
+) -> Dict[str, Any]:
+    if not isinstance(contract, dict):
+        return {}
+    if not path:
+        return contract
+    spec = contract.get("spec_extraction")
+    if not isinstance(spec, dict):
+        spec = {}
+    deliverables = spec.get("deliverables")
+    if not isinstance(deliverables, list):
+        deliverables = []
+
+    normalized: List[Dict[str, Any]] = []
+    for item in deliverables:
+        if isinstance(item, dict):
+            normalized.append(item)
+        elif isinstance(item, str):
+            normalized.append(
+                {
+                    "id": _deliverable_id_from_path(item),
+                    "path": item,
+                    "required": True,
+                    "kind": _infer_deliverable_kind(item),
+                    "description": "Requested deliverable.",
+                }
+            )
+    deliverables = normalized
+
+    existing = None
+    for item in deliverables:
+        if item.get("path") == path:
+            existing = item
+            break
+    if existing:
+        existing["required"] = bool(required)
+        if kind:
+            existing["kind"] = kind
+        if description:
+            existing["description"] = description
+        if not existing.get("id"):
+            existing["id"] = _deliverable_id_from_path(path)
+    else:
+        deliverables.append(
+            {
+                "id": _deliverable_id_from_path(path),
+                "path": path,
+                "required": bool(required),
+                "kind": kind or _infer_deliverable_kind(path),
+                "description": description or "Requested deliverable.",
+            }
+        )
+
+    spec["deliverables"] = deliverables
+    contract["spec_extraction"] = spec
+
+    required_outputs: List[str] = []
+    seen: set[str] = set()
+    for item in deliverables:
+        if not item.get("required"):
+            continue
+        out_path = item.get("path")
+        if not out_path or out_path in seen:
+            continue
+        seen.add(out_path)
+        required_outputs.append(out_path)
+    contract["required_outputs"] = required_outputs
+    return contract
+
 def _ensure_scored_rows_output(contract: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(contract, dict):
         return {}
     reqs = contract.get("data_requirements", []) or []
     needs_scored = any(isinstance(r, dict) and r.get("source") == "derived" for r in reqs)
     if needs_scored:
-        outputs = contract.get("required_outputs", []) or []
-        if "data/scored_rows.csv" not in outputs:
-            outputs.append("data/scored_rows.csv")
-        contract["required_outputs"] = outputs
+        contract = _ensure_contract_deliverable(
+            contract,
+            "data/scored_rows.csv",
+            required=True,
+            kind="dataset",
+            description="Row-level scores and key features.",
+        )
     return contract
 
 def _ensure_alignment_check_output(contract: Dict[str, Any]) -> Dict[str, Any]:
@@ -619,10 +808,13 @@ def _ensure_alignment_check_output(contract: Dict[str, Any]) -> Dict[str, Any]:
     reqs = contract.get("alignment_requirements", [])
     if not isinstance(reqs, list) or not reqs:
         return contract
-    outputs = contract.get("required_outputs", []) or []
-    if "data/alignment_check.json" not in outputs:
-        outputs.append("data/alignment_check.json")
-    contract["required_outputs"] = outputs
+    contract = _ensure_contract_deliverable(
+        contract,
+        "data/alignment_check.json",
+        required=True,
+        kind="report",
+        description="Alignment check results for contract requirements.",
+    )
     return contract
 
 def _normalize_execution_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
@@ -650,6 +842,51 @@ def _normalize_execution_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
                 for name in derived
                 if name
             ]
+
+    deliverables = spec.get("deliverables")
+    normalized_deliverables: List[Dict[str, Any]] = []
+    if isinstance(deliverables, list) and deliverables:
+        for item in deliverables:
+            if isinstance(item, dict):
+                path = item.get("path") or item.get("output") or item.get("artifact")
+                if not path:
+                    continue
+                normalized_deliverables.append(
+                    {
+                        "id": item.get("id") or _deliverable_id_from_path(path),
+                        "path": path,
+                        "required": bool(item.get("required", True)),
+                        "kind": item.get("kind") or _infer_deliverable_kind(path),
+                        "description": item.get("description") or "Requested deliverable.",
+                    }
+                )
+            elif isinstance(item, str):
+                normalized_deliverables.append(
+                    {
+                        "id": _deliverable_id_from_path(item),
+                        "path": item,
+                        "required": True,
+                        "kind": _infer_deliverable_kind(item),
+                        "description": "Requested deliverable.",
+                    }
+                )
+    if not normalized_deliverables:
+        legacy_outputs = normalized.get("required_outputs", []) or []
+        for path in legacy_outputs:
+            if not path:
+                continue
+            normalized_deliverables.append(
+                {
+                    "id": _deliverable_id_from_path(path),
+                    "path": path,
+                    "required": True,
+                    "kind": _infer_deliverable_kind(path),
+                    "description": "Requested deliverable.",
+                }
+            )
+    spec["deliverables"] = normalized_deliverables
+    if normalized_deliverables:
+        normalized["required_outputs"] = [item["path"] for item in normalized_deliverables if item.get("required")]
 
     if not spec.get("scoring_formula"):
         formulas = spec.get("formulas")
@@ -745,6 +982,15 @@ def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[
         ],
         "MODEL_FEATURES_INCOMPLETE": [
             "MODEL_FEATURES must include the decision variable (e.g., 1stYearAmount).",
+        ],
+        "CANONICAL_MAPPING_REQUIRED": [
+            "Use canonical column names in SEGMENT_FEATURES/MODEL_FEATURES and rename columns to canonical names after mapping.",
+        ],
+        "DERIVED_TARGET_REQUIRED": [
+            "If target is derived, add a guard to derive it when missing and log `DERIVED_TARGET:<name>` to stdout.",
+        ],
+        "CALIBRATED_IMPORTANCE_UNSUPPORTED": [
+            "Avoid feature_importances_/base_estimator on CalibratedClassifierCV; use coef_ or skip importances.",
         ],
         "segmentation_predecision": [
             "Ensure segmentation uses only pre-decision features defined in SEGMENT_FEATURES.",
@@ -1008,27 +1254,15 @@ def ml_quality_preflight(code: str) -> List[str]:
     code_lower = code.lower()
     if "mapping summary" not in code_lower:
         issues.append("MAPPING_SUMMARY")
-    if "alignment_check" not in code_lower:
-        issues.append("ALIGNMENT_CHECK_OUTPUT")
+    if "calibratedclassifiercv" in code_lower and (
+        "feature_importances_" in code_lower or "base_estimator" in code_lower
+    ):
+        issues.append("CALIBRATED_IMPORTANCE_UNSUPPORTED")
 
     try:
         tree = ast.parse(code)
     except Exception:
         return ["AST_PARSE_FAILED"]
-
-    has_read_csv = False
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            func = node.func
-            if isinstance(func, ast.Attribute) and func.attr == "read_csv":
-                if isinstance(func.value, ast.Name) and func.value.id in {"pd", "pandas"}:
-                    has_read_csv = True
-                    break
-            if isinstance(func, ast.Name) and func.id == "read_csv":
-                has_read_csv = True
-                break
-    if not has_read_csv:
-        issues.append("DATA_LOAD_MISSING")
 
     def _condition_checks_nunique_guard(test_node: ast.AST) -> bool:
         if not isinstance(test_node, ast.Compare):
@@ -1258,6 +1492,92 @@ def _extract_named_string_list(code: str, names: List[str]) -> List[str]:
                         values.append(elt.value)
                 return values
     return []
+
+def _find_canonical_mismatches(features: List[str], required_columns: List[str]) -> List[Dict[str, str]]:
+    mismatches: List[Dict[str, str]] = []
+    if not features or not required_columns:
+        return mismatches
+    canonical_map = {_norm_name(col): col for col in required_columns if col}
+    for feat in features:
+        canonical = canonical_map.get(_norm_name(feat))
+        if canonical and feat != canonical:
+            mismatches.append({"feature": feat, "canonical": canonical})
+    return mismatches
+
+def _code_assigns_df_column(code: str, column_name: str) -> bool:
+    import ast
+
+    if not code or not column_name:
+        return False
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return False
+
+    def _slice_has_column(node: ast.AST) -> bool:
+        if isinstance(node, ast.Constant) and node.value == column_name:
+            return True
+        if isinstance(node, ast.Tuple):
+            return any(_slice_has_column(elt) for elt in node.elts)
+        return False
+
+    def _is_df_target(node: ast.Subscript) -> bool:
+        value = node.value
+        if isinstance(value, ast.Name) and value.id == "df":
+            return True
+        if isinstance(value, ast.Attribute):
+            if isinstance(value.value, ast.Name) and value.value.id == "df" and value.attr in {"loc", "iloc"}:
+                return True
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for tgt in targets:
+                if isinstance(tgt, ast.Subscript) and _is_df_target(tgt):
+                    if _slice_has_column(tgt.slice):
+                        return True
+    return False
+
+def _has_derived_target_guard(code_lower: str, column_name: str) -> bool:
+    if not code_lower or not column_name:
+        return False
+    target_lower = str(column_name).lower()
+    if target_lower not in code_lower:
+        return False
+    return "not in df.columns" in code_lower
+
+def _collect_derived_targets(contract: Dict[str, Any]) -> List[str]:
+    derived_targets: List[str] = []
+    if not isinstance(contract, dict):
+        return derived_targets
+    reqs = contract.get("data_requirements", []) or []
+    for req in reqs:
+        if not isinstance(req, dict):
+            continue
+        if str(req.get("role", "")).lower() != "target":
+            continue
+        if str(req.get("source", "input")).lower() != "derived":
+            continue
+        name = req.get("canonical_name") or req.get("name")
+        if name and name not in derived_targets:
+            derived_targets.append(name)
+    spec = contract.get("spec_extraction") or {}
+    derived_cols = spec.get("derived_columns") or []
+    derived_names: List[str] = []
+    for col in derived_cols:
+        if isinstance(col, dict):
+            name = col.get("name") or col.get("canonical_name")
+        elif isinstance(col, str):
+            name = col
+        else:
+            name = None
+        if name and name not in derived_names:
+            derived_names.append(name)
+    target_name = spec.get("target_column")
+    if target_name and target_name in derived_names and target_name not in derived_targets:
+        derived_targets.append(target_name)
+    return derived_targets
 
 def _missing_required_output_refs(code: str, outputs: List[str]) -> List[str]:
     if not code or not outputs:
@@ -1494,6 +1814,15 @@ def _load_json_safe(path: str) -> Dict[str, Any]:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+def _load_json_any(path: str) -> Any:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 def _normalize_alignment_check(
     alignment_check: Dict[str, Any],
@@ -2192,11 +2521,10 @@ def run_steward(state: AgentState) -> AgentState:
 
     # Initialize loop variables
     budget_state = _ensure_budget_state(state or {})
-    return {
+    steward_payload = {
         "data_summary": summary,
         "csv_encoding": encoding,
         "csv_sep": sep,
-        "csv_decimal": decimal,
         "csv_decimal": decimal,
         "iteration_count": 0,
         "compliance_iterations": 0,
@@ -2221,6 +2549,12 @@ def run_steward(state: AgentState) -> AgentState:
         "run_budget": budget_state.get("run_budget", {}),
         "budget_counters": budget_state.get("budget_counters", {}),
     }
+    if isinstance(result, dict):
+        if "profile" in result:
+            steward_payload["profile"] = result.get("profile")
+        if "dataset_profile" in result:
+            steward_payload["dataset_profile"] = result.get("dataset_profile")
+    return steward_payload
 
 def run_strategist(state: AgentState) -> AgentState:
     print("--- [2] Strategist: Formulating 3 Strategies (MIMO v2 Flash) ---")
@@ -2232,6 +2566,7 @@ def run_strategist(state: AgentState) -> AgentState:
     user_context = state.get("strategist_context_override") or state.get("business_objective", "")
     result = strategist.generate_strategies(state['data_summary'], user_context)
     strategies_list = result.get('strategies', [])
+    strategy_spec = result.get("strategy_spec", {})
     
     # Fallback if list is empty or malformed
     if not strategies_list:
@@ -2245,8 +2580,17 @@ def run_strategist(state: AgentState) -> AgentState:
                 "reasoning": "Fallback"
         }]
 
+    if strategy_spec:
+        try:
+            os.makedirs("data", exist_ok=True)
+            with open("data/strategy_spec.json", "w", encoding="utf-8") as f_spec:
+                json.dump(strategy_spec, f_spec, indent=2)
+        except Exception as spec_err:
+            print(f"Warning: failed to persist strategy_spec.json: {spec_err}")
+
     return {
-        "strategies": {"strategies": strategies_list} 
+        "strategies": {"strategies": strategies_list},
+        "strategy_spec": strategy_spec,
     }
 
 def run_domain_expert(state: AgentState) -> AgentState:
@@ -2347,6 +2691,18 @@ def run_execution_planner(state: AgentState) -> AgentState:
     contract = ensure_role_runbooks(contract)
     contract = _ensure_scored_rows_output(contract)
     contract = _ensure_alignment_check_output(contract)
+    strategy_spec = state.get("strategy_spec") or _load_json_safe("data/strategy_spec.json")
+    objective_type = None
+    if isinstance(strategy_spec, dict):
+        objective_type = strategy_spec.get("objective_type")
+    if not objective_type:
+        eval_spec = contract.get("evaluation_spec") if isinstance(contract, dict) else {}
+        if isinstance(eval_spec, dict):
+            objective_type = eval_spec.get("objective_type")
+    dataset_profile = build_dataset_profile(data_summary, column_inventory)
+    execution_plan = build_execution_plan(str(objective_type or "unknown"), dataset_profile)
+    if isinstance(contract, dict):
+        contract["execution_plan"] = execution_plan
     evaluation_spec = {}
     try:
         evaluation_spec = execution_planner.generate_evaluation_spec(
@@ -2368,6 +2724,8 @@ def run_execution_planner(state: AgentState) -> AgentState:
         with open("data/execution_contract.json", "w", encoding="utf-8") as f:
             import json
             json.dump(contract, f, indent=2)
+        with open("data/plan.json", "w", encoding="utf-8") as f_plan:
+            json.dump(execution_plan, f_plan, indent=2)
         if evaluation_spec:
             with open("data/evaluation_spec.json", "w", encoding="utf-8") as f_spec:
                 json.dump(evaluation_spec, f_spec, indent=2, ensure_ascii=False)
@@ -2381,6 +2739,8 @@ def run_execution_planner(state: AgentState) -> AgentState:
         )
     policy = contract.get("iteration_policy") if isinstance(contract, dict) else {}
     result = {"execution_contract": contract}
+    if execution_plan:
+        result["execution_plan"] = execution_plan
     if evaluation_spec:
         result["evaluation_spec"] = evaluation_spec
     if isinstance(policy, dict) and policy:
@@ -4087,7 +4447,10 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
     try:
         # Run QA Audit
         evaluation_spec = state.get("evaluation_spec") or (state.get("execution_contract", {}) or {}).get("evaluation_spec")
-        qa_result = qa_reviewer.review_code(code, strategy, business_objective, evaluation_spec)
+        try:
+            qa_result = qa_reviewer.review_code(code, strategy, business_objective, evaluation_spec)
+        except TypeError:
+            qa_result = qa_reviewer.review_code(code, strategy, business_objective)
         preflight_issues = ml_quality_preflight(code)
         has_variance_guard = "TARGET_VARIANCE_GUARD" not in preflight_issues
 
@@ -4306,6 +4669,21 @@ def run_ml_preflight(state: AgentState) -> AgentState:
         else:
             if not any(var in model_features for var in decision_vars if var):
                 issues.append("MODEL_FEATURES_INCOMPLETE")
+    canonical_mismatches: List[Dict[str, str]] = []
+    if segment_features:
+        canonical_mismatches.extend(_find_canonical_mismatches(segment_features, required_columns))
+    if model_features:
+        canonical_mismatches.extend(_find_canonical_mismatches(model_features, required_columns + decision_vars))
+    if canonical_mismatches:
+        issues.append("CANONICAL_MAPPING_REQUIRED")
+    derived_targets = _collect_derived_targets(contract)
+    if derived_targets:
+        code_lower = code.lower()
+        has_derived_log = "derived_target:" in code_lower or "derived_target" in code_lower
+        has_guard = any(_has_derived_target_guard(code_lower, name) for name in derived_targets)
+        has_assignment = any(_code_assigns_df_column(code, name) for name in derived_targets)
+        if not (has_derived_log or has_guard or has_assignment):
+            issues.append("DERIVED_TARGET_REQUIRED")
     if issues:
         expanded = _expand_required_fixes(issues, issues)
         feedback = f"ML_PREFLIGHT_MISSING: {', '.join(issues)}"
@@ -4313,6 +4691,8 @@ def run_ml_preflight(state: AgentState) -> AgentState:
             feedback += f" | Missing output refs: {missing_outputs}"
         if col_coverage.get("hits") is not None and required_columns:
             feedback += f" | Required columns hits: {col_coverage.get('hits')}"
+        if canonical_mismatches:
+            feedback += f" | Canonical mismatches: {canonical_mismatches}"
         history = list(state.get("feedback_history", []))
         history.append(feedback)
         gate_context = {
@@ -4585,6 +4965,15 @@ def execute_code(state: AgentState) -> AgentState:
     plots_local = glob.glob("static/plots/*.png")
     
     fallback_plots_local = []
+    if not plots_local:
+        fallback_csv = "data/cleaned_full.csv" if os.path.exists("data/cleaned_full.csv") else "data/cleaned_data.csv"
+        fallback_plots_local = generate_fallback_plots(
+            fallback_csv,
+            output_dir="static/plots",
+            sep=state.get("csv_sep", ","),
+            decimal=state.get("csv_decimal", "."),
+            encoding=state.get("csv_encoding", "utf-8"),
+        )
              
     has_partial_visuals = len(plots_local) > 0
     
@@ -4644,7 +5033,9 @@ def execute_code(state: AgentState) -> AgentState:
         has_partial_visuals = len(plots_local) > 0
 
     # Validate required outputs early
-    output_contract = state.get("execution_contract", {}).get("required_outputs", [])
+    contract = state.get("execution_contract", {}) or {}
+    deliverables = (contract.get("spec_extraction") or {}).get("deliverables")
+    output_contract = deliverables if isinstance(deliverables, list) and deliverables else contract.get("required_outputs", [])
     oc_report = check_required_outputs(output_contract)
     try:
         os.makedirs("data", exist_ok=True)
@@ -4663,19 +5054,30 @@ def execute_code(state: AgentState) -> AgentState:
                 "output_missing": len(oc_report.get("missing", [])) if isinstance(oc_report, dict) else None,
             },
         )
-    artifact_index = []
+    artifact_paths = []
     if isinstance(oc_report, dict):
-        artifact_index.extend(oc_report.get("present", []))
+        artifact_paths.extend(oc_report.get("present", []))
     if plots_local:
-        artifact_index.extend(plots_local)
+        artifact_paths.extend(plots_local)
+    for extra_path in ["data/strategy_spec.json", "data/plan.json", "data/evaluation_spec.json"]:
+        if os.path.exists(extra_path):
+            artifact_paths.append(extra_path)
     # De-duplicate while preserving order
     deduped = []
     seen = set()
-    for item in artifact_index:
+    for item in artifact_paths:
         if item not in seen:
             seen.add(item)
             deduped.append(item)
-    artifact_index = deduped
+    artifact_paths = deduped
+    deliverables = (contract.get("spec_extraction") or {}).get("deliverables")
+    artifact_index = _build_artifact_index(artifact_paths, deliverables if isinstance(deliverables, list) else None)
+    try:
+        os.makedirs("data", exist_ok=True)
+        with open("data/artifact_index.json", "w", encoding="utf-8") as f_idx:
+            json.dump(artifact_index, f_idx, indent=2)
+    except Exception as idx_err:
+        print(f"Warning: failed to persist artifact_index.json: {idx_err}")
 
     result = {
         "execution_output": output,
@@ -4688,6 +5090,7 @@ def execute_code(state: AgentState) -> AgentState:
         "ml_skipped_reason": ml_skipped_reason,
         "output_contract_report": oc_report,
         "artifact_index": artifact_index,
+        "artifact_paths": artifact_paths,
         "sandbox_failed": sandbox_failed,
         "sandbox_retry_count": 0 if not sandbox_failed else state.get("sandbox_retry_count", 0),
         "ml_call_refund_pending": False,
@@ -4848,7 +5251,9 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         new_history.append(f"CASE_ALIGNMENT_GATE_FAILED: {case_report.get('failures')}")
 
     # Output contract validation
-    output_contract = state.get("execution_contract", {}).get("required_outputs", [])
+    contract = state.get("execution_contract", {}) or {}
+    deliverables = (contract.get("spec_extraction") or {}).get("deliverables")
+    output_contract = deliverables if isinstance(deliverables, list) and deliverables else contract.get("required_outputs", [])
     oc_report = check_required_outputs(output_contract)
     try:
         os.makedirs("data", exist_ok=True)
@@ -5124,6 +5529,43 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         except Exception as adv_err:
             print(f"Warning: results advisor failed: {adv_err}")
 
+    try:
+        strategy_spec = state.get("strategy_spec") or _load_json_safe("data/strategy_spec.json")
+        objective_type = (strategy_spec or {}).get("objective_type")
+        if not objective_type:
+            plan = state.get("execution_plan") or _load_json_safe("data/plan.json")
+            if isinstance(plan, dict):
+                objective_type = plan.get("objective_type")
+        if not objective_type:
+            evaluation_spec = state.get("evaluation_spec") or (state.get("execution_contract", {}) or {}).get("evaluation_spec")
+            if isinstance(evaluation_spec, dict):
+                objective_type = evaluation_spec.get("objective_type")
+        insights_context = {
+            "objective_type": objective_type,
+            "artifact_index": state.get("artifact_index") or _load_json_any("data/artifact_index.json"),
+            "output_contract_report": oc_report,
+            "review_feedback": feedback,
+            "metrics": metrics_report,
+            "strategy_spec": strategy_spec,
+        }
+        insights = results_advisor.generate_insights(insights_context)
+        if insights:
+            try:
+                os.makedirs("data", exist_ok=True)
+                with open("data/insights.json", "w", encoding="utf-8") as f_insights:
+                    json.dump(insights, f_insights, indent=2, ensure_ascii=False)
+                existing_index = _load_json_any("data/artifact_index.json")
+                normalized_existing = existing_index if isinstance(existing_index, list) else []
+                additions = _build_artifact_index(["data/insights.json"], None)
+                merged_index = _merge_artifact_index_entries(normalized_existing, additions)
+                with open("data/artifact_index.json", "w", encoding="utf-8") as f_idx:
+                    json.dump(merged_index, f_idx, indent=2)
+                result_state["artifact_index"] = merged_index
+            except Exception as ins_err:
+                print(f"Warning: failed to persist insights.json: {ins_err}")
+    except Exception as ins_err:
+        print(f"Warning: results advisor insights failed: {ins_err}")
+
     # Iteration memory (delta + objective + weights) for patch-mode guidance
     iteration_memory = list(state.get("ml_iteration_memory", []) or [])
     prev_summary = iteration_memory[-1] if iteration_memory else None
@@ -5351,15 +5793,25 @@ def run_translator(state: AgentState) -> AgentState:
     report_state.setdefault("execution_error", state.get("execution_error", False))
     report_state.setdefault("sandbox_failed", state.get("sandbox_failed", False))
     report_plots = report_state.get("plots_local", plots_local)
-    report_artifacts = list(report_state.get("artifact_index") or [])
+    artifact_entries = report_state.get("artifact_index") or []
+    report_artifacts = [
+        item.get("path") if isinstance(item, dict) else item
+        for item in artifact_entries
+        if item
+    ]
     error_flag = bool(report_error) or report_state.get("execution_error") or report_state.get("sandbox_failed")
     if not error_flag:
         if fallback_plots:
             report_plots = [plot for plot in report_plots if plot not in fallback_plots]
             report_state["plots_local"] = report_plots
-            if report_artifacts:
-                report_artifacts = [path for path in report_artifacts if path not in fallback_plots]
-                report_state["artifact_index"] = report_artifacts
+            if artifact_entries:
+                filtered_entries = []
+                for entry in artifact_entries:
+                    path = entry.get("path") if isinstance(entry, dict) else entry
+                    if path in fallback_plots:
+                        continue
+                    filtered_entries.append(entry)
+                report_state["artifact_index"] = filtered_entries
     report_state["has_partial_visuals"] = bool(report_plots) and error_flag
     report_has_partial = report_state["has_partial_visuals"]
     try:
@@ -5392,6 +5844,20 @@ def run_translator(state: AgentState) -> AgentState:
         Please check the logs for more details.
         """
         
+    try:
+        os.makedirs("data", exist_ok=True)
+        with open("data/executive_summary.md", "w", encoding="utf-8") as f_exec:
+            f_exec.write(report or "")
+        existing_index = _load_json_any("data/artifact_index.json")
+        normalized_existing = existing_index if isinstance(existing_index, list) else []
+        additions = _build_artifact_index(["data/executive_summary.md"], None)
+        merged_index = _merge_artifact_index_entries(normalized_existing, additions)
+        with open("data/artifact_index.json", "w", encoding="utf-8") as f_idx:
+            json.dump(merged_index, f_idx, indent=2)
+        report_state["artifact_index"] = merged_index
+    except Exception as exec_err:
+        print(f"Warning: failed to persist executive_summary.md: {exec_err}")
+
     try:
         write_data_adequacy_report(state)
         write_governance_report(state)

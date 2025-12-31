@@ -35,7 +35,8 @@ def test_remaining_agents():
         summary = steward.analyze_data(csv_path)
         print("Steward Output:")
         print(summary)
-        if "DATA SUMMARY:" in summary:
+        summary_text = summary.get("summary") if isinstance(summary, dict) else summary
+        if summary_text and "DATA SUMMARY:" in summary_text:
             print(">> Steward Test PASSED")
         else:
             print(">> Steward Test WARNING: Output format might be incorrect")

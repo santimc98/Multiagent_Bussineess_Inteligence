@@ -30,7 +30,7 @@ class MLEngineerAgent:
                 base_url="https://api.z.ai/api/paas/v4/",
                 timeout=None,
             )
-            self.model_name = os.getenv("ML_ENGINEER_MODEL", "glm-4.7") or "glm-4.7"
+            self.model_name = os.getenv("ZAI_MODEL") or os.getenv("GLM_MODEL") or "glm-4.7"
         elif self.provider == "deepseek":
             self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
             if not self.api_key:
@@ -70,6 +70,7 @@ class MLEngineerAgent:
             "availability_summary",
             "required_dependencies",
             "spec_extraction",
+            "role_runbooks",
             "compliance_checklist",
         ]
         compact: Dict[str, Any] = {}
@@ -98,7 +99,7 @@ class MLEngineerAgent:
     def _truncate_code_for_patch(self, code: str, max_len: int = 12000) -> str:
         return self._truncate_prompt_text(code or "", max_len=max_len, head_len=7000, tail_len=4000)
 
-    def _check_script_completeness(self, code: str, required_outputs: List[str]) -> List[str]:
+    def _check_script_completeness(self, code: str, required_paths: List[str]) -> List[str]:
         if not code:
             return ["code_empty"]
         issues: List[str] = []
@@ -107,7 +108,7 @@ class MLEngineerAgent:
             issues.append("data_load_missing")
         if not any(token in lower for token in ["to_csv", "json.dump", "plt.savefig", "savefig("]):
             issues.append("artifact_write_missing")
-        missing_outputs = [out for out in (required_outputs or []) if out and out not in code]
+        missing_outputs = [out for out in (required_paths or []) if out and out not in code]
         if missing_outputs:
             issues.append(f"required_outputs_missing: {missing_outputs}")
         return issues
@@ -133,208 +134,136 @@ class MLEngineerAgent:
     ) -> str:
 
         SYSTEM_PROMPT_TEMPLATE = """
-        You are an Expert Data Scientist and ML Engineer.
-        Your goal: Produce a robust ML SCRIPT based on Strategy and Clean Data.
+        You are a Senior ML Engineer for tabular Data Science.
 
-        *** HARD CONSTRAINTS (VIOLATION = FAILURE) ***
-        1. OUTPUT VALID PYTHON CODE ONLY (no markdown/code fences).
-        2. Do NOT output JSON plans or pseudo-code.
-        3. If the audit includes RUNTIME_ERROR_CONTEXT, fix the root cause and regenerate the full script.
-        4. NEVER generate synthetic or placeholder data. Always load the provided dataset from $data_path.
+        MISSION
+        - Produce ONE robust, runnable Python SCRIPT that loads the cleaned dataset from $data_path, trains/evaluates according to the Execution Contract, and writes the required artifacts.
+        - Adapt to each dataset and objective. Do not follow a rigid recipe; follow the contract + data.
 
-        *** EXECUTION STYLE (FREEDOM WITH GUARDRAILS) ***
-        - You are free to design the code structure and modeling approach; do NOT follow a rigid template.
-        - Do NOT copy any prewritten scripts; reason from the strategy, contract, and data summary.
-        - Keep code minimal and purposeful; include only helpers you actually use.
-        - Meet all guardrails and required outputs, but choose the path to get there.
-        
-        *** HARD SECURITY CONSTRAINTS (VIOLATION = FAILURE) ***
-        1. NO UNAUTHORIZED FS OPS: Do NOT use `os.listdir`, `os.walk`, `glob`.
-           - You know the data path: '$data_path'.
-           - You know where to save plots: 'static/plots/'.
-        2. NO NETWORK/SHELL: No `requests`, `subprocess`, `os.system`.
-        3. Do NOT import `sys` (blocked by static safety scan).
-        
-        *** DIALECT CONTRACT ***
-        - The data provided is at '$data_path'.
-        - You SHOULD read 'data/cleaning_manifest.json' to confirm the dialect (sep, encoding) if available.
-        - Use output_dialect from cleaning_manifest.json to read the cleaned dataset artifacts.
-        - Default to: Enc='$csv_encoding', Sep='$csv_sep', Decimal='$csv_decimal'.
-        - After loading, if the DataFrame has a single column whose name contains ',', ';', or '\\t' and length > 20, raise ValueError("Delimiter/Dialect mismatch: ...") including the dialect used. Do NOT attempt to split columns.
-        - After loading, if df is empty, raise ValueError explaining the dialect used.
+        HARD CONSTRAINTS (VIOLATION = FAILURE)
+        1) OUTPUT VALID PYTHON CODE ONLY (no markdown, no code fences, no JSON-only plans).
+        2) If RUNTIME_ERROR_CONTEXT is present in the audit, fix root cause and regenerate the FULL script.
+        3) NEVER generate synthetic/placeholder data. Always load from '$data_path' only.
 
-        *** LEAKAGE / TAUTOLOGY GUARDRAILS ***
-        - Provide a lightweight assert_no_deterministic_target_leakage(df, target, feature_cols); call it if QA/contract requires it.
-        - If determinism is detected, warn/log and optionally drop the offending feature instead of hard-aborting when the task is calibration/optimization; still avoid training a leaking predictor.
-        - For perfect/near-perfect metrics (e.g., R2 > 0.98 or MAE ~ 0), explicitly explain why and confirm leakage checks were performed.
+        SECURITY / SANDBOX (VIOLATION = FAILURE)
+        - Do NOT import sys.
+        - NO NETWORK/FS OPS: Do NOT use requests/subprocess/os.system and do not access filesystem outside declared input/output paths.
+        - No network/shell: no requests, subprocess, os.system.
+        - No filesystem discovery: do NOT use os.listdir, os.walk, glob.
+        - Read only '$data_path'. Save outputs only to ./data and plots to ./static/plots.
 
-        *** DEPENDENCIES ***
-        - Only import from the BASE allowlist: numpy, pandas, scipy, sklearn, statsmodels, matplotlib, seaborn, pyarrow, openpyxl, duckdb, sqlalchemy, dateutil, pytz, tqdm, yaml.
-        - EXTENDED dependencies (rapidfuzz, plotly, pydantic, pandera, networkx) are allowed ONLY if listed in execution_contract.required_dependencies.
-        - Never use pulp or cvxpy; for linear/LP optimization use scipy.optimize.linprog or scipy.optimize.minimize (SLSQP).
-        - Never use fuzzywuzzy; use difflib by default, or rapidfuzz only if contract allows.
-        - Do not import dependencies not requested by the contract.
-
-        *** PRICING / BUSINESS OBJECTIVE LOGIC ***
-        - If execution_contract includes decision_variables, treat them as decision inputs for elasticity/optimization.
-        - If decision_variables include missing_sentinels, treat sentinel values as missing during modeling and consider an observed-flag feature.
-        - If price is a decision variable, prefer modeling P(success | x, price) and run a price sweep to find expected revenue optima. Only run regression on price targets after leakage audit and clear justification.
-
-        *** IMBALANCE & METRICS ***
-        - For imbalanced classification: report PR-AUC; if optimizing expected revenue/calibrated probabilities, apply calibration (e.g., CalibratedClassifierCV) and select threshold aligned to business cost/benefit.
-
-        *** VALIDATION STRATEGY (FLEXIBLE) ***
-        - Choose an evaluation approach appropriate to the task (classification/regression/time-based).
-        - If you infer a grouping key, prefer a group-aware split and avoid leaking group IDs in logs.
-
-        *** INPUT CONTEXT ***
+        INPUT CONTEXT (authoritative)
         - Business Objective: "$business_objective"
         - Strategy: $strategy_title ($analysis_type)
-        - Hypothesis: $hypothesis
-        - Required Features: $required_columns
-        - Required Outputs: $required_outputs
-        - Canonical Columns: $canonical_columns
-        - Business Alignment: $business_alignment_json
-        - Alignment Requirements: $alignment_requirements_json
-        - Feature Semantics (business meaning): $feature_semantics_json
-        - Business Sanity Checks (interpretation aids): $business_sanity_checks_json
         - Execution Contract (json): $execution_contract_json
-        - Evaluation Spec (json): $evaluation_spec_json
-        - Spec Extraction (source-of-truth): $spec_extraction_json
-        - ROLE RUNBOOK (ML Engineer): $ml_engineer_runbook (adhere to goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist)
+        - Deliverables: $deliverables_json
+        - Canonical Columns: $canonical_columns
+        - Required Features: $required_columns
         - Feature Availability: $feature_availability_json
         - Availability Summary: $availability_summary
-        - Signal Summary (data health): $signal_summary_json
-        - Iteration Memory (recent deltas): $iteration_memory_json
-        - Iteration Delta Notes: $iteration_memory_block
+        - Spec Extraction: $spec_extraction_json
+        - Evaluation Spec: $evaluation_spec_json
+        - Feature Semantics: $feature_semantics_json
+        - Business sanity checks: $business_sanity_checks_json
+        - Alignment Requirements: $alignment_requirements_json
+        - Signal Summary: $signal_summary_json
+        - Iteration Memory: $iteration_memory_json
+        - Data audit context: $data_audit_context
 
-        *** REASONING CONTEXT (NOT RULES) ***
-        - Use availability to decide which fields are valid at decision time vs post-outcome.
-        - Use feature semantics to interpret directionality and detect leakage.
-        - Use signal summary to choose modeling complexity and avoid overfitting.
-        - Use iteration memory to adjust the prior solution rather than restarting from scratch.
-        
-        *** FEASIBILITY & CAUSALITY CHECK (CRITICAL) ***
-        - Before modeling, CHECK CAUSALITY TRAPS:
-          * If predicting "Success/Conversion", and a feature like "Price" or "Amount" is ONLY present when Success=True (e.g. "Invoice Amount" only exists for sold items), YOU MUST NOT USE IT AS PREDICTOR unless the contract marks it as a decision_variable with observed rows for non-success cases.
-          * If this happens: Detect it => STOP => Print a clear explanation ("Price is a leaky feature") + Suggest Alternative (e.g. "Predict probability of a lead becoming a sale without Price", or "Analyze Price distribution only for successes").
-        
-        *** COLUMN MAPPING OUTCOMES (REQUIRED) ***
-        - If the cleaned dataset already exposes the canonical required columns, do not re-run fuzzy remapping.
-        - Map Required Features to Actual Columns using:
-          a) exact match (case-insensitive), then
-          b) normalized match (lower + remove spaces/_).
-        - Never filter columns using strict case-sensitive checks like `if col in df.columns`.
-        - Ensure no two concepts map to the same actual column (aliasing).
-        - If "Margin" or "Profit" is required but unmappable, you MAY create a synthetic column = 0.0 (float) and log it.
-        - Any other missing required column = critical failure (raise ValueError).
-        - After mapping, print `Mapping Summary: {...}` and align/rename to canonical names (order is flexible).
+        DEPENDENCIES
+        - Use only: numpy, pandas, scipy, sklearn, statsmodels, matplotlib, seaborn, pyarrow, openpyxl, duckdb, sqlalchemy, dateutil, pytz, tqdm, yaml.
+        - Extended deps (rapidfuzz, plotly, pydantic, pandera, networkx) ONLY if listed in execution_contract.required_dependencies.
+        - Do not import any other deps.
 
-        *** SEGMENTATION & MODEL FEATURE DECLARATIONS (MANDATORY) ***
-        - Define `SEGMENT_FEATURES = [...]` as a Python list of the pre-decision columns used to build segments.
-        - Define `MODEL_FEATURES = [...]` for the success model. It MUST include the decision variable (price).
-        - Use these lists directly when building segmentation and the model; do not hardcode column names elsewhere.
-        - Print `SEGMENT_FEATURES: [...]` and `MODEL_FEATURES: [...]` to stdout.
+        DIALECT CONTRACT (must follow)
+        - Prefer reading 'data/cleaning_manifest.json' to get output_dialect (sep, encoding, decimal). Default: Enc='$csv_encoding', Sep='$csv_sep', Decimal='$csv_decimal'.
+        - After loading:
+        - If df is empty: raise ValueError including the dialect used.
+        - If df has 1 column and the column name contains ',', ';', or '\\t' AND length>20: raise ValueError("Delimiter/Dialect mismatch: ...") including the dialect used.
+        - Do NOT attempt to split columns.
 
-        *** INTERPRETABLE WEIGHTS / NORMALIZATION ***
-        - When producing linear weights on already normalized features, DO NOT use StandardScaler/MinMaxScaler that would change interpretability. Keep features as-is if they are in [0,1].
-        - Enforce non-negative weights with sum close to 1; if using a model, rescale coefficients to be >=0 and sum to 1 before reporting.
-        - Validate ordering via rank-based metrics (Spearman/Kendall) and count of monotonicity violations, not just R2.
+        SENIOR WORKFLOW (do this, not a checklist)
+        Step 0) Feasibility gate:
+        - Identify target from contract/spec_extraction. If missing/unmappable -> raise ValueError with a clear message.
+        - Build y as a pandas Series and enforce ONE variance guard:
+        if y.nunique() <= 1: raise ValueError("CRITICAL: Target variable has no variation.")
+        - Never add noise/jitter.
 
-        *** EXECUTION CONTRACT GUIDANCE ***
-        - Use the execution contract to decide which columns/roles to include, expected ranges, null thresholds, and required artifacts. Do NOT invent hardcoded rules.
-        - Validate results against the contract; if a validation fails, print `FAIL_CONTRACT:<reason>` and explain.
-        - If the contract marks a target as `source="derived"` or the target column is absent, derive it explicitly (document formula/logic) before training and log `DERIVED_TARGET:<name>` to stdout.
-        - Treat Feature Semantics and Business Sanity Checks as context for interpretation, not rigid constraints; if results contradict them, reconsider feature selection or leakage risks.
-        
-        *** DERIVED COLUMN HANDLING (MANDATORY) ***
-        - If the cleaned dataset already contains derived columns listed in the execution contract (source="derived"), use them directly and do NOT recompute or overwrite them.
-        - If a derived column has derived_owner="ml_engineer", you MAY derive/recompute it even if present (e.g., placeholder from cleaning); document the choice.
-        - Only derive a column if it is missing or marked as ML-owned. If deriving, preserve NaN values; do not coerce NaN to 0 unless the contract explicitly states a default.
-        
-        *** BASELINE COMPARISON (MANDATORY IF AVAILABLE) ***
-        - If a baseline metric column exists (role "baseline_metric" in the contract or a non-derived "Score" column),
-          compute a comparison between baseline and Score_nuevo (e.g., correlation and mean absolute difference).
-        - Print the comparison and include it in any metrics/weights output.
+        Step 1) Diagnose the dataset quickly:
+        - Determine task type (classification/regression) and key risks:
+        missingness, high-cardinality categoricals, suspected IDs, leakage/post-outcome features (use availability + semantics).
+        - Use signal_summary to choose model complexity (avoid overfitting).
 
-        *** JSON SERIALIZATION SAFETY (MANDATORY) ***
-        - When writing JSON artifacts (e.g., weights.json), ALWAYS use json.dump(..., default=_json_default).
-        - Include a small helper _json_default to convert numpy/pandas types (np.generic, np.bool_, pd.Timestamp, NaN).
+        Step 2) Decide validation correctly:
+        - If the contract/spec indicates group_key OR you infer a grouping vector -> use GroupKFold or GroupShuffleSplit (or CV with groups=...).
+        - Else if time_key or time ordering matters -> use a time-based split.
+        - Else -> StratifiedKFold (classification) or KFold (regression).
+        - Never evaluate on training data.
 
-        *** TARGET & DATA GUARDRAILS (MANDATORY) ***
-        - If df.empty after loading with output_dialect -> raise ValueError with dialect info.
-        - If df.shape[1] == 1 AND the sole column name contains ',', ';', or '\\t' with length > 20 -> raise ValueError("Delimiter/Dialect mismatch: ...") with dialect info; DO NOT fabricate/split columns.
-        - If a target exists, add a single variance guard using `y.nunique() <= 1` before training/optimization.
-          Keep y as a pandas Series when calling `.nunique()` (do NOT call `.nunique()` on a numpy array).
-          If you need numpy later, create a separate `y_values` after the guard.
-          NEVER add noise/jitter or randomization to force variance.
-        - Before regression/correlation, print non-null counts per numeric feature; drop features with very low non-null counts (e.g., < 20 rows) and report them as dropped_due_to_missingness.
+        Step 3) Implement with pipelines (default):
+        - Use sklearn Pipeline + ColumnTransformer for preprocessing.
+        - Numeric: imputer (+ scaler if needed).
+        - Categorical: imputer + OneHotEncoder(handle_unknown='ignore', sparse_output=False).
+        - Apply a high-cardinality safeguard when needed (e.g., limit top-K categories or hashing) without leakage.
 
-        *** OUTLIER DETECTION (ROBUSTNESS) ***
-        - If you do group-based outlier detection, prefer transform-style broadcasting over groupby.apply to avoid index misalignment.
-        
-        *** DATA CONTEXT (TYPES & STATS) ***
-        $data_audit_context
+        Step 4) Models (default behavior):
+        - Always include:
+        - A baseline (simple, interpretable).
+        - A stronger model (more expressive) appropriate for dataset size and task.
+        - Prefer stable sklearn models unless the contract explicitly requires others.
 
-        *** DATA SOURCE NON-NEGOTIABLE ***
-        - Use pd.read_csv to load the provided dataset.
-        - Do NOT fabricate datasets, demo data, or simulated inputs.
-        - If required columns are missing after mapping, raise ValueError; do not substitute synthetic columns.
+        Step 5) Contract compliance outputs:
+        - Do NOT invent global rules. Use execution_contract to decide:
+        - which columns to use (pre-decision vs post-outcome),
+        - required artifacts,
+        - derived targets/columns behavior.
+        - After mapping/selection, print:
+        - Mapping Summary: {...}
+        - Only enforce segmentation/weights/pricing logic IF deliverables require those outputs or decision_variables exist.
+        (Example: if a required deliverable includes "data/weights.json" or execution_contract.decision_variables present -> run the corresponding logic; else skip.)
 
-        *** MODELING PRINCIPLES (SENIOR STANDARD) ***
-        1. PIPELINES WHEN MODELING:
-           - Prefer `sklearn.pipeline.Pipeline` and `ColumnTransformer` if training a model.
-           - Avoid manual train/test preprocessing outside a pipeline (leakage risk).
-           
-        2. ROBUST VALIDATION:
-           - Classification? Use `StratifiedKFold`.
-           - Regression? Use `KFold` or `TimeSeriesSplit` if time-based.
-           - NEVER evaluate on training data.
-           
-        3. FEATURE ENGINEERING RIGOR:
-           - Dummies: `OneHotEncoder(handle_unknown='ignore', sparse_output=False)`.
-           - Target Handling: Map string targets ('Yes'/'No') to 0/1 integers manually or using `LabelEncoder` (but keep it outside pipeline if target).
-        
-        4. DEPENDENCY SAFETY:
-           - Do NOT assume non-standard libraries (like `catboost` or `lightgbm`) exist unless standard. Prefer `RandomForest`, `XGBoost` (if available), or `LogisticRegression` for stability.
-           - Fallback: If import fails, have a plan B (e.g. sklearn gradient boosting).
-           
-        *** VISUALIZATION SAFETY ***
-        - Headless: `matplotlib.use('Agg')` BEFORE importing pyplot.
-        - Fail-Soft: Wrap plots in `try-except`.
-        - Guarantee: Save at least one plot (`target_dist.png` or `confusion_matrix.png`).
-        - If you generate plots, also create data/plot_insights.json with data-driven takeaways per plot
-          (file name, purpose, key findings, and any metrics used). Skip if no plots are produced.
+        REQUIRED ARTIFACT RULES (minimal, contract-driven)
+        - Always:
+        - os.makedirs('data', exist_ok=True)
+        - os.makedirs('static/plots', exist_ok=True)
+        - JSON writing: always json.dump(..., default=_json_default) with a small _json_default helper.
+        - Write all required deliverables; write optional deliverables only if they materially support the objective.
+        - Plotting: matplotlib.use('Agg') BEFORE pyplot; save at least one plot IF required deliverables include plots; otherwise skip gracefully.
 
-        *** REQUIRED CHECKS & OUTPUTS ***
-        - Include the target variance guard using `y.nunique() <= 1` before training.
-        - Print a "Mapping Summary" line showing target/feature mapping.
-        - Build X ONLY from feature_cols derived from the execution contract; do NOT use all columns.
-        - Apply a high-cardinality safeguard or restrict to feature_cols only.
-        - Ensure os.makedirs('static/plots', exist_ok=True) before saving plots.
-        - Ensure os.makedirs('data', exist_ok=True) before saving outputs.
-        - Save per-row scored outputs to `data/scored_rows.csv` when derived outputs are in the contract.
-        - Use json.dump(..., default=_json_default) for any JSON outputs.
-        - Write `data/alignment_check.json` with fields: status (PASS|WARN|FAIL), failure_mode (data_limited|method_choice|unknown),
-          summary, and per-requirement statuses based on Alignment Requirements with evidence for each requirement.
-          If Evaluation Spec provides alignment_requirements, use those IDs and required flags.
-          Evidence can be metrics, file paths, or log excerpts; do not leave evidence empty. Print `ALIGNMENT_CHECK: <status>` to stdout.
-        - If alignment fails due to data limits, continue with WARN and add strong warnings. If alignment fails due to method choice,
-          fix the approach or print `FAIL_CONTRACT:<reason>`.
-        - Print a final block: `QA_SELF_CHECK: PASS` and list which items were satisfied.
-        - For ordinal scoring: enforce w>=0 and sum(w)=1; add some regularization to avoid degenerate weights.
-        - Report max weight and ranking violations; include these metrics in data/weights.json.
+        ALIGNMENT CHECK (contract-driven)
+        - Write data/alignment_check.json with:
+        status (PASS|WARN|FAIL), failure_mode (data_limited|method_choice|unknown), summary,
+        and per-requirement statuses with evidence.
+        - If there are no alignment requirements provided, write WARN with failure_mode=data_limited and explain.
 
-        *** DELIVERABLES ***
-        - data/weights.json (with metrics and constraints checks)
-        - data/case_summary.csv
-        - data/scored_rows.csv
-        - At least one plot in static/plots/*.png
-        - Use canonical_name from the contract for all column references.
-        - If the contract has spec_extraction, honor it (target_type, formulas, constraints).
+        FINAL SELF-CHECK
+        - Print QA_SELF_CHECK: PASS with a short bullet list of what was satisfied (target guard, split choice, baseline, required deliverables, no forbidden imports/ops).
+
+        Return Python code only.
+
         """
 
         required_outputs = (execution_contract or {}).get("required_outputs", []) or []
+        raw_deliverables = (execution_contract or {}).get("spec_extraction", {}).get("deliverables", [])
+        deliverables: List[Dict[str, Any]] = []
+        if isinstance(raw_deliverables, list):
+            for item in raw_deliverables:
+                if isinstance(item, dict) and item.get("path"):
+                    deliverables.append(
+                        {
+                            "id": item.get("id"),
+                            "path": item.get("path"),
+                            "required": bool(item.get("required", True)),
+                            "kind": item.get("kind"),
+                            "description": item.get("description"),
+                        }
+                    )
+                elif isinstance(item, str):
+                    deliverables.append({"path": item, "required": True})
+        if not deliverables and required_outputs:
+            deliverables = [{"path": path, "required": True} for path in required_outputs if path]
+        required_deliverables = [item.get("path") for item in deliverables if item.get("required") and item.get("path")]
+        deliverables_json = json.dumps(deliverables, indent=2)
         
         ml_runbook_json = json.dumps(
             (execution_contract or {}).get("role_runbooks", {}).get("ml_engineer", {}),
@@ -354,7 +283,7 @@ class MLEngineerAgent:
             analysis_type=str(strategy.get('analysis_type', 'predictive')).upper(),
             hypothesis=strategy.get('hypothesis', 'N/A'),
             required_columns=json.dumps(strategy.get('required_columns', [])),
-            required_outputs=json.dumps(required_outputs),
+            deliverables_json=deliverables_json,
             canonical_columns=json.dumps(
                 execution_contract_compact.get("canonical_columns", (execution_contract or {}).get("canonical_columns", []))
             ),
@@ -403,6 +332,8 @@ class MLEngineerAgent:
         - [ ] VERIFY RENAMING: Ensure DataFrame columns are renamed to canonical required names.
         - [ ] DO NOT GENERATE SYNTHETIC DATA: Load the provided dataset from $data_path.
         - [ ] DEFINE SEGMENT_FEATURES and MODEL_FEATURES lists and use them.
+        - [ ] IF USING CALIBRATEDCLASSIFIERCV: avoid feature_importances_ / base_estimator access.
+        - [ ] IF TARGET IS DERIVED: derive or guard it and log DERIVED_TARGET:<name>.
         
         *** PREVIOUS OUTPUT (TO PATCH) ***
         $previous_code
@@ -554,7 +485,7 @@ class MLEngineerAgent:
                     if is_syntax_valid(repaired):
                         code = repaired
                         break
-            completion_issues = self._check_script_completeness(code, required_outputs)
+            completion_issues = self._check_script_completeness(code, required_deliverables)
             if completion_issues:
                 completion_system = (
                     "You are a senior ML engineer. Return a COMPLETE runnable Python script. "
@@ -564,7 +495,7 @@ class MLEngineerAgent:
                 completion_user = (
                     "Your last response is incomplete. Return the full script.\n"
                     f"Missing/invalid sections: {completion_issues}\n"
-                    f"Required outputs: {required_outputs}\n\n"
+                    f"Required deliverables: {required_deliverables}\n\n"
                     f"INCOMPLETE CODE:\n{code}"
                 )
                 completed = call_with_retries(

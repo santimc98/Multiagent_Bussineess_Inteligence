@@ -12,7 +12,7 @@ y = y + np.random.normal(0, 1, len(y))
     result = run_static_qa_checks(code)
     assert result is not None
     assert result["status"] == "REJECTED"
-    assert "target" in result["feedback"].lower()
+    assert "target_variance_guard" in result.get("failed_gates", [])
 
 
 def test_static_qa_blocks_missing_variance_guard():
@@ -23,7 +23,8 @@ print(df.shape)
 """
     result = run_static_qa_checks(code)
     assert result is not None
-    assert "variance" in result["feedback"].lower()
+    assert result["status"] == "REJECTED"
+    assert "target_variance_guard" in result.get("failed_gates", [])
 
 
 def test_static_qa_allows_variance_guard():
@@ -32,7 +33,8 @@ if df['target'].nunique() <= 1:
     raise ValueError("Target has no variance; cannot train meaningful model.")
 """
     result = run_static_qa_checks(code)
-    assert result is None
+    assert result is not None
+    assert result["status"] in {"PASS", "WARN"}
 
 
 def test_static_qa_blocks_split_fabrication():
@@ -41,7 +43,7 @@ df[['a','b']] = df['raw'].str.split(';', expand=True)
 """
     result = run_static_qa_checks(code)
     assert result is not None
-    assert "delimiter mismatch" in result["feedback"].lower()
+    assert "dialect_mismatch_handling" in result.get("failed_gates", [])
 
 
 def test_static_qa_blocks_missing_group_split_when_inferred():
@@ -57,7 +59,7 @@ for tr, te in kf.split(df):
 """
     result = run_static_qa_checks(code)
     assert result is not None
-    assert "group" in result["feedback"].lower()
+    assert "group_split_required" in result.get("failed_gates", [])
 
 
 def test_static_qa_allows_group_split_when_used():
@@ -72,4 +74,20 @@ for tr, te in gkf.split(df, df['target'], groups):
     pass
 """
     result = run_static_qa_checks(code)
-    assert result is None
+    assert result is not None
+    assert result["status"] in {"PASS", "WARN"}
+
+
+def test_static_qa_respects_explicit_gates_only():
+    code = """
+from sklearn.linear_model import LinearRegression
+if df['target'].nunique() <= 1:
+    raise ValueError("Target has no variance; cannot train meaningful model.")
+model = LinearRegression()
+X = df[['a', 'b']]
+y = df['target']
+model.fit(X, y)
+"""
+    result = run_static_qa_checks(code, evaluation_spec={"qa_gates": ["target_variance_guard"]})
+    assert result is not None
+    assert result["status"] in {"PASS", "WARN"}

@@ -7,6 +7,21 @@ from openai import OpenAI
 
 load_dotenv()
 
+def apply_reviewer_gate_filter(result: Dict[str, Any], reviewer_gates: List[Any]) -> Dict[str, Any]:
+    if not isinstance(result, dict):
+        return {}
+    allowed = {str(g).lower() for g in (reviewer_gates or [])}
+    if allowed:
+        filtered = []
+        for g in result.get("failed_gates", []):
+            if str(g).lower() in allowed:
+                filtered.append(g)
+        result["failed_gates"] = filtered
+        if result.get("status") == "REJECTED" and not result.get("failed_gates"):
+            result["status"] = "APPROVE_WITH_WARNINGS"
+            result["feedback"] = "Spec-driven gating: no reviewer gates failed; downgraded to warnings."
+    return result
+
 class ReviewerAgent:
     def __init__(self, api_key: str = None):
         """
@@ -48,6 +63,13 @@ class ReviewerAgent:
         reviewer_gates = []
         if isinstance(evaluation_spec, dict):
             reviewer_gates = evaluation_spec.get("reviewer_gates") or evaluation_spec.get("gates") or []
+        allowed_columns = []
+        if isinstance(evaluation_spec, dict):
+            for key in ("allowed_columns", "canonical_columns", "required_columns", "contract_columns"):
+                cols = evaluation_spec.get(key)
+                if isinstance(cols, list) and cols:
+                    allowed_columns = [str(c) for c in cols if c]
+                    break
 
         SYSTEM_PROMPT_TEMPLATE = """
         You are a Senior Technical Lead and Security Auditor.
@@ -58,6 +80,7 @@ class ReviewerAgent:
         - Strategy Context: "$strategy_context"
         - Evaluation Spec (JSON): $evaluation_spec_json
         - Reviewer Gates (only these can fail): $reviewer_gates
+        - Allowed Columns (if provided): $allowed_columns_json
         
         ### CRITERIA FOR APPROVAL (QUALITY FIRST PRINCIPLES)
 
@@ -82,8 +105,8 @@ class ReviewerAgent:
            - **Cleanliness:** Code must be syntactically correct and runnable.
 
         5. **COLUMN MAPPING INTEGRITY:**
-           - The code MUST strictly map columns based on the strategy (Fuzzy Matching).
-           - Hardcoded column names (e.g., `df['churn']`) without lookup logic are PROHIBITED.
+           - If Allowed Columns are provided, do NOT use hardcoded column names outside that list.
+           - If Allowed Columns are missing, flag hardcoded columns as WARNING only (do not reject).
         
         ### VERDICT LOGIC
         - **REJECT**: Critical Security Violations, Data Leakage, Wrong Method (Regression for Classification), Syntax Errors, Missing Imports.
@@ -93,7 +116,7 @@ class ReviewerAgent:
         ### SPEC-DRIVEN EVALUATION (MANDATORY)
         - Only fail gates that appear in Reviewer Gates.
         - If a rule is NOT present in Reviewer Gates, you may mention it as a warning but MUST NOT reject for it.
-        - If Reviewer Gates is empty, fall back to the general criteria.
+        - If Reviewer Gates is empty, fall back to the general criteria but prefer APPROVE_WITH_WARNINGS when uncertain.
 
         ### OUTPUT FORMAT
         $output_format_instructions
@@ -106,6 +129,7 @@ class ReviewerAgent:
             strategy_context=strategy_context,
             evaluation_spec_json=eval_spec_json,
             reviewer_gates=reviewer_gates,
+            allowed_columns_json=json.dumps(allowed_columns, indent=2),
             output_format_instructions=output_format_instructions,
         )
         
@@ -139,14 +163,7 @@ class ReviewerAgent:
                 else:
                     result[field] = val
 
-            allowed = set(reviewer_gates) if reviewer_gates else set()
-            if allowed:
-                result["failed_gates"] = [g for g in result.get("failed_gates", []) if g in allowed]
-                result["required_fixes"] = [g for g in result.get("required_fixes", []) if g in allowed]
-                if result.get("status") == "REJECTED" and not result["failed_gates"]:
-                    result["status"] = "APPROVE_WITH_WARNINGS"
-                    result["feedback"] = "Spec-driven gating: no reviewer gates failed; downgraded to warnings."
-            
+            result = apply_reviewer_gate_filter(result, reviewer_gates)
             return result
 
         except Exception as e:

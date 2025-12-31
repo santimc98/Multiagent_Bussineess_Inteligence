@@ -28,7 +28,7 @@ class StewardAgent:
             generation_config={"temperature": 0.2}
         )
 
-    def analyze_data(self, data_path: str, business_objective: str = "") -> Dict[str, str]:
+    def analyze_data(self, data_path: str, business_objective: str = "") -> Dict[str, Any]:
         """
         Analyzes the CSV file and generates a dense textual summary.
         Context-aware: audits based on the business_objective.
@@ -79,11 +79,26 @@ class StewardAgent:
             
             # 4. Preserve raw headers & Scrub
             df.columns = [str(c) for c in df.columns]
+            pii_findings = detect_pii_findings(df)
             scrubber = PIIScrubber()
             df = scrubber.scrub_dataframe(df)
 
             # 5. Smart Profiling (V3)
             profile = self._smart_profile(df, business_objective)
+            dataset_profile = build_dataset_profile(
+                df=df,
+                objective=business_objective,
+                dialect_info=dialect_info,
+                encoding=detected_encoding,
+                file_size_bytes=file_size,
+                was_sampled=was_sampled,
+                sample_size=SAMPLE_SIZE if was_sampled else shape[0] if len(df) > 0 else 0,
+                pii_findings=pii_findings,
+            )
+            try:
+                write_dataset_profile(dataset_profile)
+            except Exception:
+                pass
             
             # 6. Construct Prompt
             shape = df.shape
@@ -203,7 +218,8 @@ class StewardAgent:
                 "encoding": detected_encoding,
                 "sep": sep,
                 "decimal": decimal,
-                "file_size_bytes": file_size
+                "file_size_bytes": file_size,
+                "profile": dataset_profile,
             }
             
         except Exception as e:
@@ -211,7 +227,8 @@ class StewardAgent:
                 "summary": f"DATA SUMMARY: Critical Error analyzing data: {e}", 
                 "encoding": detected_encoding,
                 "sep": sep, 
-                "decimal": decimal
+                "decimal": decimal,
+                "profile": {},
             }
 
     def _detect_csv_dialect(self, data_path: str, encoding: str) -> Dict[str, str]:
@@ -417,3 +434,137 @@ class StewardAgent:
             "targets": targets,
             "examples": examples
         }
+
+
+def _infer_type_hint(series: pd.Series) -> str:
+    dtype = str(series.dtype)
+    if dtype.startswith("int") or dtype.startswith("float"):
+        return "numeric"
+    if dtype == "bool":
+        return "boolean"
+    if dtype.startswith("datetime"):
+        return "datetime"
+    if dtype == "object":
+        sample = series.dropna().astype(str).head(200)
+        if sample.empty:
+            return "categorical"
+        try:
+            parsed = pd.to_datetime(sample, errors="coerce", dayfirst=True)
+            if parsed.notna().mean() > 0.7:
+                return "datetime"
+        except Exception:
+            pass
+        numeric_like = sample.str.contains(r"^[\s\-\+]*[\d,.\s%]+$").mean()
+        if numeric_like > 0.7:
+            return "numeric"
+        return "categorical"
+    return "unknown"
+
+
+def detect_pii_findings(df: pd.DataFrame, threshold: float = 0.3) -> Dict[str, Any]:
+    patterns = {
+        "EMAIL": re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", re.IGNORECASE),
+        "PHONE": re.compile(r"(?:\+\d{1,3})?[-. (]*\d{3}[-. )]*\d{3}[-. ]*\d{4}", re.IGNORECASE),
+        "CREDIT_CARD": re.compile(r"\b(?:\d[ -]*?){13,16}\b"),
+        "IBAN": re.compile(r"[a-zA-Z]{2}\d{2}[a-zA-Z0-9]{4,}", re.IGNORECASE),
+    }
+    findings: List[Dict[str, Any]] = []
+    object_cols = df.select_dtypes(include=["object"]).columns
+    for col in object_cols:
+        values = df[col].dropna().astype(str).tolist()
+        if not values:
+            continue
+        sample = values[: min(len(values), 200)]
+        for pii_type, pattern in patterns.items():
+            match_count = sum(1 for val in sample if pattern.search(val))
+            ratio = match_count / max(len(sample), 1)
+            if ratio >= threshold:
+                findings.append(
+                    {
+                        "column": col,
+                        "pii_type": pii_type,
+                        "match_ratio": round(ratio, 4),
+                    }
+                )
+                break
+    return {"detected": bool(findings), "findings": findings}
+
+
+def build_dataset_profile(
+    df: pd.DataFrame,
+    objective: str,
+    dialect_info: Dict[str, Any],
+    encoding: str,
+    file_size_bytes: int,
+    was_sampled: bool,
+    sample_size: int,
+    pii_findings: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    columns = [str(c) for c in df.columns]
+    type_hints = {col: _infer_type_hint(df[col]) for col in columns}
+    missing_frac: Dict[str, float] = {}
+    cardinality: Dict[str, Any] = {}
+    suspected_ids: List[str] = []
+    suspected_dates: List[str] = []
+    suspected_targets: List[str] = []
+
+    obj_tokens = set(re.sub(r"[^a-z0-9]", " ", (objective or "").lower()).split())
+    target_keywords = {"target", "label", "churn", "class", "outcome", "y", "status", "revenue", "sales"}
+    target_keywords.update(obj_tokens)
+
+    from src.utils.missing import is_effectively_missing_series
+
+    for col in columns:
+        series = df[col]
+        try:
+            missing_frac[col] = float(is_effectively_missing_series(series).mean())
+        except Exception:
+            missing_frac[col] = float(series.isna().mean())
+        n_unique = int(series.nunique(dropna=True))
+        top_values = []
+        try:
+            counts = series.astype(str).value_counts(dropna=False).head(5)
+            top_values = [{"value": str(idx), "count": int(cnt)} for idx, cnt in counts.items()]
+        except Exception:
+            top_values = []
+        cardinality[col] = {"unique": n_unique, "top_values": top_values}
+        if "id" in col.lower() or (len(df) > 0 and n_unique / max(len(df), 1) > 0.98):
+            suspected_ids.append(col)
+        if type_hints.get(col) == "datetime":
+            suspected_dates.append(col)
+        if any(tok in col.lower() for tok in target_keywords):
+            suspected_targets.append(col)
+
+    profile = {
+        "rows": int(df.shape[0]),
+        "cols": int(df.shape[1]),
+        "columns": columns,
+        "type_hints": type_hints,
+        "missing_frac": missing_frac,
+        "cardinality": cardinality,
+        "suspected_ids": sorted(set(suspected_ids)),
+        "suspected_dates": sorted(set(suspected_dates)),
+        "suspected_targets": sorted(set(suspected_targets)),
+        "pii_findings": pii_findings or {"detected": False, "findings": []},
+        "sampling": {
+            "was_sampled": bool(was_sampled),
+            "sample_size": int(sample_size),
+            "file_size_bytes": int(file_size_bytes),
+        },
+        "dialect": {
+            "sep": dialect_info.get("sep"),
+            "decimal": dialect_info.get("decimal"),
+            "encoding": encoding,
+        },
+    }
+    return profile
+
+
+def write_dataset_profile(profile: Dict[str, Any], path: str = "data/dataset_profile.json") -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    try:
+        import json as _json
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump(profile, f, indent=2, ensure_ascii=True)
+    except Exception:
+        return

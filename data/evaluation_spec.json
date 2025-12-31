@@ -1,0 +1,61 @@
+{
+  "objective_type": "prescriptive",
+  "segmentation": {
+    "required": true,
+    "features": [],
+    "confidence": 0.4,
+    "rationale": "Derived from strategy text and feature availability."
+  },
+  "decision_variable": {
+    "name": null,
+    "confidence": 0.4,
+    "rationale": "Derived from contract decision_variables."
+  },
+  "leakage_policy": {
+    "audit_features": [],
+    "correlation_threshold": 0.9,
+    "exclude_on_leakage": true
+  },
+  "validation_policy": {
+    "require_cv": true,
+    "baseline_required": true
+  },
+  "qa_gates": [
+    "mapping_summary",
+    "consistency_checks",
+    "target_variance_guard",
+    "outputs_required",
+    "segmentation_predecision"
+  ],
+  "reviewer_gates": [
+    "methodology_alignment",
+    "business_value",
+    "validation_required",
+    "price_optimization"
+  ],
+  "alignment_requirements": [
+    {
+      "id": "objective_alignment",
+      "description": "Output aligns with business objective.",
+      "required": true
+    },
+    {
+      "id": "decision_variable_handling",
+      "description": "Decision variables used correctly.",
+      "required": false
+    },
+    {
+      "id": "segment_alignment",
+      "description": "Segmentation uses only pre-decision features.",
+      "required": true
+    },
+    {
+      "id": "validation_minimum",
+      "description": "Validation performed per policy.",
+      "required": true
+    }
+  ],
+  "evidence_requirements": [],
+  "confidence": 0.4,
+  "justification": "Fallback evaluation spec derived heuristically from contract and strategy."
+}

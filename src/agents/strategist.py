@@ -92,13 +92,15 @@ class StrategistAgent:
             content = response.text
             cleaned_content = self._clean_json(content)
             single_strategy = json.loads(cleaned_content)
-            
+            strategy_spec = self._build_strategy_spec(single_strategy, data_summary, user_request)
+            if isinstance(single_strategy, dict):
+                single_strategy["strategy_spec"] = strategy_spec
             return single_strategy
             
         except Exception as e:
             print(f"Strategist Error: {e}")
             # Fallback simple strategy
-            return {"strategies": [{
+            fallback = {"strategies": [{
                 "title": "Error Fallback Strategy",
                 "analysis_type": "statistical",
                 "hypothesis": "Could not generate complex strategy. Analyzing basic correlations.",
@@ -107,8 +109,104 @@ class StrategistAgent:
                 "estimated_difficulty": "Low",
                 "reasoning": f"Gemini API Failed: {e}"
             }]}
+            fallback["strategy_spec"] = self._build_strategy_spec(fallback, data_summary, user_request)
+            return fallback
 
     def _clean_json(self, text: str) -> str:
         text = re.sub(r'```json', '', text)
         text = re.sub(r'```', '', text)
         return text.strip()
+
+    def _infer_objective_type(self, data_summary: str, user_request: str, strategy: Dict[str, Any] | None) -> str:
+        combined = " ".join([
+            str(data_summary or "").lower(),
+            str(user_request or "").lower(),
+            str((strategy or {}).get("analysis_type") or "").lower(),
+            " ".join([str(t) for t in ((strategy or {}).get("techniques") or [])]).lower(),
+        ])
+        if any(tok in combined for tok in ["forecast", "time series", "temporal", "series", "seasonal"]):
+            return "forecasting"
+        if any(tok in combined for tok in ["rank", "ranking", "priority", "prioritize", "score"]):
+            return "ranking"
+        if any(tok in combined for tok in ["classif", "churn", "binary", "categorical target"]):
+            return "classification"
+        if any(tok in combined for tok in ["regress", "continuous target", "price", "amount", "value"]):
+            return "regression"
+        if any(tok in combined for tok in ["causal", "uplift", "treatment", "impact"]):
+            return "causal"
+        if any(tok in combined for tok in ["optimiz", "maximize", "minimize", "prescriptive", "recommend"]):
+            return "prescriptive"
+        return "descriptive"
+
+    def _build_strategy_spec(self, strategy_payload: Dict[str, Any], data_summary: str, user_request: str) -> Dict[str, Any]:
+        strategies = []
+        if isinstance(strategy_payload, dict):
+            strategies = strategy_payload.get("strategies", []) or []
+        primary = strategies[0] if strategies else {}
+        objective_type = self._infer_objective_type(data_summary, user_request, primary if isinstance(primary, dict) else {})
+
+        metrics_map = {
+            "classification": ["accuracy", "f1", "roc_auc"],
+            "regression": ["mae", "rmse", "r2"],
+            "forecasting": ["mae", "rmse", "mape"],
+            "ranking": ["spearman", "ndcg"],
+        }
+        validation_map = {
+            "forecasting": "time_split",
+            "classification": "cross_validation",
+            "regression": "cross_validation",
+            "ranking": "cross_validation",
+        }
+        evaluation_plan = {
+            "objective_type": objective_type,
+            "metrics": metrics_map.get(objective_type, ["summary"]),
+            "validation": {
+                "strategy": validation_map.get(objective_type, "holdout"),
+                "notes": "Adjust validation to data volume and temporal ordering.",
+            },
+        }
+
+        leakage_risks: List[str] = []
+        combined = " ".join([str(data_summary or "").lower(), str(user_request or "").lower()])
+        if any(tok in combined for tok in ["post", "after", "outcome", "label"]):
+            leakage_risks.append("Potential post-outcome fields may leak target information.")
+        if "target" in combined:
+            leakage_risks.append("Exclude target or target-derived fields from features.")
+
+        recommended_artifacts = [
+            {"artifact_type": "clean_dataset", "required": True, "rationale": "Base dataset for modeling."},
+            {"artifact_type": "metrics", "required": True, "rationale": "Objective evaluation results."},
+        ]
+        if objective_type == "classification":
+            recommended_artifacts.extend([
+                {"artifact_type": "predictions", "required": True, "rationale": "Predicted class/probability outputs."},
+                {"artifact_type": "confusion_matrix", "required": False, "rationale": "Class error analysis."},
+            ])
+        elif objective_type == "regression":
+            recommended_artifacts.extend([
+                {"artifact_type": "predictions", "required": True, "rationale": "Predicted numeric outputs."},
+                {"artifact_type": "residuals", "required": False, "rationale": "Error distribution analysis."},
+            ])
+        elif objective_type == "forecasting":
+            recommended_artifacts.extend([
+                {"artifact_type": "forecast", "required": True, "rationale": "Forward-looking predictions."},
+                {"artifact_type": "backtest", "required": False, "rationale": "Historical forecast validation."},
+            ])
+        elif objective_type == "ranking":
+            recommended_artifacts.extend([
+                {"artifact_type": "ranking_scores", "required": True, "rationale": "Ranked list or scoring output."},
+                {"artifact_type": "ranking_report", "required": False, "rationale": "Ranking quality diagnostics."},
+            ])
+
+        recommended_artifacts.extend([
+            {"artifact_type": "feature_importances", "required": False, "rationale": "Explainability and auditability."},
+            {"artifact_type": "error_analysis", "required": False, "rationale": "Failure mode insights."},
+            {"artifact_type": "plots", "required": False, "rationale": "Diagnostic visuals when helpful."},
+        ])
+
+        return {
+            "objective_type": objective_type,
+            "evaluation_plan": evaluation_plan,
+            "leakage_risks": leakage_risks,
+            "recommended_artifacts": recommended_artifacts,
+        }

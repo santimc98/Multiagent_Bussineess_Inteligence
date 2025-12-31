@@ -20,6 +20,41 @@ def _safe_load_json(path: str):
     except Exception:
         return None
 
+def _normalize_artifact_index(entries):
+    normalized = []
+    for item in entries or []:
+        if isinstance(item, dict) and item.get("path"):
+            normalized.append(item)
+        elif isinstance(item, str):
+            normalized.append({"path": item, "artifact_type": "artifact"})
+    return normalized
+
+def _first_artifact_path(entries, artifact_type: str):
+    for item in entries or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("artifact_type") == artifact_type and item.get("path"):
+            return item.get("path")
+    return None
+
+def _facts_from_insights(insights: Dict[str, Any], max_items: int = 8):
+    if not isinstance(insights, dict):
+        return []
+    metrics = insights.get("metrics_summary")
+    facts = []
+    if isinstance(metrics, list):
+        for item in metrics:
+            if not isinstance(item, dict):
+                continue
+            metric = item.get("metric")
+            value = item.get("value")
+            if metric is None or value is None:
+                continue
+            facts.append({"source": "insights.json", "metric": metric, "value": value, "labels": {}})
+            if len(facts) >= max_items:
+                break
+    return facts
+
 def _safe_load_csv(path: str, max_rows: int = 200):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -122,7 +157,7 @@ def _build_fact_cards(case_summary_ctx, scored_rows_ctx, weights_ctx, data_adequ
             if value_key and _is_number(value):
                 labels = {k: v for k, v in example.items() if k not in {"value_key", "value"}}
                 facts.append({
-                    "source": "case_summary.csv",
+                    "source": "case_summary",
                     "metric": value_key,
                     "value": float(value),
                     "labels": labels,
@@ -135,7 +170,7 @@ def _build_fact_cards(case_summary_ctx, scored_rows_ctx, weights_ctx, data_adequ
             if value_key and _is_number(value):
                 labels = {k: v for k, v in example.items() if k not in {"value_key", "value"}}
                 facts.append({
-                    "source": "scored_rows.csv",
+                    "source": "predictions",
                     "metric": value_key,
                     "value": float(value),
                     "labels": labels,
@@ -145,7 +180,7 @@ def _build_fact_cards(case_summary_ctx, scored_rows_ctx, weights_ctx, data_adequ
             metrics = weights_ctx.get(key)
             for metric_key, metric_val in _extract_numeric_metrics(metrics):
                 facts.append({
-                    "source": "weights.json",
+                    "source": "weights",
                     "metric": metric_key,
                     "value": metric_val,
                     "labels": {"model_block": key},
@@ -177,16 +212,20 @@ class BusinessTranslatorAgent:
         )
 
     def generate_report(self, state: Dict[str, Any], error_message: Optional[str] = None, has_partial_visuals: bool = False, plots: Optional[List[str]] = None) -> str:
-        
+        if not isinstance(state, dict):
+            state = {"execution_output": str(state), "business_objective": str(error_message or "")}
+            error_message = None
+
         # Sanitize Visuals Context
         has_partial_visuals = bool(has_partial_visuals)
         plots = plots or []
-        artifact_index = state.get("artifact_index") or []
-        artifact_index = [a for a in artifact_index if isinstance(a, str)]
+        artifact_index = _normalize_artifact_index(
+            state.get("artifact_index") or _safe_load_json("data/artifact_index.json") or []
+        )
 
         def _artifact_available(path: str) -> bool:
             if artifact_index:
-                return path in artifact_index
+                return any(item.get("path") == path for item in artifact_index if isinstance(item, dict))
             return os.path.exists(path)
         
         # Safe extraction of strategy info
@@ -223,14 +262,18 @@ class BusinessTranslatorAgent:
         data_adequacy_report = _safe_load_json("data/data_adequacy_report.json") or {}
         alignment_check_report = _safe_load_json("data/alignment_check.json") or {}
         plot_insights = _safe_load_json("data/plot_insights.json") or {}
+        insights = _safe_load_json("data/insights.json") or {}
         steward_summary = _safe_load_json("data/steward_summary.json") or {}
         cleaning_manifest = _safe_load_json("data/cleaning_manifest.json") or {}
         run_summary = _safe_load_json("data/run_summary.json") or {}
-        weights_payload = _safe_load_json("data/weights.json") if _artifact_available("data/weights.json") else None
+        weights_path = _first_artifact_path(artifact_index, "weights")
+        predictions_path = _first_artifact_path(artifact_index, "predictions")
+        weights_payload = _safe_load_json(weights_path) if weights_path else None
         weights_payload = weights_payload or {}
-        scored_rows = _safe_load_csv("data/scored_rows.csv") if _artifact_available("data/scored_rows.csv") else None
-        case_summary = _safe_load_csv("data/case_summary.csv") if _artifact_available("data/case_summary.csv") else None
-        cleaned_rows = _safe_load_csv("data/cleaned_data.csv", max_rows=100) if _artifact_available("data/cleaned_data.csv") else None
+        scored_rows = _safe_load_csv(predictions_path) if predictions_path else None
+        case_summary = None
+        cleaned_path = _first_artifact_path(artifact_index, "dataset") or "data/cleaned_data.csv"
+        cleaned_rows = _safe_load_csv(cleaned_path, max_rows=100) if _artifact_available(cleaned_path) else None
         business_objective = state.get("business_objective") or contract.get("business_objective") or ""
 
         def _summarize_integrity():
@@ -254,6 +297,7 @@ class BusinessTranslatorAgent:
                 "business_alignment": contract.get("business_alignment", {}),
                 "spec_extraction": contract.get("spec_extraction", {}),
                 "iteration_policy": contract.get("iteration_policy", {}),
+                "execution_plan": contract.get("execution_plan", {}),
             }
 
         def _summarize_output_contract():
@@ -319,48 +363,19 @@ class BusinessTranslatorAgent:
                 run_metrics = run_summary.get("metrics")
                 if run_metrics:
                     metrics_summary["run_summary_metrics"] = run_metrics
+            if isinstance(insights, dict):
+                metrics_summary["insights_metrics"] = insights.get("metrics_summary", [])
             if not metrics_summary:
                 return "No explicit model metrics found."
             return metrics_summary
 
         def _summarize_case_summary():
             if not case_summary:
-                return "No case_summary.csv."
+                return "No case summary artifact."
             columns = case_summary.get("columns", [])
             rows = case_summary.get("rows", [])
-            if "metric" in columns and "value" in columns:
-                metrics = {}
-                for row in rows:
-                    key = row.get("metric")
-                    if not key:
-                        continue
-                    raw_value = row.get("value")
-                    if raw_value is None or raw_value == "":
-                        metrics[key] = None
-                        continue
-                    try:
-                        metrics[key] = float(str(raw_value).replace(",", "."))
-                    except Exception:
-                        metrics[key] = raw_value
-                return {
-                    "row_count_sampled": case_summary.get("row_count_sampled", 0),
-                    "columns": columns,
-                    "metrics": metrics,
-                }
             numeric_summary = _summarize_numeric_columns(rows, columns)
-            examples = _pick_top_examples(
-                rows,
-                columns,
-                value_keys=[
-                    "Expected_Value_mean",
-                    "ExpectedValue_mean",
-                    "Expected_Value",
-                    "ExpectedValue",
-                    "Predicted_Price_mean",
-                    "Predicted_Price",
-                ],
-                label_keys=["Sector", "Size_Decile", "Debtors_Decile", "Segment", "Typology_Cluster"],
-            )
+            examples = _pick_top_examples(rows, columns, value_keys=columns, label_keys=columns)
             return {
                 "row_count_sampled": case_summary.get("row_count_sampled", 0),
                 "columns": columns,
@@ -370,21 +385,11 @@ class BusinessTranslatorAgent:
 
         def _summarize_scored_rows():
             if not scored_rows:
-                return "No scored_rows.csv."
+                return "No predictions artifact."
             columns = scored_rows.get("columns", [])
             rows = scored_rows.get("rows", [])
             numeric_summary = _summarize_numeric_columns(rows, columns)
-            examples = _pick_top_examples(
-                rows,
-                columns,
-                value_keys=[
-                    "Expected_Value",
-                    "ExpectedValue",
-                    "expected_revenue_pred",
-                    "ExpectedRevenue",
-                ],
-                label_keys=["Sector", "Account", "FiscalId", "Size", "Debtors"],
-            )
+            examples = _pick_top_examples(rows, columns, value_keys=columns, label_keys=columns)
             return {
                 "row_count_sampled": scored_rows.get("row_count_sampled", 0),
                 "columns": columns,
@@ -515,7 +520,7 @@ class BusinessTranslatorAgent:
         run_summary_context = _summarize_run()
         data_adequacy_context = _summarize_data_adequacy()
         model_metrics_context = _summarize_model_metrics()
-        facts_context = _build_fact_cards(case_summary_context, scored_rows_context, weights_context, data_adequacy_context)
+        facts_context = _facts_from_insights(insights) or _build_fact_cards(case_summary_context, scored_rows_context, weights_context, data_adequacy_context)
         artifacts_context = artifact_index if artifact_index else []
 
         # Define Template
@@ -550,6 +555,7 @@ class BusinessTranslatorAgent:
         - Cleaning Summary: $cleaning_context
         - Run Summary: $run_summary_context
         - Data Adequacy: $data_adequacy_context
+        - Insights (primary): $insights_context
         - Fact Cards (use as evidence): $facts_context
         - Model Metrics & Weights: $weights_context
         - Model Metrics (Expanded): $model_metrics_context
@@ -557,6 +563,9 @@ class BusinessTranslatorAgent:
         - Scored Rows Snapshot: $scored_rows_context
         - Plot Insights (data-driven): $plot_insights_json
         - Artifacts Available: $artifacts_context
+
+        GUIDANCE:
+        - Use Insights as the primary evidence source; only reference other artifacts if they add clear value.
         
         ERROR CONDITION:
         $error_condition
@@ -617,6 +626,7 @@ class BusinessTranslatorAgent:
             cleaning_context=json.dumps(cleaning_context, ensure_ascii=False),
             run_summary_context=json.dumps(run_summary_context, ensure_ascii=False),
             data_adequacy_context=json.dumps(data_adequacy_context, ensure_ascii=False),
+            insights_context=json.dumps(insights, ensure_ascii=False),
             alignment_check_context=json.dumps(alignment_check_context, ensure_ascii=False),
             facts_context=json.dumps(facts_context, ensure_ascii=False),
             weights_context=json.dumps(weights_context, ensure_ascii=False),
