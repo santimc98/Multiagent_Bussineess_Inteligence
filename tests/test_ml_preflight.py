@@ -96,7 +96,7 @@ X = df[feature_cols]
 y = df["target"]
 if y.nunique() < 2:
     raise ValueError("Target has no variance; cannot train meaningful model.")
-pd.DataFrame({"age": [1, 2]})
+age = df["age"]
 imputer = SimpleImputer()
 baseline = DummyClassifier()
 """

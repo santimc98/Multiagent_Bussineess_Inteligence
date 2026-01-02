@@ -1388,6 +1388,9 @@ def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[
         "UNKNOWN_COLUMNS_REFERENCED": [
             "Remove invented columns and only reference columns from the cleaned dataset / contract mapping.",
         ],
+        "DF_COLUMN_ASSIGNMENT_FORBIDDEN": [
+            "Do not assign new columns into df; use Pipeline/ColumnTransformer or write derived columns to separate artifacts.",
+        ],
         "IMPUTER_REQUIRED": [
             "Include SimpleImputer in the preprocessing pipeline before modeling.",
         ],
@@ -1934,6 +1937,9 @@ def ml_quality_preflight(
         unknown_cols = _detect_unknown_columns(code, allowed_columns, allowed_patterns)
         if unknown_cols:
             issues.append("UNKNOWN_COLUMNS_REFERENCED")
+        forbidden_assignments = _detect_forbidden_df_assignments(code, allowed_columns, allowed_patterns)
+        if forbidden_assignments:
+            issues.append("DF_COLUMN_ASSIGNMENT_FORBIDDEN")
 
     if _detect_synthetic_data(code):
         issues.append("SYNTHETIC_DATA_DETECTED")
@@ -2163,32 +2169,18 @@ def _extract_column_references(code: str) -> List[str]:
         if not isinstance(node, ast.Subscript):
             continue
         target = node.value
-        if isinstance(target, ast.Attribute) and target.attr in {"loc", "iloc"}:
+        if isinstance(target, ast.Attribute) and target.attr == "loc":
+            if not (isinstance(target.value, ast.Name) and target.value.id == "df"):
+                continue
             slice_node = node.slice
             if isinstance(slice_node, ast.Tuple) and len(slice_node.elts) >= 2:
                 _collect_from_slice(slice_node.elts[1])
-            else:
-                _collect_from_slice(slice_node)
-        elif isinstance(target, (ast.Name, ast.Attribute)):
+            continue
+        if isinstance(target, ast.Attribute) and target.attr == "iloc":
+            continue
+        if isinstance(target, ast.Name) and target.id == "df":
             _collect_from_slice(node.slice)
 
-    known_lists = [
-        "feature_cols",
-        "features",
-        "FEATURES",
-        "target_cols",
-        "TARGET_COLS",
-        "target_col",
-        "TARGET_COL",
-        "MODEL_FEATURES",
-        "SEGMENT_FEATURES",
-        "segment_features",
-        "model_features",
-    ]
-    for name in known_lists:
-        refs.update(list_vars.get(name, []))
-
-    refs.update(_extract_dataframe_literal_columns(code))
     return sorted(refs)
 
 def _detect_unknown_columns(
@@ -2207,8 +2199,10 @@ def _detect_unknown_columns(
 
     allowed_norm = {_norm_name(col) for col in allowed_columns if col}
     refs = _extract_column_references(code)
-    unknown = []
+    unknown: set[str] = set()
     for col in refs:
+        if not col:
+            continue
         norm = _norm_name(col)
         if norm in allowed_norm:
             continue
@@ -2224,8 +2218,106 @@ def _detect_unknown_columns(
                     continue
             if matched:
                 continue
-        unknown.append(col)
-    return unknown
+        unknown.add(col)
+    return sorted(unknown)
+
+def _detect_forbidden_df_assignments(
+    code: str,
+    allowed_columns: List[str],
+    allowed_patterns: List[str] | None = None,
+) -> List[str]:
+    if not code or not allowed_columns:
+        return []
+    import ast
+    import re
+
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return []
+
+    allowed_norm = {_norm_name(col) for col in allowed_columns if col}
+    allowed_pattern_list = [str(pat) for pat in (allowed_patterns or []) if isinstance(pat, str) and pat.strip()]
+
+    def _pattern_name(name: str) -> str:
+        return re.sub(r"[^0-9a-zA-Z]+", "_", str(name).lower()).strip("_")
+
+    list_vars: Dict[str, List[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if not isinstance(target, ast.Name):
+                continue
+            if isinstance(node.value, (ast.List, ast.Tuple)):
+                values: List[str] = []
+                for elt in node.value.elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        values.append(elt.value)
+                if values:
+                    list_vars[target.id] = values
+
+    def _collect_from_slice(slice_node: ast.AST) -> List[str]:
+        cols: List[str] = []
+        if isinstance(slice_node, ast.Constant) and isinstance(slice_node.value, str):
+            cols.append(slice_node.value)
+            return cols
+        if isinstance(slice_node, ast.Name) and slice_node.id in list_vars:
+            cols.extend(list_vars[slice_node.id])
+            return cols
+        if isinstance(slice_node, (ast.List, ast.Tuple)):
+            for elt in slice_node.elts:
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                    cols.append(elt.value)
+                elif isinstance(elt, ast.Name) and elt.id in list_vars:
+                    cols.extend(list_vars[elt.id])
+        return cols
+
+    assigned_cols: set[str] = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for tgt in targets:
+                if not isinstance(tgt, ast.Subscript):
+                    continue
+                target = tgt.value
+                if isinstance(target, ast.Name) and target.id == "df":
+                    assigned_cols.update(_collect_from_slice(tgt.slice))
+                elif isinstance(target, ast.Attribute) and target.attr == "loc":
+                    if isinstance(target.value, ast.Name) and target.value.id == "df":
+                        slice_node = tgt.slice
+                        if isinstance(slice_node, ast.Tuple) and len(slice_node.elts) >= 2:
+                            assigned_cols.update(_collect_from_slice(slice_node.elts[1]))
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "assign":
+                if isinstance(func.value, ast.Name) and func.value.id == "df":
+                    for kw in node.keywords:
+                        if kw.arg:
+                            assigned_cols.add(kw.arg)
+
+    forbidden: set[str] = set()
+    for col in assigned_cols:
+        if not col:
+            continue
+        norm = _norm_name(col)
+        if norm in allowed_norm:
+            continue
+        if allowed_pattern_list:
+            target = _pattern_name(col)
+            matched = False
+            for pattern in allowed_pattern_list:
+                try:
+                    if re.search(pattern, target):
+                        matched = True
+                        break
+                except re.error:
+                    continue
+            if matched:
+                continue
+        forbidden.add(col)
+
+    return sorted(forbidden)
 
 def _find_canonical_mismatches(features: List[str], required_columns: List[str]) -> List[Dict[str, str]]:
     mismatches: List[Dict[str, str]] = []
@@ -5959,10 +6051,15 @@ def run_ml_preflight(state: AgentState) -> AgentState:
     unknown_cols: List[str] = []
     if "UNKNOWN_COLUMNS_REFERENCED" in issues and allowed_columns:
         unknown_cols = _detect_unknown_columns(code, allowed_columns, allowed_patterns)
+    forbidden_assignments: List[str] = []
+    if "DF_COLUMN_ASSIGNMENT_FORBIDDEN" in issues and allowed_columns:
+        forbidden_assignments = _detect_forbidden_df_assignments(code, allowed_columns, allowed_patterns)
     if run_id and issues:
         payload = {"issues": issues}
         if unknown_cols:
             payload["unknown_columns"] = unknown_cols
+        if forbidden_assignments:
+            payload["forbidden_df_assignments"] = forbidden_assignments
         log_run_event(run_id, "ml_preflight_issues", payload)
     if issues:
         expanded = _expand_required_fixes(issues, issues)
@@ -5976,6 +6073,9 @@ def run_ml_preflight(state: AgentState) -> AgentState:
         if unknown_cols:
             preview = unknown_cols[:10]
             feedback += f" | Unknown columns ({len(unknown_cols)}): {preview}"
+        if forbidden_assignments:
+            preview = forbidden_assignments[:10]
+            feedback += f" | Forbidden df column assignments ({len(forbidden_assignments)}): {preview}"
         history = list(state.get("feedback_history", []))
         history.append(feedback)
         gate_context = {
@@ -6095,10 +6195,14 @@ def execute_code(state: AgentState) -> AgentState:
     unknown_cols: List[str] = []
     if "UNKNOWN_COLUMNS_REFERENCED" in preflight_issues and allowed_columns:
         unknown_cols = _detect_unknown_columns(code, allowed_columns, allowed_patterns)
+    forbidden_assignments: List[str] = []
+    if "DF_COLUMN_ASSIGNMENT_FORBIDDEN" in preflight_issues and allowed_columns:
+        forbidden_assignments = _detect_forbidden_df_assignments(code, allowed_columns, allowed_patterns)
     fatal_preflight = {
         "SYNTHETIC_DATA_DETECTED",
         "DATAFRAME_LITERAL_OVERWRITE",
         "UNKNOWN_COLUMNS_REFERENCED",
+        "DF_COLUMN_ASSIGNMENT_FORBIDDEN",
     }
     fatal_hits = [issue for issue in preflight_issues if issue in fatal_preflight]
     if fatal_hits:
@@ -6106,12 +6210,17 @@ def execute_code(state: AgentState) -> AgentState:
         if unknown_cols:
             preview = unknown_cols[:10]
             msg += f" | Unknown columns ({len(unknown_cols)}): {preview}"
+        if forbidden_assignments:
+            preview = forbidden_assignments[:10]
+            msg += f" | Forbidden df column assignments ({len(forbidden_assignments)}): {preview}"
         fh = list(state.get("feedback_history", []))
         fh.append(msg)
         if run_id:
             payload = {"issues": fatal_hits}
             if unknown_cols:
                 payload["unknown_columns"] = unknown_cols
+            if forbidden_assignments:
+                payload["forbidden_df_assignments"] = forbidden_assignments
             log_run_event(run_id, "ml_preflight_blocked", payload)
         return {
             "error_message": msg,

@@ -971,6 +971,8 @@ class ExecutionPlannerAgent:
                 r".*_score$",
                 r".*_rank$",
                 r".*_segment$",
+                r"^segment_.*",
+                r"^typology_.*",
                 r".*_cluster$",
                 r".*_group$",
             ]
