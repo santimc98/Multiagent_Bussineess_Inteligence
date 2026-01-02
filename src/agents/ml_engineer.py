@@ -147,9 +147,10 @@ class MLEngineerAgent:
         2) If RUNTIME_ERROR_CONTEXT is present in the audit, fix root cause and regenerate the FULL script.
         3) NEVER generate synthetic/placeholder data. Always load from '$data_path' only.
         4) Do NOT invent column names. Use only columns from the contract/canonical list and the loaded dataset.
-        5) NEVER create DataFrames from literals (pd.DataFrame({}), from_dict, or lists/tuples). No np.random/random/faker.
-        6) scored_rows.csv may include ONLY allowed columns per the contract. Any extra derived columns (e.g., price_delta) must be written to a separate artifact file.
-        7) Start the script with a short comment block labeled PLAN describing: detected columns, row_id construction, scored_rows columns, and where extra derived artifacts go.
+        5) Do NOT add/overwrite df columns unless the name is explicitly allowed by the contract. Prefer Pipeline/ColumnTransformer transforms over df["new_col"]=... .
+        6) NEVER create DataFrames from literals (pd.DataFrame({}), from_dict, or lists/tuples). No np.random/random/faker.
+        7) scored_rows.csv may include ONLY allowed columns per the contract. Any extra derived columns (e.g., price_delta) must be written to a separate artifact file.
+        8) Start the script with a short comment block labeled PLAN describing: detected columns, row_id construction, scored_rows columns, and where extra derived artifacts go.
 
         SECURITY / SANDBOX (VIOLATION = FAILURE)
         - Do NOT import sys.

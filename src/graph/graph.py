@@ -5861,8 +5861,6 @@ def run_ml_preflight(state: AgentState) -> AgentState:
     allowed_columns = _resolve_allowed_columns_for_gate(state, contract, evaluation_spec)
     allowed_patterns = _resolve_allowed_patterns_for_gate(contract)
     issues = ml_quality_preflight(code, evaluation_spec, allowed_columns, allowed_patterns)
-    if run_id and issues:
-        log_run_event(run_id, "ml_preflight_issues", {"issues": issues})
     if isinstance(evaluation_spec, dict):
         obj_type = str(evaluation_spec.get("objective_type") or "").lower()
         validation_policy = evaluation_spec.get("validation_policy") or {}
@@ -5958,6 +5956,14 @@ def run_ml_preflight(state: AgentState) -> AgentState:
         has_assignment = any(_code_assigns_df_column(code, name) for name in derived_targets)
         if not (has_derived_log or has_guard or has_assignment):
             issues.append("DERIVED_TARGET_REQUIRED")
+    unknown_cols: List[str] = []
+    if "UNKNOWN_COLUMNS_REFERENCED" in issues and allowed_columns:
+        unknown_cols = _detect_unknown_columns(code, allowed_columns, allowed_patterns)
+    if run_id and issues:
+        payload = {"issues": issues}
+        if unknown_cols:
+            payload["unknown_columns"] = unknown_cols
+        log_run_event(run_id, "ml_preflight_issues", payload)
     if issues:
         expanded = _expand_required_fixes(issues, issues)
         feedback = f"ML_PREFLIGHT_MISSING: {', '.join(issues)}"
@@ -5967,10 +5973,9 @@ def run_ml_preflight(state: AgentState) -> AgentState:
             feedback += f" | Required columns hits: {col_coverage.get('hits')}"
         if canonical_mismatches:
             feedback += f" | Canonical mismatches: {canonical_mismatches}"
-        if "UNKNOWN_COLUMNS_REFERENCED" in issues and allowed_columns:
-            unknown_cols = _detect_unknown_columns(code, allowed_columns, allowed_patterns)
-            if unknown_cols:
-                feedback += f" | Unknown columns: {unknown_cols[:5]}"
+        if unknown_cols:
+            preview = unknown_cols[:10]
+            feedback += f" | Unknown columns ({len(unknown_cols)}): {preview}"
         history = list(state.get("feedback_history", []))
         history.append(feedback)
         gate_context = {
@@ -6087,6 +6092,9 @@ def execute_code(state: AgentState) -> AgentState:
     allowed_columns = _resolve_allowed_columns_for_gate(state, contract, eval_spec)
     allowed_patterns = _resolve_allowed_patterns_for_gate(contract)
     preflight_issues = ml_quality_preflight(code, eval_spec, allowed_columns, allowed_patterns)
+    unknown_cols: List[str] = []
+    if "UNKNOWN_COLUMNS_REFERENCED" in preflight_issues and allowed_columns:
+        unknown_cols = _detect_unknown_columns(code, allowed_columns, allowed_patterns)
     fatal_preflight = {
         "SYNTHETIC_DATA_DETECTED",
         "DATAFRAME_LITERAL_OVERWRITE",
@@ -6095,10 +6103,16 @@ def execute_code(state: AgentState) -> AgentState:
     fatal_hits = [issue for issue in preflight_issues if issue in fatal_preflight]
     if fatal_hits:
         msg = f"ML_PREFLIGHT_BLOCK: {', '.join(fatal_hits)}"
+        if unknown_cols:
+            preview = unknown_cols[:10]
+            msg += f" | Unknown columns ({len(unknown_cols)}): {preview}"
         fh = list(state.get("feedback_history", []))
         fh.append(msg)
         if run_id:
-            log_run_event(run_id, "ml_preflight_blocked", {"issues": fatal_hits})
+            payload = {"issues": fatal_hits}
+            if unknown_cols:
+                payload["unknown_columns"] = unknown_cols
+            log_run_event(run_id, "ml_preflight_blocked", payload)
         return {
             "error_message": msg,
             "execution_output": msg,
@@ -7302,6 +7316,14 @@ def run_translator(state: AgentState) -> AgentState:
         print(f"Warning: failed to persist executive_summary.md: {exec_err}")
 
     try:
+        pdf_payload = generate_pdf_artifact({**report_state, "final_report": report})
+        pdf_path = pdf_payload.get("pdf_path") if isinstance(pdf_payload, dict) else None
+        if pdf_path:
+            report_state["pdf_path"] = pdf_path
+    except Exception as pdf_err:
+        print(f"Warning: PDF generation failed in translator: {pdf_err}")
+
+    try:
         write_data_adequacy_report(state)
         write_governance_report(state)
         summary = build_run_summary(state)
@@ -7346,7 +7368,7 @@ def run_translator(state: AgentState) -> AgentState:
                 since_epoch=since_epoch,
             )
             report_sources = ["report", "reports"]
-            pdf_path = state.get("pdf_path")
+            pdf_path = report_state.get("pdf_path") or state.get("pdf_path")
             if pdf_path:
                 report_sources.append(pdf_path)
             copy_run_reports(run_id, report_sources, since_epoch=since_epoch)
@@ -7358,18 +7380,52 @@ def run_translator(state: AgentState) -> AgentState:
                 except Exception:
                     pass
             status_final = normalize_status(summary.get("status") if isinstance(summary, dict) else None)
-            finalize_run(run_id, status_final=status_final, state=state)
+        finalize_run(run_id, status_final=status_final, state=state)
     except Exception:
         pass
-    return {"final_report": report}
+    return {"final_report": report, "pdf_path": report_state.get("pdf_path")}
 # Generate Unique PDF Path to avoid file locks
 import uuid
 
 def generate_pdf_artifact(state: AgentState) -> AgentState:
     print("--- [7] System: Generating PDF Report ---")
-    report = state['final_report']
     import glob
-    
+
+    def _copy_pdf_artifact(pdf_path: str) -> None:
+        run_id = state.get("run_id")
+        if run_id:
+            copy_run_reports(run_id, [pdf_path], since_epoch=None)
+            try:
+                dest_root = os.path.join("runs", run_id, "report")
+                os.makedirs(dest_root, exist_ok=True)
+                shutil.copy2(pdf_path, os.path.join(dest_root, "final_report.pdf"))
+            except Exception:
+                pass
+        run_bundle_dir = state.get("run_bundle_dir")
+        if run_bundle_dir:
+            try:
+                dest_path = os.path.join(run_bundle_dir, "report", "final_report.pdf")
+                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                shutil.copy2(pdf_path, dest_path)
+            except Exception:
+                pass
+
+    report = state.get("final_report")
+    existing_pdf = state.get("pdf_path")
+    if existing_pdf and os.path.exists(existing_pdf):
+        _copy_pdf_artifact(existing_pdf)
+        return {"final_report": report, "pdf_path": existing_pdf}
+    if not report:
+        try:
+            with open("data/executive_summary.md", "r", encoding="utf-8") as f_exec:
+                report = f_exec.read()
+        except Exception:
+            report = ""
+    report = str(report or "")
+    if not report.strip():
+        print("PDF Generation Skipped: no report content available.")
+        return {"final_report": state.get("final_report"), "pdf_path": None}
+
     # Check for visualizations
     if "static/plots" not in report:
         plots = state.get("plots_local", []) or []
@@ -7413,26 +7469,11 @@ def generate_pdf_artifact(state: AgentState) -> AgentState:
         except Exception:
             latest_pdf = pdf_filename
 
-        if run_id:
-            copy_run_reports(run_id, [latest_pdf], since_epoch=None)
-            try:
-                dest_root = os.path.join("runs", run_id, "report")
-                os.makedirs(dest_root, exist_ok=True)
-                shutil.copy2(latest_pdf, os.path.join(dest_root, "final_report.pdf"))
-            except Exception:
-                pass
-        run_bundle_dir = state.get("run_bundle_dir")
-        if run_bundle_dir:
-            try:
-                dest_path = os.path.join(run_bundle_dir, "report", "final_report.pdf")
-                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                shutil.copy2(latest_pdf, dest_path)
-            except Exception:
-                pass
-        return {"final_report": state["final_report"], "pdf_path": pdf_filename}
+        _copy_pdf_artifact(latest_pdf)
+        return {"final_report": report, "pdf_path": pdf_filename}
     else:
         print("PDF Generation Failed")
-        return {"final_report": state["final_report"], "pdf_path": None}
+        return {"final_report": report, "pdf_path": None}
 
 # 3. Build Graph
 workflow = StateGraph(AgentState)
