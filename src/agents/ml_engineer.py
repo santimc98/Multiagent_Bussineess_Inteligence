@@ -21,6 +21,9 @@ class MLEngineerAgent:
         Initializes the ML Engineer Agent with the configured provider.
         """
         self.provider = (os.getenv("ML_ENGINEER_PROVIDER", "google") or "google").strip().lower()
+        self.fallback_model_name = None
+        self.last_model_used = None
+        self.last_fallback_reason = None
         if self.provider == "zai":
             self.api_key = api_key or os.getenv("ZAI_API_KEY") or os.getenv("GLM_API_KEY")
             if not self.api_key:
@@ -31,6 +34,32 @@ class MLEngineerAgent:
                 timeout=None,
             )
             self.model_name = os.getenv("ZAI_MODEL") or os.getenv("GLM_MODEL") or "glm-4.7"
+        elif self.provider == "openrouter":
+            self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+            if not self.api_key:
+                raise ValueError("OpenRouter API Key is required.")
+            timeout_raw = os.getenv("OPENROUTER_TIMEOUT_SECONDS")
+            try:
+                timeout_seconds = float(timeout_raw) if timeout_raw else 120.0
+            except ValueError:
+                timeout_seconds = 120.0
+            headers = {}
+            referer = os.getenv("OPENROUTER_HTTP_REFERER")
+            if referer:
+                headers["HTTP-Referer"] = referer
+            title = os.getenv("OPENROUTER_X_TITLE")
+            if title:
+                headers["X-Title"] = title
+            client_kwargs = {
+                "api_key": self.api_key,
+                "base_url": "https://openrouter.ai/api/v1",
+                "timeout": timeout_seconds,
+            }
+            if headers:
+                client_kwargs["default_headers"] = headers
+            self.client = OpenAI(**client_kwargs)
+            self.model_name = os.getenv("OPENROUTER_ML_PRIMARY_MODEL") or "z-ai/glm-4.7"
+            self.fallback_model_name = os.getenv("OPENROUTER_ML_FALLBACK_MODEL") or "moonshotai/kimi-k2-thinking"
         elif self.provider == "deepseek":
             self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
             if not self.api_key:
@@ -410,17 +439,24 @@ class MLEngineerAgent:
             provider_label = "Google"
         elif self.provider == "zai":
             provider_label = "Z.ai"
+        elif self.provider == "openrouter":
+            provider_label = "OpenRouter"
         else:
             provider_label = "DeepSeek"
 
-        def _call_model_with_prompts(sys_prompt: str, usr_prompt: str, temperature: float) -> str:
+        def _call_model_with_prompts(
+            sys_prompt: str,
+            usr_prompt: str,
+            temperature: float,
+            model_name: str,
+        ) -> str:
             self.last_prompt = sys_prompt + "\n\nUSER:\n" + usr_prompt
-            print(f"DEBUG: ML Engineer calling {provider_label} Model ({self.model_name})...")
+            print(f"DEBUG: ML Engineer calling {provider_label} Model ({model_name})...")
             if self.provider == "zai":
                 from src.utils.llm_throttle import glm_call_slot
                 with glm_call_slot():
                     response = self.client.chat.completions.create(
-                        model=self.model_name,
+                        model=model_name,
                         messages=[
                             {"role": "system", "content": sys_prompt},
                             {"role": "user", "content": usr_prompt}
@@ -428,11 +464,21 @@ class MLEngineerAgent:
                         temperature=temperature,
                     )
                 content = response.choices[0].message.content
+            elif self.provider == "openrouter":
+                response = self.client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": usr_prompt}
+                    ],
+                    temperature=temperature,
+                )
+                content = response.choices[0].message.content
             elif self.provider in {"google", "gemini"}:
                 full_prompt = sys_prompt + "\n\nUSER INPUT:\n" + usr_prompt
                 from google.genai import types
                 response = self.client.models.generate_content(
-                    model=self.model_name,
+                    model=model_name,
                     contents=full_prompt,
                     config=types.GenerateContentConfig(
                         temperature=temperature,
@@ -452,7 +498,7 @@ class MLEngineerAgent:
                 content = getattr(response, "text", "")
             else:
                 response = self.client.chat.completions.create(
-                    model=self.model_name,
+                    model=model_name,
                     messages=[
                         {"role": "system", "content": sys_prompt},
                         {"role": "user", "content": usr_prompt}
@@ -477,12 +523,38 @@ class MLEngineerAgent:
                 return str(err)
 
         try:
-            content = call_with_retries(
-                lambda: _call_model_with_prompts(system_prompt, user_message, current_temp),
-                max_retries=5,
-                backoff_factor=2,
-                initial_delay=2,
-            )
+            self.last_fallback_reason = None
+            if self.provider == "openrouter":
+                primary = self.model_name
+                fallback = self.fallback_model_name
+                try:
+                    content = call_with_retries(
+                        lambda: _call_model_with_prompts(system_prompt, user_message, current_temp, primary),
+                        max_retries=5,
+                        backoff_factor=2,
+                        initial_delay=2,
+                    )
+                    self.last_model_used = primary
+                except Exception as e:
+                    self.last_fallback_reason = str(e)[:500]
+                    print(
+                        f"WARN: OpenRouter primary failed ({e}); switching to fallback ({fallback})..."
+                    )
+                    content = call_with_retries(
+                        lambda: _call_model_with_prompts(system_prompt, user_message, current_temp, fallback),
+                        max_retries=2,
+                        backoff_factor=2,
+                        initial_delay=1,
+                    )
+                    self.last_model_used = fallback
+            else:
+                content = call_with_retries(
+                    lambda: _call_model_with_prompts(system_prompt, user_message, current_temp, self.model_name),
+                    max_retries=5,
+                    backoff_factor=2,
+                    initial_delay=2,
+                )
+                self.last_model_used = self.model_name
             print(f"DEBUG: {provider_label} response received.")
             code = self._clean_code(content)
             if code.strip().startswith("{") or code.strip().startswith("["):
@@ -499,9 +571,10 @@ class MLEngineerAgent:
                     f"Syntax error: {syntax_err}\n\nCODE:\n{code}"
                 )
                 repaired = code
+                model_for_repairs = self.last_model_used or self.model_name
                 for _ in range(2):
                     repaired = call_with_retries(
-                        lambda: _call_model_with_prompts(repair_system, repair_user, 0.0),
+                        lambda: _call_model_with_prompts(repair_system, repair_user, 0.0, model_for_repairs),
                         max_retries=2,
                         backoff_factor=2,
                         initial_delay=1,
@@ -524,7 +597,12 @@ class MLEngineerAgent:
                     f"INCOMPLETE CODE:\n{code}"
                 )
                 completed = call_with_retries(
-                    lambda: _call_model_with_prompts(completion_system, completion_user, 0.0),
+                    lambda: _call_model_with_prompts(
+                        completion_system,
+                        completion_user,
+                        0.0,
+                        self.last_model_used or self.model_name,
+                    ),
                     max_retries=2,
                     backoff_factor=2,
                     initial_delay=1,

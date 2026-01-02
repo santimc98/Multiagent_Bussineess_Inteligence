@@ -79,6 +79,16 @@ Our system mimics a high-performing human data team:
     GLM_USE_FILE_LOCK=1
     ```
     Note: set `GLM_MAX_CONCURRENCY=2` for GLM-4.7.
+    Optional: use OpenRouter with a primary + fallback model:
+    ```env
+    ML_ENGINEER_PROVIDER=openrouter
+    OPENROUTER_API_KEY=your_api_key_here
+    OPENROUTER_ML_PRIMARY_MODEL=z-ai/glm-4.7
+    OPENROUTER_ML_FALLBACK_MODEL=moonshotai/kimi-k2-thinking
+    OPENROUTER_TIMEOUT_SECONDS=120
+    OPENROUTER_HTTP_REFERER=https://your-domain.example
+    OPENROUTER_X_TITLE=your-app-title
+    ```
 
 4.  **Run the Foundry**
     ```bash
