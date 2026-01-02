@@ -920,6 +920,119 @@ class ExecutionPlannerAgent:
             contract["required_outputs"] = [item["path"] for item in deliverables if item.get("required")]
             return contract
 
+        def _merge_unique(values: List[str], extras: List[str]) -> List[str]:
+            seen: set[str] = set()
+            out: List[str] = []
+            for item in values + extras:
+                if not item:
+                    continue
+                text = str(item)
+                if text in seen:
+                    continue
+                seen.add(text)
+                out.append(text)
+            return out
+
+        def _has_deliverable(contract: Dict[str, Any], path: str) -> bool:
+            if not isinstance(contract, dict):
+                return False
+            if path in (contract.get("required_outputs") or []):
+                return True
+            spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else {}
+            deliverables = spec.get("deliverables")
+            if isinstance(deliverables, list):
+                for item in deliverables:
+                    if isinstance(item, dict) and item.get("path") == path:
+                        return True
+                    if isinstance(item, str) and item == path:
+                        return True
+            return False
+
+        def _build_scored_rows_schema(contract: Dict[str, Any]) -> Dict[str, Any] | None:
+            if not _has_deliverable(contract, "data/scored_rows.csv"):
+                return None
+            spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else {}
+            derived_cols: List[str] = []
+            derived = spec.get("derived_columns")
+            if isinstance(derived, list):
+                for entry in derived:
+                    if isinstance(entry, dict):
+                        name = entry.get("name") or entry.get("canonical_name")
+                    elif isinstance(entry, str):
+                        name = entry
+                    else:
+                        name = None
+                    if name:
+                        derived_cols.append(str(name))
+
+            objective_type = _infer_objective_type()
+            allowed_patterns = [
+                r".*_probability$",
+                r".*_score$",
+                r".*_rank$",
+                r".*_segment$",
+                r".*_cluster$",
+                r".*_group$",
+            ]
+            if objective_type in {"predictive", "prescriptive", "forecasting", "ranking"}:
+                allowed_patterns.append(r"^pred(icted)?_.*")
+
+            decision_vars = contract.get("decision_variables") or []
+            decision_context = bool(decision_vars)
+            if not decision_context:
+                combined_text = "\n".join(
+                    [
+                        contract.get("business_objective") or business_objective or "",
+                        data_summary or "",
+                        json.dumps(strategy, ensure_ascii=True) if isinstance(strategy, dict) else "",
+                    ]
+                )
+                decision_context = _detect_decision_context(combined_text)
+
+            if decision_context:
+                allowed_patterns.extend(
+                    [
+                        r"^expected_.*(revenue|value|price|profit|margin|cost).*",
+                        r".*_(revenue|value|price|profit|margin|cost)$",
+                    ]
+                )
+
+            return {
+                "rowcount": "match_cleaned",
+                "min_overlap": 1,
+                "required_columns": [],
+                "allowed_extra_columns": derived_cols,
+                "allowed_name_patterns": allowed_patterns,
+            }
+
+        def _apply_artifact_schemas(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            schemas = contract.get("artifact_schemas")
+            if not isinstance(schemas, dict):
+                schemas = {}
+            scored_schema = _build_scored_rows_schema(contract)
+            if scored_schema:
+                existing = schemas.get("data/scored_rows.csv")
+                if not isinstance(existing, dict):
+                    existing = {}
+                merged = dict(existing)
+                for key in ("rowcount", "min_overlap", "required_columns"):
+                    if key not in merged and key in scored_schema:
+                        merged[key] = scored_schema[key]
+                merged["allowed_extra_columns"] = _merge_unique(
+                    scored_schema.get("allowed_extra_columns", []),
+                    merged.get("allowed_extra_columns", []) or [],
+                )
+                merged["allowed_name_patterns"] = _merge_unique(
+                    scored_schema.get("allowed_name_patterns", []),
+                    merged.get("allowed_name_patterns", []) or [],
+                )
+                schemas["data/scored_rows.csv"] = merged
+            if schemas:
+                contract["artifact_schemas"] = schemas
+            return contract
+
         def _ensure_spec_extraction(contract: Dict[str, Any]) -> Dict[str, Any]:
             if not isinstance(contract, dict):
                 return {}
@@ -1719,6 +1832,7 @@ class ExecutionPlannerAgent:
             contract = _attach_semantic_guidance(contract)
             contract = _assign_derived_owners(contract)
             contract = _attach_variable_semantics(contract)
+            contract = _apply_artifact_schemas(contract)
             contract = _ensure_availability_reasoning(contract)
             contract = _attach_alignment_requirements(contract)
             contract = _ensure_iteration_policy(contract)
@@ -1748,6 +1862,7 @@ Requirements:
 - Prefer using columns from the strategy and data_summary; if something must be derived, mark source="derived"
   and explain in data_risks.
 - SPEC EXTRACTION deliverables must be a list of objects with keys {id, path, required, kind, description}.
+- Include artifact_schemas with per-output schemas (e.g., data/scored_rows.csv) specifying allowed_extra_columns and allowed_name_patterns.
 - required_outputs must equal [d.path for d in spec_extraction.deliverables if d.required] and include data/cleaned_data.csv.
 - Include role_runbooks to guide reasoning (goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist).
 - COLUMN INVENTORY (detected from CSV header) to help decide source input/derived: $column_inventory
@@ -1835,6 +1950,7 @@ Return the contract JSON.
             contract = _attach_semantic_guidance(contract)
             contract = _assign_derived_owners(contract)
             contract = _attach_variable_semantics(contract)
+            contract = _apply_artifact_schemas(contract)
             contract = _ensure_availability_reasoning(contract)
             contract = _attach_alignment_requirements(contract)
             contract = _ensure_iteration_policy(contract)

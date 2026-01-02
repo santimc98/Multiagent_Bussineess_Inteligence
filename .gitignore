@@ -28,6 +28,7 @@ static/plots/*.png
 final_report_*.pdf
 changes.patch
 logs/
+analysis/
 diff.patch
 run_bundle.zip
 runs/

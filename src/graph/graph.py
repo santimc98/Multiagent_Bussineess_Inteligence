@@ -2533,6 +2533,17 @@ def _artifact_alignment_gate(
     if not has_row_id and not has_overlap:
         issues.append("scored_rows_missing_row_id_or_overlap")
 
+    schema = {}
+    if isinstance(contract, dict):
+        schema = contract.get("artifact_schemas") if isinstance(contract.get("artifact_schemas"), dict) else {}
+        if not schema:
+            spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else {}
+            if isinstance(spec, dict):
+                schema = spec.get("artifact_schemas") if isinstance(spec.get("artifact_schemas"), dict) else {}
+    scored_schema = schema.get("data/scored_rows.csv") if isinstance(schema, dict) else {}
+    allowed_extra = scored_schema.get("allowed_extra_columns") if isinstance(scored_schema, dict) else None
+    allowed_patterns = scored_schema.get("allowed_name_patterns") if isinstance(scored_schema, dict) else None
+
     allowed_cols: List[str] = list(cleaned_cols)
     allowed_cols.extend(_resolve_contract_columns(contract, sources={"derived", "output"}))
     spec = contract.get("spec_extraction") if isinstance(contract, dict) else None
@@ -2584,6 +2595,12 @@ def _artifact_alignment_gate(
         ]
     )
     allowed_norm = {_norm_name(col) for col in allowed_cols if col}
+    allowed_extra_norm = {_norm_name(col) for col in allowed_extra or [] if col}
+    allowed_pattern_list = [str(pat) for pat in (allowed_patterns or []) if isinstance(pat, str) and pat.strip()]
+
+    def _pattern_name(name: str) -> str:
+        return re.sub(r"[^0-9a-zA-Z]+", "_", str(name).lower()).strip("_")
+
     scored_extras = []
     for col in scored_cols:
         norm = _norm_name(col)
@@ -2591,6 +2608,20 @@ def _artifact_alignment_gate(
             continue
         if norm in allowed_norm:
             continue
+        if norm in allowed_extra_norm:
+            continue
+        if allowed_pattern_list:
+            pattern_target = _pattern_name(col)
+            matched = False
+            for pattern in allowed_pattern_list:
+                try:
+                    if re.search(pattern, pattern_target):
+                        matched = True
+                        break
+                except re.error:
+                    continue
+            if matched:
+                continue
         if any(tok in norm for tok in ["pred", "score", "prob", "rank", "segment", "cluster", "group"]):
             continue
         scored_extras.append(col)
