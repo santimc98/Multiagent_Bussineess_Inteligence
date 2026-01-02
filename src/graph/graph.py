@@ -3151,6 +3151,7 @@ class AgentState(TypedDict):
     last_gate_context: Dict[str, Any]
     review_reject_streak: int
     qa_reject_streak: int
+    data_engineer_attempt: int
     execution_attempt: int # Track runtime retries
     runtime_fix_count: int
     last_runtime_error_tail: str # Added for Runtime Error Visibility
@@ -3348,8 +3349,6 @@ def run_strategist(state: AgentState) -> AgentState:
     user_context = state.get("strategist_context_override") or state.get("business_objective", "")
     result = strategist.generate_strategies(state['data_summary'], user_context)
     run_id = state.get("run_id")
-    attempt_id = int(state.get("data_engineer_attempt", 0)) + 1
-    state["data_engineer_attempt"] = attempt_id
     if run_id:
         log_agent_snapshot(
             run_id,
@@ -3597,6 +3596,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
             "error_message": err_msg,
             "budget_counters": counters,
         }
+    attempt_id = int(state.get("data_engineer_attempt", 0)) + 1
+    state["data_engineer_attempt"] = attempt_id
     if run_id:
         log_run_event(run_id, "data_engineer_start", {})
     
