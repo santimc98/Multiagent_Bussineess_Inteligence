@@ -59,3 +59,22 @@ def test_block_np_bool():
     is_safe, violations = scan_code_safety(code)
     assert not is_safe
     assert any("np.bool" in v for v in violations)
+
+def test_block_int_sum_chain():
+    code = """
+import pandas as pd
+mask = pd.Series([True, False])
+bad = int(mask).sum()
+    """
+    is_safe, violations = scan_code_safety(code)
+    assert not is_safe
+    assert any("int(...)" in v for v in violations)
+
+def test_allow_int_sum_scalar():
+    code = """
+import pandas as pd
+mask = pd.Series([True, False])
+ok = int(mask.sum())
+    """
+    is_safe, violations = scan_code_safety(code)
+    assert is_safe, f"Valid sum pattern was blocked: {violations}"

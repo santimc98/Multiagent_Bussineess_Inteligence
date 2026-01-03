@@ -60,6 +60,9 @@ class DataEngineerAgent:
         4. BAN pandas private APIs: do not use pandas.io.* or pd.io.parsers.*.
         5. If the audit includes RUNTIME_ERROR_CONTEXT, fix the root cause and regenerate the full script.
         6. Do NOT use np.bool (deprecated). Use bool or np.bool_ if needed.
+        7. Never call int(series) or float(series). For boolean masks use int(mask.sum()).
+           If you fill NaN with a sentinel (e.g., 'Unknown'), log nulls via original_nulls = int(col.isna().sum());
+           nulls_before = original_nulls; nulls_after_na = int(cleaned.isna().sum()); filled_nulls = original_nulls.
         
         *** INPUT PARAMETERS ***
         - Input: '$input_path'

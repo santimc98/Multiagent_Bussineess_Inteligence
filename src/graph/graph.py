@@ -2759,6 +2759,8 @@ def _infer_de_failure_cause(text: str) -> str:
     if not text:
         return ""
     lower = text.lower()
+    if "cannot convert the series to <class 'int'>" in lower or "cannot convert the series to <class 'float'>" in lower:
+        return "Attempted int()/float() cast on a pandas Series; compute scalar first (e.g., mask.sum())."
     if "missing required columns" in lower or "mapping failed" in lower:
         return "Required columns not found after canonicalization or alias mapping."
     if "cleaning_plan_not_allowed" in lower or "plan output" in lower:
@@ -2788,6 +2790,13 @@ def _build_de_runtime_diagnosis(error_details: str) -> List[str]:
         return []
     lower = error_details.lower()
     lines: List[str] = []
+    if "cannot convert the series to <class 'int'>" in lower or "cannot convert the series to <class 'float'>" in lower:
+        lines.append(
+            "You are calling int()/float() on a pandas Series. For boolean masks use int(mask.sum())."
+        )
+        lines.append(
+            "Avoid int(...).sum(); it casts before summing. Correct: int((...).sum())."
+        )
     if "list of cases must be same length as list of conditions" in lower:
         lines.append(
             "np.select raised a length mismatch: number of conditions does not match number of choices (see assign_fec_window)."

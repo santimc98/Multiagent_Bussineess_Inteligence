@@ -66,6 +66,13 @@ def scan_code_safety(code: str) -> Tuple[bool, List[str]]:
             
         def visit_Call(self, node):
             func_name = self._get_func_name(node.func)
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "sum":
+                base_call = node.func.value
+                if isinstance(base_call, ast.Call) and isinstance(base_call.func, ast.Name):
+                    if base_call.func.id == "int":
+                        self.errors.append(
+                            "Likely bug: int(...) returns scalar; .sum() here indicates you meant int((...).sum())."
+                        )
             if func_name in BLOCKED_CALLS:
                 self.errors.append(f"Calling '{func_name}' is PROHIBITED.")
             
