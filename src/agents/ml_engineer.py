@@ -113,6 +113,117 @@ class MLEngineerAgent:
                 compact[key] = vals[:80]
         return compact
 
+    def _resolve_allowed_columns_for_prompt(self, contract: Dict[str, Any] | None) -> List[str]:
+        if not isinstance(contract, dict):
+            return []
+        cols: List[str] = []
+        for key in ("required_columns", "canonical_columns"):
+            values = contract.get(key)
+            if isinstance(values, list):
+                cols.extend([str(v) for v in values if v])
+        feature_availability = contract.get("feature_availability")
+        if isinstance(feature_availability, list):
+            for item in feature_availability:
+                if isinstance(item, dict) and item.get("column"):
+                    cols.append(str(item.get("column")))
+        decision_vars = contract.get("decision_variables")
+        if isinstance(decision_vars, list):
+            cols.extend([str(v) for v in decision_vars if v])
+        seen = set()
+        deduped = []
+        for col in cols:
+            key = col.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(col)
+            if len(deduped) >= 120:
+                break
+        return deduped
+
+    def _resolve_allowed_name_patterns_for_prompt(self, contract: Dict[str, Any] | None) -> List[str]:
+        if not isinstance(contract, dict):
+            return []
+        schema = contract.get("artifact_schemas")
+        if not isinstance(schema, dict):
+            spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else None
+            if isinstance(spec, dict):
+                schema = spec.get("artifact_schemas")
+        if not isinstance(schema, dict):
+            return []
+        scored_schema = schema.get("data/scored_rows.csv")
+        if not isinstance(scored_schema, dict):
+            return []
+        allowed = scored_schema.get("allowed_name_patterns")
+        if not isinstance(allowed, list):
+            return []
+        return [str(pat) for pat in allowed if isinstance(pat, str) and pat.strip()]
+
+    def _select_feedback_blocks(
+        self,
+        feedback_history: List[str] | None,
+        gate_context: Dict[str, Any] | None,
+        max_blocks: int = 2,
+    ) -> str:
+        blocks: List[str] = []
+        if isinstance(gate_context, dict):
+            feedback = gate_context.get("feedback")
+            if isinstance(feedback, str) and feedback.strip():
+                blocks.append(feedback.strip())
+        if isinstance(feedback_history, list):
+            for item in reversed(feedback_history):
+                if isinstance(item, str) and item.strip():
+                    blocks.append(item.strip())
+                if len(blocks) >= max_blocks:
+                    break
+        if not blocks:
+            return ""
+        return "\n\n".join(blocks[:max_blocks])
+
+    def _build_incomplete_reprompt_context(
+        self,
+        execution_contract: Dict[str, Any] | None,
+        required_outputs: List[str],
+        iteration_memory_block: str,
+        iteration_memory: List[Dict[str, Any]] | None,
+        feedback_history: List[str] | None,
+        gate_context: Dict[str, Any] | None,
+    ) -> str:
+        contract_min = self._compact_execution_contract(execution_contract or {})
+        allowed_columns = self._resolve_allowed_columns_for_prompt(execution_contract or {})
+        allowed_patterns = self._resolve_allowed_name_patterns_for_prompt(execution_contract or {})
+        feedback_blocks = self._select_feedback_blocks(feedback_history, gate_context, max_blocks=2)
+        memory_block = iteration_memory_block.strip()
+        if not memory_block:
+            memory_block = json.dumps(iteration_memory or [], indent=2)
+        rules_block = "\n".join(
+            [
+                "- No synthetic/placeholder data. Load only the provided dataset.",
+                "- Do not create new df columns unless explicitly allowed by contract/patterns.",
+                "- Baseline model is required.",
+                "- Include SimpleImputer in preprocessing when NaNs may exist.",
+                "- Write all required outputs to exact paths.",
+            ]
+        )
+        return "\n".join(
+            [
+                "CONTRACT_MIN_CONTEXT:",
+                json.dumps(contract_min, indent=2),
+                "REQUIRED OUTPUTS:",
+                json.dumps(required_outputs or [], indent=2),
+                "ALLOWED COLUMNS:",
+                json.dumps(allowed_columns, indent=2),
+                "ALLOWED_NAME_PATTERNS:",
+                json.dumps(allowed_patterns, indent=2),
+                "UNIVERSAL RULES:",
+                rules_block,
+                "ITERATION_MEMORY_CONTEXT:",
+                memory_block,
+                "LATEST_REVIEW_FEEDBACK:",
+                feedback_blocks or "None",
+            ]
+        )
+
     def _truncate_prompt_text(self, text: str, max_len: int, head_len: int, tail_len: int) -> str:
         if not text:
             return text
@@ -204,6 +315,7 @@ class MLEngineerAgent:
         - Alignment Requirements: $alignment_requirements_json
         - Signal Summary: $signal_summary_json
         - Iteration Memory: $iteration_memory_json
+        - Iteration Memory (compact): $iteration_memory_block
         - Data audit context: $data_audit_context
 
         DEPENDENCIES
@@ -585,6 +697,14 @@ class MLEngineerAgent:
                         break
             completion_issues = self._check_script_completeness(code, required_deliverables)
             if completion_issues:
+                reprompt_context = self._build_incomplete_reprompt_context(
+                    execution_contract=execution_contract,
+                    required_outputs=required_deliverables,
+                    iteration_memory_block=iteration_memory_block,
+                    iteration_memory=iteration_memory,
+                    feedback_history=feedback_history,
+                    gate_context=gate_context,
+                )
                 completion_system = (
                     "You are a senior ML engineer. Return a COMPLETE runnable Python script. "
                     "Do not return partial snippets, diffs, or TODOs. "
@@ -594,7 +714,9 @@ class MLEngineerAgent:
                     "Your last response is incomplete. Return the full script.\n"
                     f"Missing/invalid sections: {completion_issues}\n"
                     f"Required deliverables: {required_deliverables}\n\n"
-                    f"INCOMPLETE CODE:\n{code}"
+                    f"INCOMPLETE CODE:\n{code}\n\n"
+                    "Re-emit the FULL script without truncation, respecting contract and fixes.\n\n"
+                    f"{reprompt_context}"
                 )
                 completed = call_with_retries(
                     lambda: _call_model_with_prompts(

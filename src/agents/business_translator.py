@@ -404,9 +404,13 @@ class BusinessTranslatorAgent:
                 return "No run_summary.json."
             return {
                 "status": run_summary.get("status"),
+                "run_outcome": run_summary.get("run_outcome"),
                 "failed_gates": run_summary.get("failed_gates", []),
                 "warnings": run_summary.get("warnings", []),
                 "metrics": run_summary.get("metrics", {}),
+                "metric_ceiling_detected": run_summary.get("metric_ceiling_detected"),
+                "ceiling_reason": run_summary.get("ceiling_reason"),
+                "baseline_vs_model": run_summary.get("baseline_vs_model", []),
             }
 
         def _summarize_gate_context():
@@ -581,14 +585,15 @@ class BusinessTranslatorAgent:
         
         IF SUCCESS:
         Produce a senior-level executive report with these required sections:
-        1) Executive Decision: ONE line with readiness (GO / PILOT / NO-GO) and why.
+        1) Executive Decision: ONE line with readiness (GO / GO_WITH_LIMITATIONS / NO_GO) and why.
         2) Objective & Approach: What we set out to do and the approach used.
         3) Evidence & Metrics: Cite 3+ concrete numbers from Fact Cards or snapshots, with source file names.
            If a number is unavailable, write "No disponible" and state which artifact is missing.
         4) Business Impact: Translate metrics into business implications and expected value.
         5) Risks & Limitations: Call out data risks, gate failures, or misalignment with the objective.
-        6) Recommended Next Actions: 2-5 specific actions (short-term + data improvements).
-        7) Visual Insights: Explain what each plot shows using Plot Insights; do not describe only the chart type.
+        6) Metric Ceiling (if applicable): State whether a ceiling was detected and why.
+        7) Recommended Next Actions: 2-5 specific actions (short-term + data improvements).
+        8) Visual Insights: Explain what each plot shows using Plot Insights; do not describe only the chart type.
 
         Ensure logical consistency: do not claim elasticity, uplift, or improvements unless supported by metrics or plots.
         If quality gates are missing or misaligned, explicitly state that evaluation confidence is reduced.
@@ -598,6 +603,7 @@ class BusinessTranslatorAgent:
         and list 2-4 concrete data improvement steps from Data Adequacy recommendations.
         If Data Adequacy indicates "insufficient_signal", state that metrics are incomplete
         and the report should be treated as directional, not decision-grade.
+        If run_outcome is GO_WITH_LIMITATIONS, explicitly state limitations and scope of validity.
 
         If Business Readiness indicates NO_APTO_PARA_PRODUCCION, explicitly state it and summarize
         the main reasons using gate context and review feedback in executive language.

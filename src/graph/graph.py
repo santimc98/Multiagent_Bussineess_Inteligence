@@ -3286,6 +3286,233 @@ def _extract_metrics_snapshot(metrics_report: Dict[str, Any], weights_report: Di
                 snapshot[f"optimization_{key}"] = float(value)
     return snapshot
 
+def _normalize_reason_tags(text: str, failed_gates: List[str] | None = None) -> List[str]:
+    tags: List[str] = []
+    lower = str(text or "").lower()
+    gate_tokens = [str(item).lower() for item in (failed_gates or []) if item]
+    combined = " ".join([lower] + gate_tokens)
+    mapping = [
+        ("synthetic", "synthetic"),
+        ("df_column_assignment_forbidden", "df_mutation"),
+        ("df_column", "df_mutation"),
+        ("unknown_columns_referenced", "unknown_columns"),
+        ("unknown column", "unknown_columns"),
+        ("baseline", "baseline_missing"),
+        ("imputer", "imputer_missing"),
+        ("leakage", "leakage"),
+        ("output_contract_missing", "contract_missing_outputs"),
+        ("required_outputs_missing", "contract_missing_outputs"),
+        ("missing output", "contract_missing_outputs"),
+        ("time_series", "time_series_split"),
+        ("cross_validation_required", "validation_missing"),
+        ("validation_required", "validation_missing"),
+        ("alignment", "alignment"),
+        ("method_choice", "method_choice"),
+        ("data_limited", "data_limited"),
+        ("variance guard", "target_variance_guard"),
+    ]
+    for token, tag in mapping:
+        if token in combined and tag not in tags:
+            tags.append(tag)
+    return tags
+
+def _summarize_runtime_error(output: str | None) -> Dict[str, str] | None:
+    if not output:
+        return None
+    text = str(output)
+    line = text.strip().splitlines()[-1] if text.strip() else ""
+    if "Traceback" in text:
+        return {"type": "runtime_error", "message": line[:300]}
+    if "EXECUTION ERROR" in text or "Sandbox Execution Failed" in text:
+        return {"type": "execution_error", "message": line[:300]}
+    return {"type": "error", "message": line[:300]}
+
+def _collect_outputs_state(required_outputs: List[str]) -> Dict[str, List[str]]:
+    present: List[str] = []
+    missing: List[str] = []
+    for path in required_outputs or []:
+        if not path or _is_glob_pattern(path):
+            continue
+        if os.path.exists(path):
+            present.append(path)
+        else:
+            missing.append(path)
+    return {"present": present, "missing": missing}
+
+def _suggest_next_actions(
+    preflight_issues: List[str],
+    outputs_missing: List[str],
+    reviewer_reasons: List[str],
+    qa_reasons: List[str],
+) -> List[str]:
+    actions: List[str] = []
+    issues = [str(item) for item in (preflight_issues or []) if item]
+    reasons = set((reviewer_reasons or []) + (qa_reasons or []))
+    if outputs_missing:
+        actions.append(f"Write required outputs: {outputs_missing[:5]}")
+    if "SYNTHETIC_DATA_DETECTED" in issues or "synthetic" in reasons:
+        actions.append("Remove synthetic data generation; load only the provided dataset.")
+    if "DF_COLUMN_ASSIGNMENT_FORBIDDEN" in issues or "df_mutation" in reasons:
+        actions.append("Avoid df column assignments; use Pipeline/ColumnTransformer or separate artifacts.")
+    if "UNKNOWN_COLUMNS_REFERENCED" in issues or "unknown_columns" in reasons:
+        actions.append("Use only contract/canonical columns; avoid invented names.")
+    if "BASELINE_REQUIRED" in issues or "baseline_missing" in reasons:
+        actions.append("Add a DummyClassifier/DummyRegressor baseline with metrics.")
+    if "IMPUTER_REQUIRED" in issues or "imputer_missing" in reasons:
+        actions.append("Include SimpleImputer in preprocessing before modeling.")
+    if "validation_missing" in reasons:
+        actions.append("Add appropriate validation (CV or time-based split) and report metrics.")
+    if "leakage" in reasons:
+        actions.append("Exclude post-outcome features and document leakage prevention.")
+    if "contract_missing_outputs" in reasons:
+        actions.append("Verify all required artifacts are written to contract paths.")
+    if not actions:
+        actions.append("Apply reviewer feedback and align outputs to the execution contract.")
+    return actions[:3]
+
+def _ml_iteration_journal_path(run_id: str, base_dir: str = "runs") -> str:
+    return os.path.join(base_dir, run_id, "ml_iteration_journal.jsonl")
+
+def _append_ml_iteration_journal(
+    run_id: str,
+    entry: Dict[str, Any],
+    written_ids: List[int] | None = None,
+    base_dir: str = "runs",
+) -> List[int]:
+    if not run_id or not isinstance(entry, dict):
+        return written_ids or []
+    iter_id = entry.get("iteration_id")
+    if iter_id is None:
+        return written_ids or []
+    known = set(int(i) for i in (written_ids or []) if isinstance(i, int) or str(i).isdigit())
+    if int(iter_id) in known:
+        return sorted(known)
+    path = _ml_iteration_journal_path(run_id, base_dir=base_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=True) + "\n")
+    except Exception:
+        return sorted(known)
+    known.add(int(iter_id))
+    return sorted(known)
+
+def _load_ml_iteration_journal(run_id: str, base_dir: str = "runs") -> List[Dict[str, Any]]:
+    if not run_id:
+        return []
+    path = _ml_iteration_journal_path(run_id, base_dir=base_dir)
+    if not os.path.exists(path):
+        return []
+    entries: List[Dict[str, Any]] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    return entries
+
+def _build_ml_iteration_memory_block(entries: List[Dict[str, Any]], max_chars: int = 1200) -> str:
+    if not entries:
+        return ""
+    last = entries[-1]
+    last_summary = {
+        "iteration_id": last.get("iteration_id"),
+        "preflight_issues": last.get("preflight_issues"),
+        "runtime_error": last.get("runtime_error"),
+        "outputs_missing": last.get("outputs_missing"),
+        "reviewer_verdict": last.get("reviewer_verdict"),
+        "qa_verdict": last.get("qa_verdict"),
+    }
+    counts: Dict[str, int] = {}
+    for entry in entries:
+        for tag in (entry.get("reviewer_reasons") or []) + (entry.get("qa_reasons") or []) + (entry.get("preflight_issues") or []):
+            if not tag:
+                continue
+            key = str(tag)
+            counts[key] = counts.get(key, 0) + 1
+    top_failures = sorted(counts.items(), key=lambda item: item[1], reverse=True)[:3]
+    top_failures_list = [f"{name} (x{count})" for name, count in top_failures]
+    do_lines = []
+    for item in last.get("next_actions") or []:
+        if not item:
+            continue
+        do_lines.append(f"DO: {item}")
+        if len(do_lines) >= 3:
+            break
+    dont_lines = []
+    dont_map = {
+        "synthetic": "Don't generate synthetic data.",
+        "df_mutation": "Don't assign new df columns outside allowed patterns.",
+        "unknown_columns": "Don't reference columns not in the contract.",
+        "contract_missing_outputs": "Don't skip required artifacts.",
+        "leakage": "Don't use post-outcome features.",
+    }
+    for key in counts.keys():
+        tag = str(key)
+        if tag in dont_map and len(dont_lines) < 3:
+            dont_lines.append(dont_map[tag])
+    lines = [
+        "Last attempt summary: " + json.dumps(last_summary, ensure_ascii=True),
+        "Top recurring failures: " + json.dumps(top_failures_list, ensure_ascii=True),
+    ]
+    lines.extend(do_lines + dont_lines)
+    block = "\n".join(lines)
+    if len(block) <= max_chars:
+        return block
+    base_lines = lines[:2]
+    trimmed_lines = list(base_lines)
+    for extra in lines[2:]:
+        candidate = "\n".join(trimmed_lines + [extra])
+        if len(candidate) > max_chars:
+            break
+        trimmed_lines.append(extra)
+    block = "\n".join(trimmed_lines)
+    if len(block) <= max_chars:
+        return block
+    summary_line, failures_line = base_lines
+    overhead = len(failures_line) + 1
+    allowed = max_chars - overhead
+    if allowed <= 0:
+        return failures_line[:max_chars]
+    summary_line = summary_line[:allowed]
+    return summary_line + "\n" + failures_line
+
+def _build_ml_iteration_journal_entry(
+    state: Dict[str, Any],
+    preflight_issues: List[str] | None,
+    runtime_error: Dict[str, str] | None,
+    outputs_present: List[str],
+    outputs_missing: List[str],
+    reviewer_verdict: str | None,
+    reviewer_reasons: List[str],
+    qa_verdict: str | None,
+    qa_reasons: List[str],
+    next_actions: List[str],
+) -> Dict[str, Any]:
+    code = state.get("generated_code") or ""
+    code_hash = hashlib.sha256(code.encode("utf-8", errors="replace")).hexdigest()[:12] if code else ""
+    iter_id = int(state.get("iteration_count", 0)) + 1
+    return {
+        "iteration_id": iter_id,
+        "code_hash": code_hash,
+        "preflight_issues": preflight_issues or [],
+        "runtime_error": runtime_error,
+        "outputs_present": outputs_present,
+        "outputs_missing": outputs_missing,
+        "reviewer_verdict": reviewer_verdict or "UNKNOWN",
+        "reviewer_reasons": reviewer_reasons or [],
+        "qa_verdict": qa_verdict or "UNKNOWN",
+        "qa_reasons": qa_reasons or [],
+        "next_actions": next_actions or [],
+    }
+
 def _build_iteration_memory(
     iter_id: int,
     metrics_report: Dict[str, Any],
@@ -3463,6 +3690,7 @@ class AgentState(TypedDict):
     iteration_count: int
     ml_iteration_memory: List[Dict[str, Any]]
     ml_iteration_memory_block: str
+    ml_journal_written_ids: List[int]
     metrics_signature: str
     weights_signature: str
     execution_output_stale: bool
@@ -3660,6 +3888,7 @@ def run_steward(state: AgentState) -> AgentState:
         "metric_iterations": 0,
         "compliance_passed": False,
         "last_iteration_type": None,
+        "ml_journal_written_ids": [],
         "feedback_history": [],
         "has_partial_visuals": False,
         "plots_local": [],
@@ -5353,6 +5582,12 @@ def run_engineer(state: AgentState) -> AgentState:
     availability_summary = (execution_contract or {}).get("availability_summary", "")
     iteration_memory = list(state.get("ml_iteration_memory", []) or [])
     iteration_memory_block = state.get("ml_iteration_memory_block", "")
+    iter_id = int(state.get("iteration_count", 0)) + 1
+    if run_id and iter_id >= 2:
+        journal_entries = _load_ml_iteration_journal(run_id)
+        journal_block = _build_ml_iteration_memory_block(journal_entries)
+        if journal_block:
+            iteration_memory_block = journal_block
     compliance_checklist = (execution_contract or {}).get("compliance_checklist", [])
     if compliance_checklist and not state.get("compliance_passed", False):
         checklist_payload = "COMPLIANCE_BOOTSTRAP_CHECKLIST:\n" + json.dumps(compliance_checklist, ensure_ascii=True)
@@ -6088,12 +6323,36 @@ def run_ml_preflight(state: AgentState) -> AgentState:
         fix_block = _build_fix_instructions(expanded)
         if fix_block:
             gate_context["edit_instructions"] = fix_block
+        if run_id:
+            outputs_state = _collect_outputs_state(_resolve_required_outputs(contract))
+            reviewer_reasons = _normalize_reason_tags(feedback, issues)
+            next_actions = _suggest_next_actions(issues, outputs_state["missing"], reviewer_reasons, [])
+            entry = _build_ml_iteration_journal_entry(
+                state,
+                preflight_issues=issues,
+                runtime_error=None,
+                outputs_present=outputs_state["present"],
+                outputs_missing=outputs_state["missing"],
+                reviewer_verdict="REJECTED",
+                reviewer_reasons=reviewer_reasons,
+                qa_verdict=None,
+                qa_reasons=[],
+                next_actions=next_actions,
+            )
+            written_ids = _append_ml_iteration_journal(
+                run_id,
+                entry,
+                state.get("ml_journal_written_ids"),
+            )
+        else:
+            written_ids = state.get("ml_journal_written_ids")
         return {
             "ml_preflight_failed": True,
             "feedback_history": history,
             "last_gate_context": gate_context,
             "review_verdict": "REJECTED",
             "review_feedback": feedback,
+            "ml_journal_written_ids": written_ids,
         }
     if manifest_dump_missing_default(code):
         feedback = "ML_JSON_SERIALIZATION_GUARD: json.dump must use default=_json_default to serialize numpy/pandas types."
@@ -6106,12 +6365,36 @@ def run_ml_preflight(state: AgentState) -> AgentState:
             "failed_gates": ["JSON_SERIALIZATION_GUARD"],
             "required_fixes": ["Add json.dump(..., default=_json_default) and define _json_default helper."],
         }
+        if run_id:
+            outputs_state = _collect_outputs_state(_resolve_required_outputs(contract))
+            reviewer_reasons = _normalize_reason_tags(feedback, ["JSON_SERIALIZATION_GUARD"])
+            next_actions = _suggest_next_actions(["JSON_SERIALIZATION_GUARD"], outputs_state["missing"], reviewer_reasons, [])
+            entry = _build_ml_iteration_journal_entry(
+                state,
+                preflight_issues=["JSON_SERIALIZATION_GUARD"],
+                runtime_error=None,
+                outputs_present=outputs_state["present"],
+                outputs_missing=outputs_state["missing"],
+                reviewer_verdict="REJECTED",
+                reviewer_reasons=reviewer_reasons,
+                qa_verdict=None,
+                qa_reasons=[],
+                next_actions=next_actions,
+            )
+            written_ids = _append_ml_iteration_journal(
+                run_id,
+                entry,
+                state.get("ml_journal_written_ids"),
+            )
+        else:
+            written_ids = state.get("ml_journal_written_ids")
         return {
             "ml_preflight_failed": True,
             "feedback_history": history,
             "last_gate_context": gate_context,
             "review_verdict": "REJECTED",
             "review_feedback": feedback,
+            "ml_journal_written_ids": written_ids,
         }
     return {"ml_preflight_failed": False}
 
@@ -7143,6 +7426,29 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     result_state["ml_iteration_memory"] = iteration_memory
     result_state["ml_iteration_memory_block"] = edit_block
 
+    if run_id:
+        outputs_state = _collect_outputs_state(_resolve_required_outputs(contract))
+        reviewer_reasons = _normalize_reason_tags(review_feedback, failed_gates)
+        next_actions = _suggest_next_actions([], outputs_state["missing"], reviewer_reasons, [])
+        entry = _build_ml_iteration_journal_entry(
+            state,
+            preflight_issues=[],
+            runtime_error=None,
+            outputs_present=outputs_state["present"],
+            outputs_missing=outputs_state["missing"],
+            reviewer_verdict=status,
+            reviewer_reasons=reviewer_reasons,
+            qa_verdict=None,
+            qa_reasons=[],
+            next_actions=next_actions,
+        )
+        written_ids = _append_ml_iteration_journal(
+            run_id,
+            entry,
+            state.get("ml_journal_written_ids"),
+        )
+        result_state["ml_journal_written_ids"] = written_ids
+
     if status == "NEEDS_IMPROVEMENT":
         result_state["iteration_count"] = state.get("iteration_count", 0) + 1
     if run_id:
@@ -7246,13 +7552,40 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
                 print(f"Warning: failed to persist ml_engineer_failure_explainer.txt: {exp_err}")
     except Exception as expl_err:
         print(f"Warning: ML failure explainer failed during runtime fix: {expl_err}")
-    
+    run_id = state.get("run_id")
+    if run_id:
+        contract = state.get("execution_contract", {}) or {}
+        outputs_state = _collect_outputs_state(_resolve_required_outputs(contract))
+        reviewer_feedback = state.get("review_feedback") or ""
+        reviewer_reasons = _normalize_reason_tags(reviewer_feedback, [])
+        next_actions = _suggest_next_actions([], outputs_state["missing"], reviewer_reasons, [])
+        entry = _build_ml_iteration_journal_entry(
+            state,
+            preflight_issues=[],
+            runtime_error=_summarize_runtime_error(output),
+            outputs_present=outputs_state["present"],
+            outputs_missing=outputs_state["missing"],
+            reviewer_verdict=state.get("review_verdict"),
+            reviewer_reasons=reviewer_reasons,
+            qa_verdict=None,
+            qa_reasons=[],
+            next_actions=next_actions,
+        )
+        written_ids = _append_ml_iteration_journal(
+            run_id,
+            entry,
+            state.get("ml_journal_written_ids"),
+        )
+    else:
+        written_ids = state.get("ml_journal_written_ids")
+
     return {
         "last_gate_context": error_context,
          # We add error to history so it persists
         "feedback_history": state.get("feedback_history", []) + [f"RUNTIME ERROR (Attempt {fix_attempt}/{max_runtime_fixes}):\n{output[-500:]}"],
         "ml_engineer_audit_override": ml_override,
         "runtime_fix_count": base_fix_count if terminal_fix else fix_attempt,
+        "ml_journal_written_ids": written_ids,
     }
 
 def finalize_runtime_failure(state: AgentState) -> AgentState:

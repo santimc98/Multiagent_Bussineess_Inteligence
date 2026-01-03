@@ -1423,6 +1423,40 @@ class ExecutionPlannerAgent:
                 contract["availability_summary"] = ""
             return contract
 
+        def _attach_counterfactual_policy(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            if contract.get("counterfactual_policy"):
+                return contract
+            decision_vars = contract.get("decision_variables") or []
+            if not isinstance(decision_vars, list) or not decision_vars:
+                return contract
+            availability_summary = contract.get("availability_summary") or ""
+            feature_availability = contract.get("feature_availability") or []
+            reqs = contract.get("data_requirements") or []
+            combined_text = " ".join(
+                [
+                    availability_summary,
+                    json.dumps(feature_availability, ensure_ascii=True) if isinstance(feature_availability, list) else "",
+                    json.dumps(reqs, ensure_ascii=True) if isinstance(reqs, list) else "",
+                    data_summary or "",
+                ]
+            ).lower()
+            evidence_tokens = [
+                "random", "randomized", "experiment", "a/b", "ab test", "treatment",
+                "control", "holdout", "policy change", "uplift", "causal", "instrument",
+            ]
+            has_counterfactual = any(tok in combined_text for tok in evidence_tokens)
+            if not has_counterfactual:
+                contract["counterfactual_policy"] = "observational_only"
+                contract["recommendation_scope"] = "within_observed_support_only"
+                contract["required_limitations_section"] = True
+                contract["required_next_steps"] = True
+            else:
+                contract["counterfactual_policy"] = "counterfactual_supported"
+                contract["recommendation_scope"] = "supported_by_experiment"
+            return contract
+
         def _ensure_iteration_policy(contract: Dict[str, Any]) -> Dict[str, Any]:
             if not isinstance(contract, dict):
                 return contract
@@ -1883,6 +1917,7 @@ class ExecutionPlannerAgent:
             contract = _attach_variable_semantics(contract)
             contract = _apply_artifact_schemas(contract)
             contract = _ensure_availability_reasoning(contract)
+            contract = _attach_counterfactual_policy(contract)
             contract = _attach_alignment_requirements(contract)
             contract = _ensure_iteration_policy(contract)
             return _attach_spec_extraction_to_runbook(contract)
@@ -2001,6 +2036,7 @@ Return the contract JSON.
             contract = _attach_variable_semantics(contract)
             contract = _apply_artifact_schemas(contract)
             contract = _ensure_availability_reasoning(contract)
+            contract = _attach_counterfactual_policy(contract)
             contract = _attach_alignment_requirements(contract)
             contract = _ensure_iteration_policy(contract)
             return _attach_spec_extraction_to_runbook(contract)
