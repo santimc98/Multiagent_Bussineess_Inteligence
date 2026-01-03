@@ -39,7 +39,6 @@ class DataEngineerAgent:
         Generates a Python script to clean and standardize the dataset.
         """
         from src.utils.prompting import render_prompt
-        from src.utils.static_safety_scan import scan_code_safety
         import json
 
         contract_json = json.dumps(execution_contract or {}, indent=2)
@@ -148,15 +147,6 @@ class DataEngineerAgent:
             print("DEBUG: DeepSeek response received.")
             
             code = self._clean_code(content)
-            
-            # STATIC SAFETY SCAN
-            is_safe, violations = scan_code_safety(code)
-            if not is_safe:
-                error_msg = f"Security Check Failed. Violations: {violations}"
-                print(f"CRITICAL: {error_msg}")
-                # Return a script that raises the error so the Reviewer catches it
-                return f"raise ValueError('GENERATED CODE BLOCKED BY STATIC SCAN: {violations}')"
-
             return code
             
         except Exception as e:

@@ -189,7 +189,7 @@ def _align_quality_gates(
         "status": status,
         "mapped_gates": mapped,
         "unmapped_gates": unmapped,
-        "available_metrics": sorted(metric_pool.keys()),
+        "available_metrics": sorted(metric_pool.keys()) if metric_pool else None,
     }
 
 
@@ -353,16 +353,16 @@ def _calc_lift(baseline: float | None, model: float | None, higher_is_better: bo
     return (baseline - model) / baseline
 
 
-def _segment_coverage(case_summary: pd.DataFrame | None, min_size: int | None) -> Tuple[float | None, int]:
+def _segment_coverage(case_summary: pd.DataFrame | None, min_size: int | None) -> Tuple[float | None, int | None]:
     if case_summary is None or min_size is None or "Segment_Size" not in case_summary.columns:
-        return None, 0
+        return None, None
     try:
         small = case_summary["Segment_Size"].astype(float) < float(min_size)
         if small.empty:
-            return None, 0
+            return None, None
         return float(small.mean()), int(small.sum())
     except Exception:
-        return None, 0
+        return None, None
 
 
 def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -371,6 +371,7 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
     metrics_report = _safe_load_json("data/metrics.json")
     cleaned = _safe_load_csv("data/cleaned_data.csv")
     case_summary = _safe_load_csv("data/case_summary.csv")
+    base_missing = cleaned is None or (not metrics_report and not weights)
 
     metric_pool = _extract_metric_pool(weights, metrics_report)
     cls_preference = ["f1", "roc_auc", "auc", "pr_auc", "average_precision", "accuracy", "precision", "recall"]
@@ -451,7 +452,26 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
     small_segment_frac, small_segment_count = _segment_coverage(case_summary, min_segment_size)
     gate_alignment = _align_quality_gates(quality_gates, metric_pool)
 
+    if base_missing:
+        metric_pool = {}
+        cls_metric_name = cls_metric = cls_baseline_name = cls_baseline = None
+        reg_metric_name = reg_metric = reg_baseline_name = reg_baseline = None
+        cls_lift = reg_lift = None
+        f1 = f1_baseline = f1_lift = None
+        mae = mae_baseline = mae_lift = None
+        row_count = None
+        feature_count = None
+        rows_per_feature = None
+        class_balance = None
+        target_kind = None
+        small_segment_frac = None
+        small_segment_count = None
+        auc_proxy = {"best_auc": None, "best_feature": None}
+        reg_proxy = {"best_abs_spearman": None, "best_feature": None, "best_r2_proxy": None}
+
     reasons: List[str] = []
+    if base_missing:
+        reasons.append("pipeline_aborted_before_metrics")
     signals: Dict[str, Any] = {
         "row_count": row_count,
         "feature_count": feature_count,
@@ -484,24 +504,24 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         "available_metrics": sorted(metric_pool.keys()),
     }
 
-    if cls_metric is None:
+    if not base_missing and cls_metric is None:
         reasons.append("classification_metric_missing")
-    if reg_metric is None:
+    if not base_missing and reg_metric is None:
         reasons.append("regression_metric_missing")
-    if cls_metric is not None and cls_baseline is None:
+    if not base_missing and cls_metric is not None and cls_baseline is None:
         reasons.append("classification_baseline_missing")
-    if reg_metric is not None and reg_baseline is None:
+    if not base_missing and reg_metric is not None and reg_baseline is None:
         reasons.append("regression_baseline_missing")
 
-    if cls_lift is not None and cls_lift < 0.05:
+    if not base_missing and cls_lift is not None and cls_lift < 0.05:
         reasons.append("classification_lift_low")
-    if reg_lift is not None and reg_lift < 0.1:
+    if not base_missing and reg_lift is not None and reg_lift < 0.1:
         reasons.append("regression_lift_low")
-    if rows_per_feature is not None and rows_per_feature < 10:
+    if not base_missing and rows_per_feature is not None and rows_per_feature < 10:
         reasons.append("high_dimensionality_low_sample")
-    if class_balance is not None and (class_balance < 0.1 or class_balance > 0.9):
+    if not base_missing and class_balance is not None and (class_balance < 0.1 or class_balance > 0.9):
         reasons.append("class_imbalance")
-    if small_segment_frac is not None and small_segment_frac > 0.3:
+    if not base_missing and small_segment_frac is not None and small_segment_frac > 0.3:
         reasons.append("segments_too_small")
 
     if auc_proxy.get("best_auc") is not None:
@@ -547,9 +567,12 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
     if "classification_baseline_missing" in reasons or "regression_baseline_missing" in reasons:
         recommendations.append("Include baseline metrics (dummy/naive) to quantify lift over trivial models.")
 
-    status = "data_limited" if data_limited else "sufficient_signal"
-    if cls_metric is None or reg_metric is None:
+    if base_missing:
         status = "insufficient_signal"
+    else:
+        status = "data_limited" if data_limited else "sufficient_signal"
+        if cls_metric is None or reg_metric is None:
+            status = "insufficient_signal"
     threshold = int(state.get("data_adequacy_threshold", 3) or 3)
     consecutive = int(state.get("data_adequacy_consecutive", 0) or 0)
 

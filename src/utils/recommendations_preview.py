@@ -105,6 +105,21 @@ def _count_present(paths: List[str], file_set: set[str]) -> Tuple[int, List[str]
     return len(present), present
 
 
+def _normalize_produced_index(entries: Any) -> set[str]:
+    file_set: set[str] = set()
+    if isinstance(entries, dict):
+        entries = entries.get("present") or entries.get("paths") or []
+    if isinstance(entries, list):
+        for item in entries:
+            if isinstance(item, dict):
+                path = item.get("path")
+            else:
+                path = item
+            if path:
+                file_set.add(str(path).replace("\\", "/"))
+    return file_set
+
+
 def _load_output_contract_report(root_dir: str) -> Dict[str, Any]:
     if not root_dir:
         return {}
@@ -463,9 +478,14 @@ def _score_source_root(
     root_dir: str,
     deliverable_spec: Dict[str, Any],
     blocking_reasons: List[str] | None = None,
+    file_set_override: set[str] | None = None,
 ) -> Dict[str, Any]:
-    files = _list_downloaded_files(root_dir) if root_dir and os.path.isdir(root_dir) else []
-    file_set = set(files)
+    files = []
+    if file_set_override is not None:
+        file_set = set(file_set_override)
+    else:
+        files = _list_downloaded_files(root_dir) if root_dir and os.path.isdir(root_dir) else []
+        file_set = set(files)
     required_paths = deliverable_spec.get("required_paths") or []
     optional_paths = deliverable_spec.get("optional_paths") or []
     requires_plots = bool(deliverable_spec.get("requires_plots"))
@@ -478,7 +498,8 @@ def _score_source_root(
     output_report = _load_output_contract_report(root_dir)
     reasons = list(blocking_reasons or [])
     if required_total and not output_report:
-        reasons.append("output_contract_missing")
+        if file_set_override is None or "data/output_contract_report.json" not in file_set_override:
+            reasons.append("output_contract_missing")
     missing_required = output_report.get("missing", []) if isinstance(output_report, dict) else []
     if missing_required:
         reasons.append("output_contract_missing")
@@ -544,10 +565,21 @@ def build_recommendations_preview(
     governance_summary: Dict[str, Any] | None,
     artifacts_dir: str,
     cleaned_data_path: str | None = None,
+    produced_artifact_index: Any | None = None,
+    run_scoped_root: str | None = None,
 ) -> Dict[str, Any]:
     contract = contract or {}
     policy = _normalize_reporting_policy(contract)
     deliverable_spec = _normalize_deliverables(contract)
+    artifacts_dir = artifacts_dir or ""
+    artifacts_abs = os.path.abspath(artifacts_dir) if artifacts_dir else ""
+    run_root_abs = os.path.abspath(run_scoped_root) if run_scoped_root else ""
+    root_out_of_scope = False
+    if run_root_abs and artifacts_abs:
+        try:
+            root_out_of_scope = os.path.commonpath([artifacts_abs, run_root_abs]) != run_root_abs
+        except ValueError:
+            root_out_of_scope = True
     governance_summary = governance_summary or {}
     run_outcome = governance_summary.get("run_outcome") or governance_summary.get("status") or "UNKNOWN"
     counterfactual_policy = contract.get("counterfactual_policy") or "unknown"
@@ -602,10 +634,34 @@ def build_recommendations_preview(
             vals = governance_summary.get(key)
             if isinstance(vals, list):
                 artifact_blocking.extend([str(v) for v in vals if v])
-    artifacts_eval = _score_source_root(artifacts_dir, deliverable_spec, artifact_blocking)
+    produced_file_set = _normalize_produced_index(produced_artifact_index)
+    if root_out_of_scope:
+        artifacts_eval = {
+            "root": artifacts_dir,
+            "files": [],
+            "integrity_pass": False,
+            "reasons": ["root_out_of_scope"],
+            "score": -1e9,
+            "score_breakdown": {
+                "required_present": 0,
+                "required_total": len(deliverable_spec.get("required_paths") or []),
+                "optional_present": 0,
+                "plots_present": False,
+                "required_ratio": 0.0,
+            },
+            "present_required": [],
+            "present_optional": [],
+        }
+    else:
+        artifacts_eval = _score_source_root(
+            artifacts_dir,
+            deliverable_spec,
+            artifact_blocking,
+            produced_file_set if produced_file_set else None,
+        )
     sources_checked.append(
         {
-            "attempt_root": os.path.abspath(artifacts_dir),
+            "attempt_root": artifacts_abs or artifacts_dir,
             "integrity_pass": artifacts_eval["integrity_pass"],
             "reasons": artifacts_eval["reasons"],
             "score_breakdown": artifacts_eval["score_breakdown"],

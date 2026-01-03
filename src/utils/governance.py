@@ -173,6 +173,9 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
         failed_gates.extend(case_alignment.get("failures", []))
     if isinstance(output_contract, dict) and output_contract.get("missing"):
         failed_gates.append("output_contract_missing")
+    pipeline_aborted = state.get("pipeline_aborted_reason")
+    if pipeline_aborted:
+        failed_gates.append(f"pipeline_aborted:{pipeline_aborted}")
     adequacy_summary = {}
     if isinstance(data_adequacy, dict):
         alignment = data_adequacy.get("quality_gates_alignment", {}) if isinstance(data_adequacy, dict) else {}
@@ -224,7 +227,7 @@ def build_run_summary(state: Dict[str, Any]) -> Dict[str, Any]:
     ]
     critical_hit = any(any(tok in gate for tok in critical_tokens) for gate in failed_gates_lower)
     output_missing = bool(isinstance(output_contract, dict) and output_contract.get("missing"))
-    if output_missing or critical_hit or status in {"REJECTED", "FAIL", "CRASH"}:
+    if output_missing or critical_hit or status in {"REJECTED", "FAIL", "CRASH"} or pipeline_aborted or state.get("data_engineer_failed"):
         run_outcome = "NO_GO"
     else:
         counterfactual_policy = ""

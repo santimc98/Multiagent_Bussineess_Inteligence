@@ -68,6 +68,7 @@ from src.utils.run_bundle import (
     copy_run_contracts,
     copy_run_reports,
     write_run_manifest,
+    get_run_dir,
 )
 from src.utils.run_storage import (
     init_run_dir,
@@ -112,6 +113,77 @@ def _normalize_path_posix(path: str) -> str:
         return Path(path).as_posix()
     except Exception:
         return str(path).replace("\\", "/")
+
+
+def _hash_text(text: str) -> str:
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
+def _apply_static_autofixes(code: str) -> tuple[str, List[Dict[str, Any]]]:
+    if not code:
+        return code, []
+    fixes: List[Dict[str, Any]] = []
+    updated = code
+    for pattern, replacement, label in [
+        (r"\bnp\.bool\b", "np.bool_", "np.bool->np.bool_"),
+    ]:
+        before_hash = _hash_text(updated)
+        updated, count = re.subn(pattern, replacement, updated)
+        if count:
+            fixes.append(
+                {
+                    "rule": label,
+                    "count": int(count),
+                    "before_hash": before_hash,
+                    "after_hash": _hash_text(updated),
+                }
+            )
+    return updated, fixes
+
+
+def _collect_violation_snippets(code: str, violations: List[str], max_lines: int = 12) -> List[str]:
+    if not code or not violations:
+        return []
+    tokens: List[str] = []
+    for violation in violations:
+        if "np.bool" in violation:
+            tokens.append("np.bool")
+        matches = re.findall(r"'([^']+)'", str(violation))
+        for match in matches:
+            if match and match not in tokens:
+                tokens.append(match)
+    if not tokens:
+        return []
+    lines = code.splitlines()
+    snippets: List[str] = []
+    for idx, line in enumerate(lines, start=1):
+        if any(tok in line for tok in tokens):
+            snippets.append(f"L{idx}: {line.strip()}")
+            if len(snippets) >= max_lines:
+                break
+    return snippets
+
+
+def _persist_output_contract_report(
+    state: Dict[str, Any],
+    reason: str | None = None,
+    path: str = "data/output_contract_report.json",
+) -> Dict[str, Any]:
+    contract = state.get("execution_contract", {}) if isinstance(state, dict) else {}
+    deliverables = (contract.get("spec_extraction") or {}).get("deliverables")
+    output_contract = deliverables if isinstance(deliverables, list) and deliverables else contract.get("required_outputs", [])
+    report = check_required_outputs(output_contract)
+    if reason:
+        report["reason"] = reason
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+    return report
 
 def _stage_illustrative_assets(
     source_root: str,
@@ -4375,10 +4447,16 @@ def run_data_engineer(state: AgentState) -> AgentState:
     if not ok:
         if run_id:
             log_run_event(run_id, "budget_exceeded", {"label": "data_engineer", "error": err_msg})
+        if run_id:
+            log_run_event(run_id, "pipeline_aborted_reason", {"reason": "data_engineer_budget_exceeded"})
+        oc_report = _persist_output_contract_report(state, reason="data_engineer_budget_exceeded")
         return {
             "cleaning_code": "",
             "cleaned_data_preview": "Error: Budget Exceeded",
             "error_message": err_msg,
+            "output_contract_report": oc_report,
+            "pipeline_aborted_reason": "data_engineer_budget_exceeded",
+            "data_engineer_failed": True,
             "budget_counters": counters,
         }
     attempt_id = int(state.get("data_engineer_attempt", 0)) + 1
@@ -4477,10 +4555,16 @@ def run_data_engineer(state: AgentState) -> AgentState:
     if plan:
         if force_code_mode:
             msg = "CLEANING_PLAN_NOT_ALLOWED: expected Python cleaning code."
+            if run_id:
+                log_run_event(run_id, "pipeline_aborted_reason", {"reason": "data_engineer_plan_not_allowed"})
+            oc_report = _persist_output_contract_report(state, reason="data_engineer_plan_not_allowed")
             return {
                 "cleaning_code": code,
                 "cleaned_data_preview": "Error: Plan Output",
                 "error_message": msg,
+                "output_contract_report": oc_report,
+                "pipeline_aborted_reason": "data_engineer_plan_not_allowed",
+                "data_engineer_failed": True,
                 "budget_counters": counters,
             }
         is_plan = True
@@ -4494,36 +4578,102 @@ def run_data_engineer(state: AgentState) -> AgentState:
             print(f"Warning: failed to persist data_engineer_last_plan.json: {art_err}")
         if plan_issues:
             msg = "CLEANING_PLAN_INVALID: " + "; ".join(plan_issues)
+            if run_id:
+                log_run_event(run_id, "pipeline_aborted_reason", {"reason": "data_engineer_plan_invalid"})
+            oc_report = _persist_output_contract_report(state, reason="data_engineer_plan_invalid")
             return {
                 "cleaning_code": code,
                 "cleaned_data_preview": "Error: Invalid Plan",
                 "error_message": msg,
+                "output_contract_report": oc_report,
+                "pipeline_aborted_reason": "data_engineer_plan_invalid",
+                "data_engineer_failed": True,
                 "budget_counters": counters,
             }
     
     # Check if generation failed
     if code.strip().startswith("# Error"):
         print(f"Correction: Data Engineer failed to generate code. Error: {code}")
+        if run_id:
+            log_run_event(run_id, "pipeline_aborted_reason", {"reason": "data_engineer_generation_failed"})
+        oc_report = _persist_output_contract_report(state, reason="data_engineer_generation_failed")
         return {
             "cleaning_code": code,
             "cleaned_data_preview": "Error: Generation Failed",
             "error_message": code,
+            "output_contract_report": oc_report,
+            "pipeline_aborted_reason": "data_engineer_generation_failed",
+            "data_engineer_failed": True,
             "budget_counters": counters,
         }
 
-    if "GENERATED CODE BLOCKED BY STATIC SCAN" in code:
+    original_code = code
+    code, auto_fixes = _apply_static_autofixes(code)
+    if auto_fixes and run_id:
+        log_run_event(run_id, "auto_fix_applied", {"attempt": attempt_id, "fixes": auto_fixes})
+        run_dir = get_run_dir(run_id)
+        if run_dir:
+            try:
+                base = os.path.join(run_dir, "agents", "data_engineer", f"iteration_{attempt_id}")
+                os.makedirs(base, exist_ok=True)
+                with open(os.path.join(base, "script.py"), "w", encoding="utf-8") as f_script:
+                    f_script.write(code)
+            except Exception:
+                pass
+    is_safe, violations = scan_code_safety(code)
+    if not is_safe:
+        snippets = _collect_violation_snippets(original_code, violations)
+        if run_id:
+            log_run_event(
+                run_id,
+                "static_scan_failed",
+                {"attempt": attempt_id, "violations": violations, "snippets": snippets},
+            )
+        run_dir = get_run_dir(run_id) if run_id else None
+        if run_dir:
+            try:
+                base = os.path.join(run_dir, "agents", "data_engineer", f"iteration_{attempt_id}")
+                os.makedirs(base, exist_ok=True)
+                with open(os.path.join(base, "script_blocked.py"), "w", encoding="utf-8") as f_blocked:
+                    f_blocked.write(original_code)
+                blocked_reason = {
+                    "violations": violations,
+                    "snippets": snippets,
+                    "auto_fixes_applied": auto_fixes,
+                }
+                with open(os.path.join(base, "blocked_reason.json"), "w", encoding="utf-8") as f_reason:
+                    json.dump(blocked_reason, f_reason, indent=2)
+                guard_code = f"raise ValueError('GENERATED CODE BLOCKED BY STATIC SCAN: {violations}')"
+                with open(os.path.join(base, "script.py"), "w", encoding="utf-8") as f_guard:
+                    f_guard.write(guard_code)
+            except Exception:
+                pass
         if not state.get("de_static_guard_retry_done"):
             new_state = dict(state)
             new_state["de_static_guard_retry_done"] = True
             base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-            payload = "SECURITY_VIOLATION_CONTEXT:\n" + code.strip()
+            context_payload = {
+                "violations": violations,
+                "snippets": snippets,
+                "auto_fixes_applied": auto_fixes,
+            }
+            payload = "STATIC_SCAN_VIOLATIONS:\n" + json.dumps(context_payload, indent=2, ensure_ascii=False)
             new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+            if run_id:
+                log_run_event(run_id, "static_scan_retry", {"attempt": attempt_id, "violations": violations})
             print("Static scan guard: retrying Data Engineer with violation context.")
             return run_data_engineer(new_state)
+        if run_id:
+            log_run_event(run_id, "pipeline_aborted_reason", {"reason": "data_engineer_static_scan_failed"})
+        oc_report = _persist_output_contract_report(state, reason="data_engineer_static_scan_failed")
+        guard_code = f"raise ValueError('GENERATED CODE BLOCKED BY STATIC SCAN: {violations}')"
         return {
-            "cleaning_code": code,
+            "cleaning_code": guard_code,
             "cleaned_data_preview": "Error: Security Blocked",
             "error_message": "CRITICAL: cleaning code blocked by static scan.",
+            "output_contract_report": oc_report,
+            "pipeline_aborted_reason": "data_engineer_static_scan_failed",
+            "data_engineer_failed": True,
             "budget_counters": counters,
         }
 
@@ -4591,15 +4741,21 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     pass
                 new_state["data_engineer_audit_override"] = override
                 print("Preflight guard: retrying Data Engineer with explainer context.")
-                return run_data_engineer(new_state)
-            return {
-                "cleaning_code": code,
-                "cleaned_data_preview": "Preflight Failed",
-                "error_message": msg,
-                "feedback_history": fh,
-                "last_gate_context": lgc,
-                "budget_counters": counters,
-            }
+            return run_data_engineer(new_state)
+        if run_id:
+            log_run_event(run_id, "pipeline_aborted_reason", {"reason": "data_engineer_preflight_failed"})
+        oc_report = _persist_output_contract_report(state, reason="data_engineer_preflight_failed")
+        return {
+            "cleaning_code": code,
+            "cleaned_data_preview": "Preflight Failed",
+            "error_message": msg,
+            "feedback_history": fh,
+            "last_gate_context": lgc,
+            "output_contract_report": oc_report,
+            "pipeline_aborted_reason": "data_engineer_preflight_failed",
+            "data_engineer_failed": True,
+            "budget_counters": counters,
+        }
 
     # 0a. Undefined name preflight for Data Engineer code
     if not is_plan:
@@ -4623,11 +4779,17 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 return run_data_engineer(new_state)
             fh = list(state.get("feedback_history", []))
             fh.append(msg)
+            if run_id:
+                log_run_event(run_id, "pipeline_aborted_reason", {"reason": "data_engineer_undefined_names"})
+            oc_report = _persist_output_contract_report(state, reason="data_engineer_undefined_names")
             return {
                 "cleaning_code": code,
                 "cleaned_data_preview": "Preflight Failed",
                 "error_message": msg,
                 "feedback_history": fh,
+                "output_contract_report": oc_report,
+                "pipeline_aborted_reason": "data_engineer_undefined_names",
+                "data_engineer_failed": True,
                 "budget_counters": counters,
             }
 
@@ -4648,10 +4810,16 @@ def run_data_engineer(state: AgentState) -> AgentState:
             new_state["data_engineer_audit_override"] = override
             print("Contract literal guard triggered: retrying Data Engineer with safety instructions.")
             return run_data_engineer(new_state)
+        if run_id:
+            log_run_event(run_id, "pipeline_aborted_reason", {"reason": "data_engineer_json_literals"})
+        oc_report = _persist_output_contract_report(state, reason="data_engineer_json_literals")
         return {
             "cleaning_code": code,
             "cleaned_data_preview": "Error: Contract Literal Guard",
             "error_message": "CRITICAL: JSON literals (null/true/false) found in Python code.",
+            "output_contract_report": oc_report,
+            "pipeline_aborted_reason": "data_engineer_json_literals",
+            "data_engineer_failed": True,
             "budget_counters": counters,
         }
 
@@ -4669,10 +4837,16 @@ def run_data_engineer(state: AgentState) -> AgentState:
             print("Manifest JSON guard triggered: retrying Data Engineer with safety instructions.")
             return run_data_engineer(new_state)
         else:
+            if run_id:
+                log_run_event(run_id, "pipeline_aborted_reason", {"reason": "data_engineer_manifest_guard"})
+            oc_report = _persist_output_contract_report(state, reason="data_engineer_manifest_guard")
             return {
                 "cleaning_code": code,
                 "cleaned_data_preview": "Error: Manifest JSON Guard",
                 "error_message": "CRITICAL: Manifest serialization must use json.dump(..., default=_json_default).",
+                "output_contract_report": oc_report,
+                "pipeline_aborted_reason": "data_engineer_manifest_guard",
+                "data_engineer_failed": True,
                 "budget_counters": counters,
             }
 
@@ -4693,26 +4867,18 @@ def run_data_engineer(state: AgentState) -> AgentState:
             print("⚠️ DIALECT_GUARD: retrying Data Engineer with enforced dialect instructions.")
             return run_data_engineer(new_state)
         else:
+            if run_id:
+                log_run_event(run_id, "pipeline_aborted_reason", {"reason": "data_engineer_dialect_guard"})
+            oc_report = _persist_output_contract_report(state, reason="data_engineer_dialect_guard")
             return {
                 "cleaning_code": code,
                 "cleaned_data_preview": "Error: Dialect Guard",
                 "error_message": "CRITICAL: pd.read_csv must use provided dialect parameters.",
+                "output_contract_report": oc_report,
+                "pipeline_aborted_reason": "data_engineer_dialect_guard",
+                "data_engineer_failed": True,
                 "budget_counters": counters,
             }
-
-    # STATIC SAFETY SCAN FOR CLEANING CODE (HARDENING)
-    is_safe, violations = (True, [])
-    if not is_plan:
-        is_safe, violations = scan_code_safety(code)
-    if not is_safe:
-        failure_reason = "CRITICAL: Security Violations:\n" + "\n".join(violations)
-        print(f"🚫 Security Block (Data Engineer): {failure_reason}")
-        return {
-            "cleaning_code": code,
-            "cleaned_data_preview": "Security Block",
-            "error_message": f"Cleaning Code Blocked: {failure_reason}",
-            "budget_counters": counters,
-        }
 
     # Execute in E2B Sandbox
     try:
@@ -6702,23 +6868,29 @@ def execute_code(state: AgentState) -> AgentState:
         "DF_COLUMN_ASSIGNMENT_FORBIDDEN",
     }
     fatal_hits = [issue for issue in preflight_issues if issue in fatal_preflight]
-    if fatal_hits:
-        msg = f"ML_PREFLIGHT_BLOCK: {', '.join(fatal_hits)}"
-        if unknown_cols:
-            preview = unknown_cols[:10]
-            msg += f" | Unknown columns ({len(unknown_cols)}): {preview}"
-        if forbidden_assignments:
-            preview = forbidden_assignments[:10]
-            msg += f" | Forbidden df column assignments ({len(forbidden_assignments)}): {preview}"
-        fh = list(state.get("feedback_history", []))
-        fh.append(msg)
-        if run_id:
-            payload = {"issues": fatal_hits}
+        if fatal_hits:
+            msg = f"ML_PREFLIGHT_BLOCK: {', '.join(fatal_hits)}"
             if unknown_cols:
-                payload["unknown_columns"] = unknown_cols
+                preview = unknown_cols[:10]
+                msg += f" | Unknown columns ({len(unknown_cols)}): {preview}"
             if forbidden_assignments:
-                payload["forbidden_df_assignments"] = forbidden_assignments
-            log_run_event(run_id, "ml_preflight_blocked", payload)
+                preview = forbidden_assignments[:10]
+                msg += f" | Forbidden df column assignments ({len(forbidden_assignments)}): {preview}"
+            snippet_tokens = [f"'{col}'" for col in (unknown_cols + forbidden_assignments)[:10]]
+            snippets = _collect_violation_snippets(code, snippet_tokens)
+            if snippets:
+                msg += f" | Code refs: {snippets[:5]}"
+            fh = list(state.get("feedback_history", []))
+            fh.append(msg)
+            if run_id:
+                payload = {"issues": fatal_hits}
+                if unknown_cols:
+                    payload["unknown_columns"] = unknown_cols
+                if forbidden_assignments:
+                    payload["forbidden_df_assignments"] = forbidden_assignments
+                if snippets:
+                    payload["snippets"] = snippets
+                log_run_event(run_id, "ml_preflight_blocked", payload)
         return {
             "error_message": msg,
             "execution_output": msg,
@@ -7900,6 +8072,9 @@ def run_translator(state: AgentState) -> AgentState:
     report_state = dict(state)
     summary = None
     try:
+        if not os.path.exists("data/output_contract_report.json"):
+            reason = state.get("pipeline_aborted_reason") or "pipeline_aborted"
+            _persist_output_contract_report(state, reason=reason)
         summary = build_run_summary(state)
         os.makedirs("data", exist_ok=True)
         with open("data/run_summary.json", "w", encoding="utf-8") as f:
@@ -7941,11 +8116,39 @@ def run_translator(state: AgentState) -> AgentState:
             or stale_guard
         )
         cleaned_path = "data/cleaned_full.csv" if os.path.exists("data/cleaned_full.csv") else "data/cleaned_data.csv"
+        preview_root = None
+        run_dir = get_run_dir(run_id) if run_id else None
+        if run_id and not run_dir:
+            run_dir = os.path.join("runs", run_id)
+        if run_dir:
+            preview_root = os.path.join(run_dir, "artifacts")
+            try:
+                copy_run_artifacts(
+                    run_id,
+                    ["data", "reports", "static"],
+                    since_epoch=state.get("run_start_epoch"),
+                )
+            except Exception:
+                pass
+        produced_index = (
+            state.get("produced_artifact_index")
+            or state.get("artifact_index")
+            or _load_json_any("data/produced_artifact_index.json")
+        )
+        preview_cleaned_path = None
+        if preview_root:
+            candidate = os.path.join(preview_root, "data", "cleaned_data.csv")
+            if os.path.exists(candidate):
+                preview_cleaned_path = candidate
+        if not preview_cleaned_path and cleaned_path and os.path.exists(cleaned_path):
+            preview_cleaned_path = cleaned_path
         preview_payload = build_recommendations_preview(
             contract=contract,
             governance_summary=summary or {},
-            artifacts_dir=".",
-            cleaned_data_path=cleaned_path if os.path.exists(cleaned_path) else None,
+            artifacts_dir=preview_root or ".",
+            cleaned_data_path=preview_cleaned_path,
+            produced_artifact_index=produced_index,
+            run_scoped_root=run_dir,
         )
         chosen_source = preview_payload.get("chosen_source") if isinstance(preview_payload, dict) else {}
         if not artifacts_valid:

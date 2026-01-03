@@ -73,3 +73,5 @@ models/
 plots/
 reports/
 
+# Run-produced artifact indexes
+data/produced_artifact_index.json
