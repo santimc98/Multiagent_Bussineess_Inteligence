@@ -665,95 +665,27 @@ def _resolve_allowed_columns_for_gate(
     evaluation_spec: Dict[str, Any] | None = None,
 ) -> List[str]:
     allowed: List[str] = []
-    canonical = contract.get("canonical_columns") if isinstance(contract, dict) else None
-    if isinstance(canonical, list):
-        allowed.extend([str(col) for col in canonical if col])
-    allowed.extend(_resolve_contract_columns(contract))
+    csv_path = state.get("ml_data_path") or "data/cleaned_data.csv"
+    if not os.path.exists(csv_path) and os.path.exists("data/cleaned_full.csv"):
+        csv_path = "data/cleaned_full.csv"
+    if os.path.exists(csv_path):
+        try:
+            import pandas as pd
 
-    profile = state.get("profile") or state.get("dataset_profile")
-    if isinstance(profile, dict):
-        cols = profile.get("columns")
-        if isinstance(cols, list):
-            allowed.extend([str(col) for col in cols if col])
+            csv_sep = state.get("csv_sep", ",")
+            csv_decimal = state.get("csv_decimal", ".")
+            csv_encoding = state.get("csv_encoding", "utf-8")
+            header_df = pd.read_csv(csv_path, nrows=0, sep=csv_sep, decimal=csv_decimal, encoding=csv_encoding)
+            allowed.extend([str(col) for col in header_df.columns.tolist() if col])
+        except Exception:
+            pass
 
     if not allowed:
-        csv_path = "data/cleaned_data.csv"
-        if os.path.exists(csv_path):
-            try:
-                import pandas as pd
-
-                csv_sep = state.get("csv_sep", ",")
-                csv_decimal = state.get("csv_decimal", ".")
-                csv_encoding = state.get("csv_encoding", "utf-8")
-                header_df = pd.read_csv(csv_path, nrows=0, sep=csv_sep, decimal=csv_decimal, encoding=csv_encoding)
-                allowed.extend([str(col) for col in header_df.columns.tolist() if col])
-            except Exception:
-                pass
-
-    derived = _resolve_contract_columns(contract, sources={"derived", "output"})
-    if derived:
-        allowed.extend([str(col) for col in derived if col])
-
-    spec = contract.get("spec_extraction") if isinstance(contract, dict) else None
-    if isinstance(spec, dict):
-        derived_cols = spec.get("derived_columns")
-        if isinstance(derived_cols, list):
-            for col in derived_cols:
-                if isinstance(col, dict):
-                    name = col.get("name") or col.get("canonical_name")
-                elif isinstance(col, str):
-                    name = col
-                else:
-                    name = None
-                if name:
-                    allowed.append(str(name))
-
-    if isinstance(evaluation_spec, dict):
-        target = evaluation_spec.get("target")
-        if isinstance(target, dict):
-            name = target.get("name")
-            if name:
-                allowed.append(str(name))
-
-    extra_allowed = [
-        "prediction",
-        "pred",
-        "predicted",
-        "predicted_value",
-        "predicted_label",
-        "predicted_prob",
-        "probability",
-        "prob",
-        "score",
-        "risk_score",
-        "rank",
-        "ranking",
-        "segment",
-        "segment_id",
-        "cluster",
-        "cluster_id",
-        "group",
-        "group_id",
-        "row_id",
-        "case_id",
-        "caseid",
-        "id",
-        "expected_value",
-        "actual",
-        "label",
-    ]
-    allowed.extend(extra_allowed)
-    schema = contract.get("artifact_schemas") if isinstance(contract, dict) else None
-    if not isinstance(schema, dict):
-        spec = contract.get("spec_extraction") if isinstance(contract, dict) else None
-        if isinstance(spec, dict):
-            schema = spec.get("artifact_schemas")
-    if isinstance(schema, dict):
-        scored_schema = schema.get("data/scored_rows.csv")
-        if isinstance(scored_schema, dict):
-            extra_cols = scored_schema.get("allowed_extra_columns")
-            if isinstance(extra_cols, list):
-                allowed.extend([str(col) for col in extra_cols if col])
+        profile = state.get("profile") or state.get("dataset_profile")
+        if isinstance(profile, dict):
+            cols = profile.get("columns")
+            if isinstance(cols, list):
+                allowed.extend([str(col) for col in cols if col])
 
     seen: set[str] = set()
     deduped: List[str] = []
@@ -1174,6 +1106,9 @@ def _should_run_case_alignment(
 ) -> bool:
     if not isinstance(contract, dict):
         contract = {}
+    skip_reason = _case_alignment_skip_reason(contract, evaluation_spec)
+    if skip_reason:
+        return False
     required_outputs = _resolve_required_outputs(contract)
     required_set = {str(p) for p in (required_outputs or []) if p}
     requires_outputs = bool(
@@ -1188,6 +1123,27 @@ def _should_run_case_alignment(
         )
     flags = _resolve_eval_flags(evaluation_spec) if isinstance(evaluation_spec, dict) else {}
     return requires_outputs or spec_requires or bool(flags.get("requires_row_scoring"))
+
+def _case_alignment_skip_reason(
+    contract: Dict[str, Any] | None,
+    evaluation_spec: Dict[str, Any] | None = None,
+) -> str:
+    if not isinstance(contract, dict):
+        contract = {}
+    spec = contract.get("spec_extraction") or {}
+    if not isinstance(spec, dict):
+        spec = {}
+    case_taxonomy = spec.get("case_taxonomy") if isinstance(spec.get("case_taxonomy"), list) else []
+    case_key = spec.get("case_key")
+    case_columns = spec.get("case_columns")
+    if isinstance(evaluation_spec, dict):
+        case_key = case_key or evaluation_spec.get("case_key")
+        case_columns = case_columns or evaluation_spec.get("case_columns")
+    if not case_taxonomy:
+        return "case_taxonomy missing or empty"
+    if not case_key and not case_columns:
+        return "case_key/case_columns missing"
+    return ""
 
 def _ensure_alignment_check_output(contract: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(contract, dict):
@@ -2229,7 +2185,6 @@ def _detect_forbidden_df_assignments(
     if not code or not allowed_columns:
         return []
     import ast
-    import re
 
     try:
         tree = ast.parse(code)
@@ -2237,11 +2192,6 @@ def _detect_forbidden_df_assignments(
         return []
 
     allowed_norm = {_norm_name(col) for col in allowed_columns if col}
-    allowed_pattern_list = [str(pat) for pat in (allowed_patterns or []) if isinstance(pat, str) and pat.strip()]
-
-    def _pattern_name(name: str) -> str:
-        return re.sub(r"[^0-9a-zA-Z]+", "_", str(name).lower()).strip("_")
-
     list_vars: Dict[str, List[str]] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
@@ -2303,18 +2253,6 @@ def _detect_forbidden_df_assignments(
         norm = _norm_name(col)
         if norm in allowed_norm:
             continue
-        if allowed_pattern_list:
-            target = _pattern_name(col)
-            matched = False
-            for pattern in allowed_pattern_list:
-                try:
-                    if re.search(pattern, target):
-                        matched = True
-                        break
-                except re.error:
-                    continue
-            if matched:
-                continue
         forbidden.add(col)
 
     return sorted(forbidden)
@@ -2670,6 +2608,37 @@ def _normalize_alignment_check(
     requirements_payload = normalized.get("requirements")
     per_req = normalized.get("per_requirement")
     evidence_map = normalized.get("evidence")
+    checks_payload = normalized.get("checks") or normalized.get("checklist") or []
+
+    def _requirements_from_checks(checks: Any) -> List[Dict[str, Any]]:
+        derived: List[Dict[str, Any]] = []
+        if not isinstance(checks, list):
+            return derived
+        for idx, item in enumerate(checks):
+            if not isinstance(item, dict):
+                continue
+            req_id = item.get("id") or item.get("name") or item.get("key") or f"check_{idx}"
+            status_val = item.get("status") or item.get("result") or item.get("outcome")
+            evidence_val = item.get("evidence") or item.get("notes") or []
+            evidence_list: List[str] = []
+            if isinstance(evidence_val, list):
+                evidence_list = [str(v) for v in evidence_val if v]
+            elif isinstance(evidence_val, str) and evidence_val.strip():
+                evidence_list = [evidence_val.strip()]
+            derived.append(
+                {
+                    "id": str(req_id),
+                    "status": str(status_val or "").upper(),
+                    "evidence": evidence_list,
+                }
+            )
+        return derived
+
+    if not isinstance(requirements_payload, list) and checks_payload:
+        requirements_payload = _requirements_from_checks(checks_payload)
+        normalized["requirements"] = requirements_payload
+    if not alignment_requirements and isinstance(requirements_payload, list):
+        alignment_requirements = [{"id": item.get("id"), "required": True} for item in requirements_payload if item.get("id")]
 
     normalized_reqs: List[Dict[str, Any]] = []
     missing_status = 0
@@ -6952,6 +6921,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
 
     # Case alignment QA gate (optional if required by contract/spec)
     contract = state.get("execution_contract", {}) or {}
+    skip_reason = _case_alignment_skip_reason(contract, evaluation_spec)
     case_alignment_required = _should_run_case_alignment(contract, evaluation_spec)
     case_report: Dict[str, Any] = {
         "status": "SKIP",
@@ -6960,7 +6930,18 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "reason": "case alignment not required",
     }
     case_history = list(state.get("case_alignment_history", []) or [])
-    if case_alignment_required:
+    if skip_reason:
+        case_alignment_required = False
+        case_report = {
+            "status": "SKIPPED",
+            "mode": "case_level",
+            "metrics": {"case_count": None},
+            "thresholds": {},
+            "failures": [],
+            "explanation": f"Case alignment skipped: {skip_reason}.",
+            "skip_reason": skip_reason,
+        }
+    elif case_alignment_required:
         data_paths = []
         if os.path.exists("data/cleaned_full.csv"):
             data_paths.append("data/cleaned_full.csv")

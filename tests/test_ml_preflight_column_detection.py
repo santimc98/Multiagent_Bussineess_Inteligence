@@ -32,7 +32,7 @@ df.loc[:, "segment_key"] = "A"
     allowed_cols = ["Size", "Debtors", "Sector"]
     patterns = ["^segment_.*"]
     forbidden = _detect_forbidden_df_assignments(script, allowed_cols, patterns)
-    assert forbidden == ["Size_bin"]
+    assert forbidden == ["Size_bin", "segment_key"]
     issues = ml_quality_preflight(script, allowed_columns=allowed_cols, allowed_patterns=patterns)
     assert "DF_COLUMN_ASSIGNMENT_FORBIDDEN" in issues
 

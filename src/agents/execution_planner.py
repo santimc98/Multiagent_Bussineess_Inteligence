@@ -1431,6 +1431,8 @@ class ExecutionPlannerAgent:
             decision_vars = contract.get("decision_variables") or []
             if not isinstance(decision_vars, list) or not decision_vars:
                 return contract
+            spec = contract.get("spec_extraction") or {}
+            case_taxonomy = spec.get("case_taxonomy") if isinstance(spec.get("case_taxonomy"), list) else []
             availability_summary = contract.get("availability_summary") or ""
             feature_availability = contract.get("feature_availability") or []
             reqs = contract.get("data_requirements") or []
@@ -1447,6 +1449,8 @@ class ExecutionPlannerAgent:
                 "control", "holdout", "policy change", "uplift", "causal", "instrument",
             ]
             has_counterfactual = any(tok in combined_text for tok in evidence_tokens)
+            if not case_taxonomy:
+                has_counterfactual = False
             if not has_counterfactual:
                 contract["counterfactual_policy"] = "observational_only"
                 contract["recommendation_scope"] = "within_observed_support_only"
