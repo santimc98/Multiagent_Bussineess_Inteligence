@@ -18,7 +18,7 @@ def test_ml_iteration_journal_append_and_load(tmp_path):
         "next_actions": ["Use only contract columns"],
     }
     written = _append_ml_iteration_journal("run1", entry, [], base_dir=str(tmp_path))
-    path = tmp_path / "run1" / "ml_iteration_journal.jsonl"
+    path = tmp_path / "run1" / "report" / "governance" / "ml_iteration_journal.jsonl"
     assert path.exists()
     entries = _load_ml_iteration_journal("run1", base_dir=str(tmp_path))
     assert entries and entries[0]["iteration_id"] == 1

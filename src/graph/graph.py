@@ -3371,7 +3371,7 @@ def _suggest_next_actions(
     return actions[:3]
 
 def _ml_iteration_journal_path(run_id: str, base_dir: str = "runs") -> str:
-    return os.path.join(base_dir, run_id, "ml_iteration_journal.jsonl")
+    return os.path.join(base_dir, run_id, "report", "governance", "ml_iteration_journal.jsonl")
 
 def _append_ml_iteration_journal(
     run_id: str,
