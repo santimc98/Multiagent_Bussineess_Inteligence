@@ -1,5 +1,6 @@
 from src.graph.graph import ml_quality_preflight
 from src.graph.graph import run_ml_preflight
+from src.graph.graph import _detect_synthetic_data
 
 
 def test_ml_preflight_fails_missing_variance_guard():
@@ -175,3 +176,29 @@ baseline = DummyClassifier()
 """
     issues = ml_quality_preflight(code, allowed_columns=["a", "b", "target"])
     assert "SCORED_ROWS_SCHEMA_VIOLATION" in issues
+
+
+def test_synthetic_detector_allows_counterfactual_grid():
+    code = """
+import pandas as pd
+feature_cols = ["Size", "Debtors", "Sector", "1stYearAmount"]
+df_seg = df[df["Sector"] == "A"]
+sim_df = df_seg.copy()
+for price in [100, 200, 300]:
+    sim_df["1stYearAmount"] = price
+    _ = sim_df[feature_cols]
+sampled = df.sample(n=10, random_state=42)
+"""
+    assert _detect_synthetic_data(code) is False
+
+
+def test_synthetic_detector_blocks_generators():
+    code = """
+import numpy as np
+from faker import Faker
+from sklearn.datasets import make_classification
+faker = Faker()
+X, y = make_classification(n_samples=10, n_features=3)
+noise = np.random.randn(10)
+"""
+    assert _detect_synthetic_data(code) is True

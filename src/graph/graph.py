@@ -7,6 +7,7 @@ import json
 import hashlib
 import threading
 import time
+from pathlib import Path
 from datetime import datetime
 from typing import TypedDict, Dict, Any, List, Literal
 from langgraph.graph import StateGraph, END
@@ -85,6 +86,7 @@ from src.utils.data_adequacy import build_data_adequacy_report, write_data_adequ
 from src.utils.code_extract import is_syntax_valid
 from src.utils.visuals import generate_fallback_plots
 from src.utils.recommendations_preview import build_recommendations_preview
+from src.utils.segment_enrichment import enrich_segmented_summary_json
 
 def _norm_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
@@ -103,6 +105,80 @@ def _truncate_text(text: str, max_len: int = 18000, head_len: int = 10000, tail_
     return text[:safe_head] + "\n...[TRUNCATED]...\n" + text[-safe_tail:]
 
 _ABORT_EVENT = threading.Event()
+
+def _normalize_path_posix(path: str) -> str:
+    try:
+        return Path(path).as_posix()
+    except Exception:
+        return str(path).replace("\\", "/")
+
+def _stage_illustrative_assets(
+    source_root: str,
+    report_root: str = "report",
+    segment_label_column: str | None = None,
+    segment_id_key: str = "segment_id",
+) -> Dict[str, Any]:
+    staged = {"plots": [], "jsons": [], "csvs": [], "metadata_path": None}
+    if not source_root or not os.path.isdir(source_root):
+        return staged
+    report_root = report_root or "report"
+    os.makedirs(report_root, exist_ok=True)
+    scored_rows_dest = None
+    summary_dest = None
+    for base, _, names in os.walk(source_root):
+        for name in names:
+            full = os.path.join(base, name)
+            rel = os.path.relpath(full, source_root)
+            rel_posix = rel.replace("\\", "/")
+            lower = rel_posix.lower()
+            is_plot = lower.startswith("static/plots/") and lower.endswith((".png", ".jpg", ".jpeg"))
+            is_json = lower.startswith(("data/", "reports/")) and lower.endswith(".json")
+            is_scored_rows = rel_posix == "data/scored_rows.csv"
+            if not (is_plot or is_json or is_scored_rows):
+                continue
+            dest = os.path.join(report_root, rel)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            try:
+                shutil.copy2(full, dest)
+            except Exception:
+                continue
+            dest_posix = _normalize_path_posix(dest)
+            if is_plot:
+                staged["plots"].append(dest_posix)
+            elif is_json:
+                staged["jsons"].append(dest_posix)
+                if rel_posix == "reports/price_optimization_summary.json":
+                    summary_dest = dest
+            elif is_scored_rows:
+                staged["csvs"].append(dest_posix)
+                scored_rows_dest = dest
+
+    if summary_dest and scored_rows_dest and segment_label_column:
+        try:
+            enrich_segmented_summary_json(
+                summary_dest,
+                scored_rows_dest,
+                segment_label_column=segment_label_column,
+                segment_id_key=segment_id_key,
+            )
+        except Exception as err:
+            print(f"Warning: illustrative segment enrichment failed: {err}")
+
+    metadata = {
+        "status": "illustrative_only",
+        "not_production": True,
+        "source_root": _normalize_path_posix(source_root),
+        "staged_at": datetime.utcnow().isoformat(),
+        "assets": staged,
+    }
+    try:
+        meta_path = os.path.join(report_root, "illustrative_assets.json")
+        with open(meta_path, "w", encoding="utf-8") as f_meta:
+            json.dump(metadata, f_meta, indent=2, ensure_ascii=False)
+        staged["metadata_path"] = _normalize_path_posix(meta_path)
+    except Exception:
+        staged["metadata_path"] = None
+    return staged
 
 def request_abort(reason: str | None = None) -> None:
     _ABORT_EVENT.set()
@@ -1949,23 +2025,60 @@ def _required_columns_coverage(code: str, required_columns: List[str]) -> Dict[s
     return {"hits": hits, "missing": missing}
 
 def _detect_synthetic_data(code: str) -> bool:
+    import ast
+
     if not code:
         return False
-    code_lower = code.lower()
-    synthetic_markers = [
-        "np.random",
-        "random.",
-        "make_classification",
-        "make_regression",
-        "make_blobs",
-        "faker",
-        "synthetic data",
-        "generate synthetic",
-        "load_iris",
-        "load_breast_cancer",
-        "load_wine",
-    ]
-    return any(marker in code_lower for marker in synthetic_markers)
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return False
+
+    if _detect_dataframe_literal_overwrite(code):
+        return True
+
+    def _call_name(call_node: ast.Call) -> str:
+        try:
+            return ast.unparse(call_node.func)
+        except Exception:
+            if isinstance(call_node.func, ast.Name):
+                return call_node.func.id
+            if isinstance(call_node.func, ast.Attribute):
+                return call_node.func.attr
+        return ""
+
+    def _is_random_call(call_node: ast.Call) -> bool:
+        name = _call_name(call_node).lower()
+        if name.startswith("np.random.") or name.startswith("numpy.random."):
+            return True
+        if name.startswith("random.") or name == "random":
+            return True
+        return False
+
+    def _is_faker_call(call_node: ast.Call) -> bool:
+        name = _call_name(call_node).lower()
+        return name.endswith("faker") or ".faker" in name
+
+    def _is_sklearn_make_call(call_node: ast.Call) -> bool:
+        name = _call_name(call_node).lower()
+        make_names = {
+            "make_classification",
+            "make_regression",
+            "make_blobs",
+            "make_moons",
+            "make_circles",
+        }
+        if any(name.endswith(item) for item in make_names):
+            return True
+        if "sklearn.datasets.make_" in name or ".datasets.make_" in name:
+            return True
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            if _is_random_call(node) or _is_faker_call(node) or _is_sklearn_make_call(node):
+                return True
+    return False
 
 def _detect_dataframe_literal_overwrite(code: str) -> bool:
     import ast
@@ -7701,14 +7814,22 @@ def run_translator(state: AgentState) -> AgentState:
             artifacts_dir=".",
             cleaned_data_path=cleaned_path if os.path.exists(cleaned_path) else None,
         )
+        chosen_source = preview_payload.get("chosen_source") if isinstance(preview_payload, dict) else {}
         if not artifacts_valid:
-            preview_payload["items"] = []
-            preview_payload["reason"] = preview_payload.get("reason") or "artifacts_invalid"
-            preview_payload["status"] = "illustrative_only"
-            preview_payload["risk_level"] = "high"
-            preview_payload.setdefault("caveats", []).append(
-                "Artifacts were invalid or blocked; examples withheld."
-            )
+            if isinstance(chosen_source, dict) and chosen_source.get("kind") == "sandbox_attempt":
+                preview_payload["status"] = "illustrative_only"
+                preview_payload["risk_level"] = "high"
+                preview_payload.setdefault("caveats", []).append(
+                    "Artifacts were invalid or blocked; illustrative examples sourced from sandbox attempt outputs."
+                )
+            else:
+                preview_payload["items"] = []
+                preview_payload["reason"] = preview_payload.get("reason") or "artifacts_invalid"
+                preview_payload["status"] = "illustrative_only"
+                preview_payload["risk_level"] = "high"
+                preview_payload.setdefault("caveats", []).append(
+                    "Artifacts were invalid or blocked; examples withheld."
+                )
         try:
             os.makedirs("reports", exist_ok=True)
             with open("reports/recommendations_preview.json", "w", encoding="utf-8") as f_prev:
@@ -7722,6 +7843,19 @@ def run_translator(state: AgentState) -> AgentState:
             report_state["artifact_index"] = merged_index
         except Exception as prev_err:
             print(f"Warning: failed to persist recommendations_preview.json: {prev_err}")
+
+        if isinstance(chosen_source, dict) and chosen_source.get("kind") == "sandbox_attempt":
+            segment_label_column = None
+            if isinstance(contract, dict):
+                segment_label_column = contract.get("segment_label_column")
+            staged = _stage_illustrative_assets(
+                chosen_source.get("root"),
+                report_root="report",
+                segment_label_column=segment_label_column,
+            )
+            if staged.get("plots") and not report_state.get("plots_local"):
+                report_state["plots_local"] = staged.get("plots")
+            report_state["illustrative_assets"] = staged
     report_plots = report_state.get("plots_local", plots_local)
     artifact_entries = report_state.get("artifact_index") or []
     report_artifacts = [
@@ -7918,10 +8052,15 @@ def generate_pdf_artifact(state: AgentState) -> AgentState:
         has_exec_error = bool(state.get("execution_error") or state.get("sandbox_failed"))
         if not has_exec_error and fallback_plots:
             plots = [plot for plot in plots if plot not in fallback_plots]
+        if not plots:
+            report_plots_dir = os.path.join("report", "static", "plots")
+            if os.path.isdir(report_plots_dir):
+                plots = glob.glob(os.path.join(report_plots_dir, "*.png"))
         if plots:
             report += "\n\n## Visualizations\n"
             for plot in plots:
-                report += f"![{os.path.basename(plot)}]({plot})\n"
+                plot_ref = _normalize_path_posix(plot)
+                report += f"![{os.path.basename(plot)}]({plot_ref})\n"
     
     # Generate unique filename
     unique_id = uuid.uuid4().hex[:8]

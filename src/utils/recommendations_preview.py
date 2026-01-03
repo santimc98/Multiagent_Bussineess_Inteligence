@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import os
 from datetime import datetime
@@ -265,6 +266,146 @@ def _build_items_from_scored_rows(path: str, max_examples: int) -> List[Dict[str
     return items
 
 
+def _load_iteration_journal(run_dir: str) -> List[Dict[str, Any]]:
+    journal_path = os.path.join(run_dir, "report", "governance", "ml_iteration_journal.jsonl")
+    if not os.path.exists(journal_path):
+        return []
+    entries: List[Dict[str, Any]] = []
+    try:
+        with open(journal_path, "r", encoding="utf-8") as f_journal:
+            for line in f_journal:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(payload, dict):
+                    entries.append(payload)
+    except Exception:
+        return []
+    return entries
+
+
+def _entry_has_blocking_issue(entry: Dict[str, Any]) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    fields = []
+    for key in ("preflight_issues", "reviewer_reasons", "qa_reasons", "failed_gates"):
+        vals = entry.get(key)
+        if isinstance(vals, list):
+            fields.extend([str(v).lower() for v in vals if v])
+    joined = " ".join(fields)
+    if "synthetic" in joined:
+        return True
+    contract_tokens = [
+        "unknown_columns",
+        "unknown_columns_referenced",
+        "df_column_assignment_forbidden",
+        "output_contract_missing",
+        "contract_missing_outputs",
+        "contract_literal_guard",
+        "must_reference_contract_columns",
+    ]
+    return any(tok in joined for tok in contract_tokens)
+
+
+def _hash_code_text(code: str) -> str:
+    if not code:
+        return ""
+    return hashlib.sha256(code.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
+def _attempt_is_blocked(attempt_dir: str, journal_entries: List[Dict[str, Any]]) -> bool:
+    if not journal_entries:
+        return False
+    code_path = os.path.join(attempt_dir, "code_sent.py")
+    if not os.path.exists(code_path):
+        return False
+    try:
+        with open(code_path, "r", encoding="utf-8") as f_code:
+            code = f_code.read()
+    except Exception:
+        return False
+    code_hash = _hash_code_text(code)
+    if not code_hash:
+        return False
+    for entry in journal_entries:
+        if entry.get("code_hash") == code_hash and _entry_has_blocking_issue(entry):
+            return True
+    return False
+
+
+def _list_downloaded_files(root_dir: str) -> List[str]:
+    files: List[str] = []
+    for base, _, names in os.walk(root_dir):
+        for name in names:
+            full = os.path.join(base, name)
+            rel = os.path.relpath(full, root_dir)
+            files.append(rel.replace("\\", "/"))
+    return files
+
+
+def _select_best_attempt(run_dir: str) -> Dict[str, Any] | None:
+    sandbox_dir = os.path.join(run_dir, "sandbox", "ml_engineer")
+    if not os.path.isdir(sandbox_dir):
+        return None
+    journal_entries = _load_iteration_journal(run_dir)
+    attempt_dirs = []
+    for name in os.listdir(sandbox_dir):
+        if not name.startswith("attempt_"):
+            continue
+        attempt_path = os.path.join(sandbox_dir, name)
+        if os.path.isdir(attempt_path):
+            attempt_dirs.append((name, attempt_path))
+    if not attempt_dirs:
+        return None
+    candidates: List[Dict[str, Any]] = []
+    for name, attempt_path in attempt_dirs:
+        if _attempt_is_blocked(attempt_path, journal_entries):
+            continue
+        downloaded_root = os.path.join(attempt_path, "downloaded_artifacts")
+        if not os.path.isdir(downloaded_root):
+            continue
+        files = _list_downloaded_files(downloaded_root)
+        file_set = set(files)
+        has_metrics = "data/metrics.json" in file_set
+        has_preview_source = any(
+            rel in file_set
+            for rel in ("reports/optimization_results.json", "data/predictions.csv", "data/scored_rows.csv")
+        )
+        if not (has_metrics and has_preview_source):
+            continue
+        score = 0
+        if "data/metrics.json" in file_set:
+            score += 3
+        if "reports/price_optimization_summary.json" in file_set:
+            score += 3
+        if "reports/optimization_results.json" in file_set:
+            score += 2
+        if "data/scored_rows.csv" in file_set or "data/predictions.csv" in file_set:
+            score += 2
+        if "data/alignment_check.json" in file_set:
+            score += 1
+        if any(path.startswith("static/plots/") for path in file_set):
+            score += 1
+        attempt_num = int(name.split("_")[-1]) if name.split("_")[-1].isdigit() else 0
+        candidates.append(
+            {
+                "attempt": attempt_num,
+                "name": name,
+                "root": downloaded_root,
+                "score": score,
+                "files": files,
+            }
+        )
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item["score"], item["attempt"]), reverse=True)
+    return candidates[0]
+
+
 def build_recommendations_preview(
     contract: Dict[str, Any],
     governance_summary: Dict[str, Any] | None,
@@ -283,46 +424,83 @@ def build_recommendations_preview(
     caveats: List[str] = []
     items: List[Dict[str, Any]] = []
     reason = ""
+    chosen_source: Dict[str, Any] | None = None
 
-    opt_path = os.path.join(artifacts_dir, "reports", "optimization_results.json")
-    if os.path.exists(opt_path):
-        sources_checked.append("reports/optimization_results.json")
-        payload = _safe_load_json(opt_path)
-        for raw_item in _extract_items_from_optimization(payload):
-            segment = _extract_segment_from_item(raw_item)
-            current_action, suggested_action = _extract_actions_from_item(raw_item)
-            expected_effect = _extract_expected_effect(raw_item)
-            support = _extract_support(raw_item)
-            item = {
-                "segment": segment,
-                "current_action": current_action,
-                "suggested_action": suggested_action,
-                "expected_effect": expected_effect,
-                "support": support,
-                "source": "reports/optimization_results.json",
-            }
-            item, notes = _apply_observational_policy(item, counterfactual_policy)
-            if notes:
-                expected_effect.setdefault("notes", "; ".join(notes))
-            items.append(item)
-        if items:
-            sources_used.append("reports/optimization_results.json")
+    def _label_source(prefix: str, rel_path: str) -> str:
+        rel = rel_path.replace("\\", "/")
+        return f"{prefix}{rel}" if prefix else rel
 
-    if not items:
-        for rel_path in ["data/predictions.csv", "data/scored_rows.csv"]:
-            path = os.path.join(artifacts_dir, rel_path)
-            if not os.path.exists(path):
-                continue
-            sources_checked.append(rel_path)
-            items = _build_items_from_scored_rows(path, max_examples=max_examples)
-            for item in items:
-                item["source"] = rel_path
+    def _collect_items_from_root(root_dir: str, prefix: str) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
+        collected: List[Dict[str, Any]] = []
+        checked: List[str] = []
+        used: List[str] = []
+        opt_path = os.path.join(root_dir, "reports", "optimization_results.json")
+        if os.path.exists(opt_path):
+            checked.append(_label_source(prefix, "reports/optimization_results.json"))
+            payload = _safe_load_json(opt_path)
+            for raw_item in _extract_items_from_optimization(payload):
+                segment = _extract_segment_from_item(raw_item)
+                current_action, suggested_action = _extract_actions_from_item(raw_item)
+                expected_effect = _extract_expected_effect(raw_item)
+                support = _extract_support(raw_item)
+                item = {
+                    "segment": segment,
+                    "current_action": current_action,
+                    "suggested_action": suggested_action,
+                    "expected_effect": expected_effect,
+                    "support": support,
+                    "source": _label_source(prefix, "reports/optimization_results.json"),
+                }
                 item, notes = _apply_observational_policy(item, counterfactual_policy)
                 if notes:
-                    item["expected_effect"].setdefault("notes", "; ".join(notes))
-            if items:
-                sources_used.append(rel_path)
-                break
+                    expected_effect.setdefault("notes", "; ".join(notes))
+                collected.append(item)
+            if collected:
+                used.append(_label_source(prefix, "reports/optimization_results.json"))
+
+        if not collected:
+            for rel_path in ["data/predictions.csv", "data/scored_rows.csv"]:
+                path = os.path.join(root_dir, rel_path)
+                if not os.path.exists(path):
+                    continue
+                checked.append(_label_source(prefix, rel_path))
+                extracted = _build_items_from_scored_rows(path, max_examples=max_examples)
+                for item in extracted:
+                    item["source"] = _label_source(prefix, rel_path)
+                    item, notes = _apply_observational_policy(item, counterfactual_policy)
+                    if notes:
+                        item["expected_effect"].setdefault("notes", "; ".join(notes))
+                    collected.append(item)
+                if collected:
+                    used.append(_label_source(prefix, rel_path))
+                    break
+        return collected, checked, used
+    items, checked, used = _collect_items_from_root(artifacts_dir, "")
+    sources_checked.extend(checked)
+    sources_used.extend(used)
+    if items:
+        chosen_source = {
+            "kind": "artifacts",
+            "root": os.path.abspath(artifacts_dir),
+        }
+
+    if not items and governance_summary and governance_summary.get("run_id"):
+        run_id = str(governance_summary.get("run_id"))
+        run_dir = os.path.join("runs", run_id)
+        attempt = _select_best_attempt(run_dir)
+        if attempt:
+            prefix = f"sandbox/ml_engineer/attempt_{attempt['attempt']}/downloaded_artifacts/"
+            attempt_items, checked, used = _collect_items_from_root(attempt["root"], prefix)
+            sources_checked.extend(checked)
+            sources_used.extend(used)
+            if attempt_items:
+                items = attempt_items
+            chosen_source = {
+                "kind": "sandbox_attempt",
+                "run_id": run_id,
+                "attempt": attempt["attempt"],
+                "root": os.path.abspath(attempt["root"]),
+            }
 
     items = [item for item in items if isinstance(item, dict)]
     if items:
@@ -346,6 +524,8 @@ def build_recommendations_preview(
     if run_outcome in {"NO_GO", "GO_WITH_LIMITATIONS"}:
         caveats.append("Illustrative examples only; not production-ready.")
         caveats.append("Do not claim causal impact from these examples.")
+    if isinstance(chosen_source, dict) and chosen_source.get("kind") == "sandbox_attempt":
+        caveats.append("Examples derived from sandbox attempt outputs; not promoted artifacts.")
     if counterfactual_policy == "observational_only":
         caveats.append("Observational-only policy: stay within observed support.")
     if not caveats:
@@ -380,5 +560,6 @@ def build_recommendations_preview(
         },
         "sources_checked": sources_checked,
         "sources_used": sources_used,
+        "chosen_source": chosen_source,
         "items": items,
     }

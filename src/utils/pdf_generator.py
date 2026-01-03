@@ -53,8 +53,8 @@ def convert_report_to_pdf(markdown_content: str, output_filename: str = "final_r
                 
                 # Create Cell
                 if os.path.exists(abs_path):
-                    # Robust Windows Path (xhtml2pdf prefers raw paths over file:// URIs often)
-                    img_src = str(Path(abs_path).resolve())
+                    # Robust Windows Path (xhtml2pdf prefers forward slashes)
+                    img_src = Path(abs_path).resolve().as_posix()
                     
                     image_grid_html += f'''
                         <td style="width: 50%; padding: 5px; vertical-align: top; border: none;">
