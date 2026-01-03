@@ -72,9 +72,21 @@ class ResultsAdvisorAgent:
         return (content or "").strip()
 
     def generate_insights(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        artifact_index = self._normalize_artifact_index(
-            context.get("artifact_index") or self._safe_load_json("data/artifact_index.json") or []
+        produced_index = (
+            context.get("produced_artifact_index")
+            or context.get("artifact_index")
+            or self._safe_load_json("data/produced_artifact_index.json")
+            or []
         )
+        artifact_index = self._normalize_artifact_index(produced_index)
+        if not artifact_index:
+            output_report = context.get("output_contract_report") or self._safe_load_json("data/output_contract_report.json")
+            present = output_report.get("present", []) if isinstance(output_report, dict) else []
+            artifact_index = [
+                {"path": path, "artifact_type": self._infer_artifact_type(path)}
+                for path in present
+                if path
+            ]
         objective_type = context.get("objective_type") or context.get("strategy_spec", {}).get("objective_type") or "unknown"
 
         metrics_artifacts = self._find_artifacts_by_type(artifact_index, "metrics")
@@ -220,6 +232,20 @@ class ResultsAdvisorAgent:
             elif isinstance(item, str):
                 normalized.append({"path": item, "artifact_type": "artifact"})
         return normalized
+
+    def _infer_artifact_type(self, path: str) -> str:
+        lower = str(path).lower()
+        if "metrics" in lower:
+            return "metrics"
+        if "alignment" in lower:
+            return "report"
+        if "error" in lower:
+            return "error_analysis"
+        if "importance" in lower:
+            return "feature_importances"
+        if "scored_rows" in lower or "predictions" in lower:
+            return "predictions"
+        return "artifact"
 
     def _find_artifacts_by_type(self, entries: List[Dict[str, Any]], artifact_type: str) -> List[str]:
         matches = []

@@ -1740,8 +1740,17 @@ class ExecutionPlannerAgent:
             reviewer_gates = ["methodology_alignment", "business_value"]
             if objective_type in {"predictive", "prescriptive"}:
                 reviewer_gates.append("validation_required")
-            if objective_type == "prescriptive":
-                reviewer_gates.append("price_optimization")
+            spec = contract.get("spec_extraction") or {}
+            decision_opt_required = bool(
+                decision_var
+                and (
+                    spec.get("scoring_formula")
+                    or spec.get("constraints")
+                    or contract.get("optimization_constraints")
+                )
+            )
+            if decision_opt_required:
+                reviewer_gates.append("decision_optimization_required")
 
             alignment_requirements = contract.get("alignment_requirements") or []
             if not alignment_requirements:
@@ -2197,7 +2206,17 @@ Return the contract JSON.
             if objective_type in {"predictive", "prescriptive"}:
                 reviewer_gates.append("validation_required")
             if objective_type == "prescriptive":
-                reviewer_gates.append("price_optimization")
+                spec = contract.get("spec_extraction") or {}
+                decision_opt_required = bool(
+                    decision_var
+                    and (
+                        spec.get("scoring_formula")
+                        or spec.get("constraints")
+                        or contract.get("optimization_constraints")
+                    )
+                )
+                if decision_opt_required:
+                    reviewer_gates.append("decision_optimization_required")
 
             alignment_requirements = contract.get("alignment_requirements") or []
             if not alignment_requirements:
@@ -2281,7 +2300,7 @@ Return the contract JSON.
             "Return JSON only, matching the template. "
             "Gate vocabulary (use only these ids): "
             "mapping_summary, consistency_checks, target_variance_guard, leakage_prevention, outputs_required, "
-            "segmentation_predecision, decision_variable_handling, validation_required, price_optimization, "
+            "segmentation_predecision, decision_variable_handling, validation_required, decision_optimization_required, "
             "methodology_alignment, business_value. "
             "Include requires_target/requires_supervised_split/requires_time_series_split/requires_row_scoring flags "
             "and a target object {name, derive_from} when a target exists."

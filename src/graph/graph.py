@@ -7,6 +7,7 @@ import json
 import hashlib
 import threading
 import time
+import fnmatch
 from pathlib import Path
 from datetime import datetime
 from typing import TypedDict, Dict, Any, List, Literal
@@ -116,6 +117,7 @@ def _stage_illustrative_assets(
     source_root: str,
     report_root: str = "report",
     label_col_hint: str | None = None,
+    contract: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     staged = {"plots": [], "jsons": [], "csvs": [], "metadata_path": None}
     if not source_root or not os.path.isdir(source_root):
@@ -124,6 +126,46 @@ def _stage_illustrative_assets(
     os.makedirs(report_root, exist_ok=True)
     scored_rows_dest = None
     summary_dest = None
+    candidate_jsons: List[Dict[str, str]] = []
+    deliverable_lookup: Dict[str, Dict[str, Any]] = {}
+    schema_paths: set[str] = set()
+    if isinstance(contract, dict):
+        spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else {}
+        deliverables = spec.get("deliverables") if isinstance(spec, dict) else None
+        if isinstance(deliverables, list):
+            for item in deliverables:
+                if isinstance(item, dict) and item.get("path"):
+                    deliverable_lookup[str(item["path"])] = item
+        schema = contract.get("artifact_schemas")
+        if not isinstance(schema, dict) and isinstance(spec, dict):
+            schema = spec.get("artifact_schemas")
+        if isinstance(schema, dict):
+            schema_paths = {str(path) for path in schema.keys() if path}
+
+    def _score_summary_candidate(rel_path: str, dest_path: str) -> float:
+        deliverable = deliverable_lookup.get(rel_path, {})
+        kind = str(deliverable.get("kind") or "").lower()
+        score = 0.0
+        if kind in {"report", "summary", "metrics"}:
+            score += 5.0
+        if deliverable and deliverable.get("required"):
+            score += 3.0
+        if rel_path in schema_paths:
+            score += 1.0
+        try:
+            size = os.path.getsize(dest_path)
+            if size > 0:
+                score += min(size / 2048.0, 4.0)
+        except Exception:
+            pass
+        payload = _load_json_any(dest_path)
+        if isinstance(payload, dict):
+            keys = list(payload.keys())
+            score += min(len(keys), 20) * 0.1
+            for tok in ("metrics", "recommendations", "limits", "summary", "results"):
+                if tok in payload:
+                    score += 0.5
+        return score
     for base, _, names in os.walk(source_root):
         for name in names:
             full = os.path.join(base, name)
@@ -146,11 +188,18 @@ def _stage_illustrative_assets(
                 staged["plots"].append(dest_posix)
             elif is_json:
                 staged["jsons"].append(dest_posix)
-                if rel_posix == "reports/price_optimization_summary.json":
-                    summary_dest = dest
+                candidate_jsons.append({"rel": rel_posix, "dest": dest})
             elif is_scored_rows:
                 staged["csvs"].append(dest_posix)
                 scored_rows_dest = dest
+
+    if candidate_jsons:
+        ranked = sorted(
+            candidate_jsons,
+            key=lambda item: _score_summary_candidate(item["rel"], item["dest"]),
+            reverse=True,
+        )
+        summary_dest = ranked[0]["dest"]
 
     if summary_dest and scored_rows_dest and label_col_hint:
         try:
@@ -756,6 +805,31 @@ def _resolve_allowed_columns_for_gate(
         except Exception:
             pass
 
+    if isinstance(contract, dict):
+        derived_cols: List[str] = []
+        data_reqs = contract.get("data_requirements", []) or []
+        if isinstance(data_reqs, list):
+            for req in data_reqs:
+                if not isinstance(req, dict):
+                    continue
+                source = req.get("source")
+                owner = (req.get("derived_owner") or "").lower()
+                if source == "derived" and owner == "ml_engineer":
+                    name = req.get("canonical_name") or req.get("name")
+                    if name:
+                        derived_cols.append(str(name))
+        spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else {}
+        spec_derived = spec.get("derived_columns") if isinstance(spec, dict) else None
+        if isinstance(spec_derived, list):
+            for item in spec_derived:
+                if isinstance(item, dict):
+                    name = item.get("column") or item.get("name")
+                    if name:
+                        derived_cols.append(str(name))
+                elif isinstance(item, str):
+                    derived_cols.append(item)
+        allowed.extend([col for col in derived_cols if col])
+
     if not allowed:
         profile = state.get("profile") or state.get("dataset_profile")
         if isinstance(profile, dict):
@@ -829,7 +903,24 @@ def _resolve_required_outputs(contract: Dict[str, Any]) -> List[str]:
         return required
     return contract.get("required_outputs", []) or []
 
-def _purge_execution_outputs(required_outputs: List[str]) -> None:
+def _resolve_expected_output_paths(contract: Dict[str, Any]) -> List[str]:
+    if not isinstance(contract, dict):
+        return []
+    spec = contract.get("spec_extraction") or {}
+    deliverables = spec.get("deliverables") if isinstance(spec, dict) else None
+    expected: List[str] = []
+    if isinstance(deliverables, list) and deliverables:
+        for item in deliverables:
+            if isinstance(item, dict) and item.get("path"):
+                expected.append(str(item.get("path")))
+            elif isinstance(item, str):
+                expected.append(str(item))
+    else:
+        expected.extend(contract.get("required_outputs", []) or [])
+    return expected
+
+
+def _purge_execution_outputs(required_outputs: List[str], keep_outputs: List[str] | None = None) -> None:
     protected = {
         "data/cleaned_data.csv",
         "data/cleaned_full.csv",
@@ -843,6 +934,21 @@ def _purge_execution_outputs(required_outputs: List[str]) -> None:
         "data/evaluation_spec.json",
         "data/execution_contract.json",
     }
+    keep_exact = {
+        _normalize_path_posix(path)
+        for path in (keep_outputs or [])
+        if path and not _is_glob_pattern(path)
+    }
+    keep_globs = [str(path) for path in (keep_outputs or []) if path and _is_glob_pattern(path)]
+
+    def _should_keep(path: str) -> bool:
+        norm = _normalize_path_posix(path)
+        if norm in keep_exact:
+            return True
+        for pattern in keep_globs:
+            if fnmatch.fnmatch(norm, pattern):
+                return True
+        return False
     for path in required_outputs or []:
         if not path or _is_glob_pattern(path):
             continue
@@ -861,10 +967,10 @@ def _purge_execution_outputs(required_outputs: List[str]) -> None:
         "data/alignment_check.json",
         "data/output_contract_report.json",
         "analysis/leakage_report.json",
-        "analysis/price_elasticity_segments.csv",
-        "analysis/optimal_prices.csv",
     ]:
         if extra in protected:
+            continue
+        if _should_keep(extra):
             continue
         try:
             if os.path.exists(extra):
@@ -873,8 +979,28 @@ def _purge_execution_outputs(required_outputs: List[str]) -> None:
             pass
     for folder in ["analysis", "models", os.path.join("static", "plots")]:
         try:
-            if os.path.isdir(folder):
-                shutil.rmtree(folder, ignore_errors=True)
+            if not os.path.isdir(folder):
+                continue
+            for base, _, names in os.walk(folder):
+                for name in names:
+                    full = os.path.join(base, name)
+                    rel = _normalize_path_posix(os.path.relpath(full, "."))
+                    if rel in protected or rel.startswith("data/cleaned_"):
+                        continue
+                    if _should_keep(rel):
+                        continue
+                    try:
+                        os.remove(full)
+                    except Exception:
+                        pass
+            for base, dirs, _ in os.walk(folder, topdown=False):
+                for dname in dirs:
+                    path = os.path.join(base, dname)
+                    try:
+                        if os.path.isdir(path) and not os.listdir(path):
+                            os.rmdir(path)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -1438,8 +1564,8 @@ def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[
         "decision_variable_handling": [
             "Use decision variables only in the optimization/modeling step, not for segmentation.",
         ],
-        "price_optimization": [
-            "Provide a per-segment optimal price derived from Price * P(Success).",
+        "decision_optimization_required": [
+            "Provide decision-optimization evidence aligned to the contract (decision variable, constraints, and scoring formula).",
         ],
         "validation_required": [
             "Add cross-validation or an appropriate validation strategy per evaluation_spec.",
@@ -6102,6 +6228,11 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
     try:
         # Run QA Audit
         evaluation_spec = state.get("evaluation_spec") or (state.get("execution_contract", {}) or {}).get("evaluation_spec")
+        if isinstance(evaluation_spec, dict):
+            evaluation_spec = dict(evaluation_spec)
+        else:
+            evaluation_spec = {}
+        evaluation_spec["ml_data_path"] = state.get("ml_data_path") or "data/cleaned_data.csv"
         try:
             qa_result = qa_reviewer.review_code(code, strategy, business_objective, evaluation_spec)
         except TypeError:
@@ -6551,7 +6682,8 @@ def execute_code(state: AgentState) -> AgentState:
         return {"error_message": msg, "execution_output": msg, "feedback_history": fh, "budget_counters": counters}
 
     required_outputs = _resolve_required_outputs(contract)
-    _purge_execution_outputs(required_outputs)
+    expected_outputs = _resolve_expected_output_paths(contract)
+    _purge_execution_outputs(required_outputs, expected_outputs)
 
     eval_spec = state.get("evaluation_spec") or (contract.get("evaluation_spec") if isinstance(contract, dict) else {})
     allowed_columns = _resolve_allowed_columns_for_gate(state, contract, eval_spec)
@@ -6853,7 +6985,7 @@ def execute_code(state: AgentState) -> AgentState:
 
     outputs_valid = not bool(artifact_issues or stale_outputs or error_in_output)
     if not outputs_valid:
-        _purge_execution_outputs(required_outputs)
+        _purge_execution_outputs(required_outputs, expected_outputs)
         plots_local = []
         fallback_plots_local = []
         has_partial_visuals = False
@@ -6937,10 +7069,10 @@ def execute_code(state: AgentState) -> AgentState:
     artifact_index = _build_artifact_index(artifact_paths, deliverables if isinstance(deliverables, list) else None)
     try:
         os.makedirs("data", exist_ok=True)
-        with open("data/artifact_index.json", "w", encoding="utf-8") as f_idx:
+        with open("data/produced_artifact_index.json", "w", encoding="utf-8") as f_idx:
             json.dump(artifact_index, f_idx, indent=2)
     except Exception as idx_err:
-        print(f"Warning: failed to persist artifact_index.json: {idx_err}")
+        print(f"Warning: failed to persist produced_artifact_index.json: {idx_err}")
 
     result = {
         "execution_output": output,
@@ -6953,6 +7085,7 @@ def execute_code(state: AgentState) -> AgentState:
         "ml_skipped_reason": ml_skipped_reason,
         "output_contract_report": oc_report,
         "artifact_index": artifact_index,
+        "produced_artifact_index": artifact_index,
         "artifact_paths": artifact_paths,
         "sandbox_failed": sandbox_failed,
         "sandbox_retry_count": 0 if not sandbox_failed else state.get("sandbox_retry_count", 0),
@@ -7459,7 +7592,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 objective_type = evaluation_spec.get("objective_type")
         insights_context = {
             "objective_type": objective_type,
-            "artifact_index": state.get("artifact_index") or _load_json_any("data/artifact_index.json"),
+            "artifact_index": state.get("artifact_index") or _load_json_any("data/produced_artifact_index.json"),
             "output_contract_report": oc_report,
             "review_feedback": feedback,
             "metrics": metrics_report,
@@ -7480,13 +7613,14 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 os.makedirs("data", exist_ok=True)
                 with open("data/insights.json", "w", encoding="utf-8") as f_insights:
                     json.dump(insights, f_insights, indent=2, ensure_ascii=False)
-                existing_index = _load_json_any("data/artifact_index.json")
+                existing_index = _load_json_any("data/produced_artifact_index.json")
                 normalized_existing = existing_index if isinstance(existing_index, list) else []
                 additions = _build_artifact_index(["data/insights.json"], None)
                 merged_index = _merge_artifact_index_entries(normalized_existing, additions)
-                with open("data/artifact_index.json", "w", encoding="utf-8") as f_idx:
+                with open("data/produced_artifact_index.json", "w", encoding="utf-8") as f_idx:
                     json.dump(merged_index, f_idx, indent=2)
                 result_state["artifact_index"] = merged_index
+                result_state["produced_artifact_index"] = merged_index
             except Exception as ins_err:
                 print(f"Warning: failed to persist insights.json: {ins_err}")
     except Exception as ins_err:
@@ -7833,13 +7967,14 @@ def run_translator(state: AgentState) -> AgentState:
             os.makedirs("reports", exist_ok=True)
             with open("reports/recommendations_preview.json", "w", encoding="utf-8") as f_prev:
                 json.dump(preview_payload, f_prev, indent=2, ensure_ascii=False)
-            existing_index = _load_json_any("data/artifact_index.json")
+            existing_index = _load_json_any("data/produced_artifact_index.json")
             normalized_existing = existing_index if isinstance(existing_index, list) else []
             additions = _build_artifact_index(["reports/recommendations_preview.json"], deliverables)
             merged_index = _merge_artifact_index_entries(normalized_existing, additions)
-            with open("data/artifact_index.json", "w", encoding="utf-8") as f_idx:
+            with open("data/produced_artifact_index.json", "w", encoding="utf-8") as f_idx:
                 json.dump(merged_index, f_idx, indent=2)
             report_state["artifact_index"] = merged_index
+            report_state["produced_artifact_index"] = merged_index
         except Exception as prev_err:
             print(f"Warning: failed to persist recommendations_preview.json: {prev_err}")
 
@@ -7851,6 +7986,7 @@ def run_translator(state: AgentState) -> AgentState:
                 chosen_source.get("root"),
                 report_root="report",
                 label_col_hint=label_col_hint,
+                contract=contract,
             )
             if staged.get("plots") and not report_state.get("plots_local"):
                 report_state["plots_local"] = staged.get("plots")
@@ -7875,6 +8011,7 @@ def run_translator(state: AgentState) -> AgentState:
                         continue
                     filtered_entries.append(entry)
                 report_state["artifact_index"] = filtered_entries
+                report_state["produced_artifact_index"] = filtered_entries
     report_state["has_partial_visuals"] = bool(report_plots) and error_flag
     report_has_partial = report_state["has_partial_visuals"]
     try:
@@ -7923,13 +8060,14 @@ def run_translator(state: AgentState) -> AgentState:
         os.makedirs("data", exist_ok=True)
         with open("data/executive_summary.md", "w", encoding="utf-8") as f_exec:
             f_exec.write(report or "")
-        existing_index = _load_json_any("data/artifact_index.json")
+        existing_index = _load_json_any("data/produced_artifact_index.json")
         normalized_existing = existing_index if isinstance(existing_index, list) else []
         additions = _build_artifact_index(["data/executive_summary.md"], None)
         merged_index = _merge_artifact_index_entries(normalized_existing, additions)
-        with open("data/artifact_index.json", "w", encoding="utf-8") as f_idx:
+        with open("data/produced_artifact_index.json", "w", encoding="utf-8") as f_idx:
             json.dump(merged_index, f_idx, indent=2)
         report_state["artifact_index"] = merged_index
+        report_state["produced_artifact_index"] = merged_index
     except Exception as exec_err:
         print(f"Warning: failed to persist executive_summary.md: {exec_err}")
 
@@ -7969,7 +8107,7 @@ def run_translator(state: AgentState) -> AgentState:
                 [
                     "data/execution_contract.json",
                     "data/evaluation_spec.json",
-                    "data/artifact_index.json",
+                    "data/produced_artifact_index.json",
                     "data/contract_min.json",
                 ],
             )

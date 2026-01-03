@@ -378,7 +378,12 @@ def write_run_manifest(
     contracts_dir = os.path.join(run_dir, "contracts")
     contract = _safe_load_json(os.path.join(contracts_dir, "execution_contract.json")) or state.get("execution_contract") or {}
     evaluation_spec = _safe_load_json(os.path.join(contracts_dir, "evaluation_spec.json")) or state.get("evaluation_spec") or {}
-    artifact_index = _safe_load_json(os.path.join(contracts_dir, "artifact_index.json")) or state.get("artifact_index") or []
+    artifact_index = (
+        _safe_load_json(os.path.join(run_dir, "artifacts", "data", "produced_artifact_index.json"))
+        or state.get("produced_artifact_index")
+        or state.get("artifact_index")
+        or []
+    )
     output_contract = _safe_load_json(os.path.join(run_dir, "report", "output_contract_report.json"))
     if not output_contract:
         output_contract = _safe_load_json(os.path.join(run_dir, "artifacts", "data", "output_contract_report.json")) or {}

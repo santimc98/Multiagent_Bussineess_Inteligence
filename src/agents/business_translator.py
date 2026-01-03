@@ -222,7 +222,7 @@ class BusinessTranslatorAgent:
         has_partial_visuals = bool(has_partial_visuals)
         plots = plots or []
         artifact_index = _normalize_artifact_index(
-            state.get("artifact_index") or _safe_load_json("data/artifact_index.json") or []
+            state.get("artifact_index") or _safe_load_json("data/produced_artifact_index.json") or []
         )
 
         def _artifact_available(path: str) -> bool:

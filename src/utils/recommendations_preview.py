@@ -1,4 +1,5 @@
 import csv
+import fnmatch
 import hashlib
 import json
 import os
@@ -47,6 +48,76 @@ def _normalize_reporting_policy(contract: Dict[str, Any]) -> Dict[str, Any]:
     merged = dict(defaults)
     merged.update({k: v for k, v in policy.items() if v is not None})
     return merged
+
+
+def _normalize_deliverables(contract: Dict[str, Any]) -> Dict[str, Any]:
+    required_paths: List[str] = []
+    optional_paths: List[str] = []
+    kinds_by_path: Dict[str, str] = {}
+    spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else {}
+    deliverables = spec.get("deliverables") if isinstance(spec, dict) else None
+    if isinstance(deliverables, list) and deliverables:
+        for item in deliverables:
+            if isinstance(item, dict):
+                path = item.get("path") or item.get("output") or item.get("artifact")
+                if not path:
+                    continue
+                kind = item.get("kind")
+                if not kind:
+                    lower = str(path).lower()
+                    if lower.startswith("static/plots/") or lower.endswith((".png", ".jpg", ".jpeg", ".svg")):
+                        kind = "plot"
+                if kind:
+                    kinds_by_path[str(path)] = str(kind)
+                is_required = item.get("required")
+                if is_required is None:
+                    is_required = True
+                if is_required:
+                    required_paths.append(str(path))
+                else:
+                    optional_paths.append(str(path))
+            elif isinstance(item, str):
+                required_paths.append(item)
+    else:
+        required_paths.extend(contract.get("required_outputs", []) or [])
+    requires_plots = any(str(kind).lower() == "plot" for kind in kinds_by_path.values())
+    return {
+        "required_paths": required_paths,
+        "optional_paths": optional_paths,
+        "kinds_by_path": kinds_by_path,
+        "requires_plots": requires_plots,
+    }
+
+
+def _path_matches(pattern: str, rel_path: str) -> bool:
+    if not pattern or not rel_path:
+        return False
+    if any(ch in pattern for ch in ["*", "?", "["]):
+        return fnmatch.fnmatch(rel_path, pattern)
+    return pattern == rel_path
+
+
+def _count_present(paths: List[str], file_set: set[str]) -> Tuple[int, List[str]]:
+    present = []
+    for path in paths:
+        if any(_path_matches(path, rel) for rel in file_set):
+            present.append(path)
+    return len(present), present
+
+
+def _load_output_contract_report(root_dir: str) -> Dict[str, Any]:
+    if not root_dir:
+        return {}
+    candidates = [
+        os.path.join(root_dir, "data", "output_contract_report.json"),
+        os.path.join(root_dir, "report", "output_contract_report.json"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            payload = _safe_load_json(path)
+            if isinstance(payload, dict):
+                return payload
+    return {}
 
 
 def _ensure_item_fields(item: Dict[str, Any], source_path: str) -> Dict[str, Any]:
@@ -321,6 +392,17 @@ def _entry_has_blocking_issue(entry: Dict[str, Any]) -> bool:
     return any(tok in joined for tok in contract_tokens)
 
 
+def _blocking_reasons_from_entry(entry: Dict[str, Any]) -> List[str]:
+    reasons: List[str] = []
+    if not isinstance(entry, dict):
+        return reasons
+    for key in ("preflight_issues", "reviewer_reasons", "qa_reasons", "failed_gates"):
+        vals = entry.get(key)
+        if isinstance(vals, list):
+            reasons.extend([str(v) for v in vals if v])
+    return list(dict.fromkeys(reasons))
+
+
 def _hash_code_text(code: str) -> str:
     if not code:
         return ""
@@ -347,6 +429,26 @@ def _attempt_is_blocked(attempt_dir: str, journal_entries: List[Dict[str, Any]])
     return False
 
 
+def _attempt_blocking_reasons(attempt_dir: str, journal_entries: List[Dict[str, Any]]) -> List[str]:
+    if not journal_entries:
+        return []
+    code_path = os.path.join(attempt_dir, "code_sent.py")
+    if not os.path.exists(code_path):
+        return []
+    try:
+        with open(code_path, "r", encoding="utf-8") as f_code:
+            code = f_code.read()
+    except Exception:
+        return []
+    code_hash = _hash_code_text(code)
+    if not code_hash:
+        return []
+    for entry in journal_entries:
+        if entry.get("code_hash") == code_hash and _entry_has_blocking_issue(entry):
+            return _blocking_reasons_from_entry(entry)
+    return []
+
+
 def _list_downloaded_files(root_dir: str) -> List[str]:
     files: List[str] = []
     for base, _, names in os.walk(root_dir):
@@ -357,10 +459,59 @@ def _list_downloaded_files(root_dir: str) -> List[str]:
     return files
 
 
-def _select_best_attempt(run_dir: str) -> Dict[str, Any] | None:
+def _score_source_root(
+    root_dir: str,
+    deliverable_spec: Dict[str, Any],
+    blocking_reasons: List[str] | None = None,
+) -> Dict[str, Any]:
+    files = _list_downloaded_files(root_dir) if root_dir and os.path.isdir(root_dir) else []
+    file_set = set(files)
+    required_paths = deliverable_spec.get("required_paths") or []
+    optional_paths = deliverable_spec.get("optional_paths") or []
+    requires_plots = bool(deliverable_spec.get("requires_plots"))
+
+    required_total = len(required_paths)
+    required_present, present_required = _count_present(required_paths, file_set)
+    optional_present, present_optional = _count_present(optional_paths, file_set)
+    plots_present = any(path.startswith("static/plots/") for path in file_set)
+
+    output_report = _load_output_contract_report(root_dir)
+    reasons = list(blocking_reasons or [])
+    if required_total and not output_report:
+        reasons.append("output_contract_missing")
+    missing_required = output_report.get("missing", []) if isinstance(output_report, dict) else []
+    if missing_required:
+        reasons.append("output_contract_missing")
+
+    required_ratio = 1.0 if required_total == 0 else (required_present / max(required_total, 1))
+    score = (10.0 * required_ratio) + (2.0 * optional_present)
+    if requires_plots and plots_present:
+        score += 1.0
+    if reasons:
+        score = -1e9
+
+    return {
+        "root": root_dir,
+        "files": files,
+        "integrity_pass": not reasons,
+        "reasons": reasons,
+        "score": score,
+        "score_breakdown": {
+            "required_present": required_present,
+            "required_total": required_total,
+            "optional_present": optional_present,
+            "plots_present": plots_present,
+            "required_ratio": required_ratio,
+        },
+        "present_required": present_required,
+        "present_optional": present_optional,
+    }
+
+
+def _select_best_attempt(run_dir: str, deliverable_spec: Dict[str, Any]) -> Tuple[Dict[str, Any] | None, List[Dict[str, Any]]]:
     sandbox_dir = os.path.join(run_dir, "sandbox", "ml_engineer")
     if not os.path.isdir(sandbox_dir):
-        return None
+        return None, []
     journal_entries = _load_iteration_journal(run_dir)
     attempt_dirs = []
     for name in os.listdir(sandbox_dir):
@@ -370,48 +521,22 @@ def _select_best_attempt(run_dir: str) -> Dict[str, Any] | None:
         if os.path.isdir(attempt_path):
             attempt_dirs.append((name, attempt_path))
     if not attempt_dirs:
-        return None
+        return None, []
     candidates: List[Dict[str, Any]] = []
     for name, attempt_path in attempt_dirs:
-        if _attempt_is_blocked(attempt_path, journal_entries):
-            continue
         downloaded_root = os.path.join(attempt_path, "downloaded_artifacts")
         if not os.path.isdir(downloaded_root):
             continue
-        files = _list_downloaded_files(downloaded_root)
-        file_set = set(files)
-        report_files = [rel for rel in file_set if rel.startswith("reports/") and rel.endswith(".json")]
-        if not report_files:
-            continue
-        score = 0
-        if "reports/recommendations.json" in file_set:
-            score += 5
-        if report_files:
-            score += 2
-        if "reports/price_optimization_summary.json" in file_set:
-            score += 1
-        if "reports/optimization_results.json" in file_set:
-            score += 2
-        if "data/metrics.json" in file_set:
-            score += 1
-        if "data/alignment_check.json" in file_set:
-            score += 1
-        if any(path.startswith("static/plots/") for path in file_set):
-            score += 1
+        blocking = _attempt_blocking_reasons(attempt_path, journal_entries)
+        scored = _score_source_root(downloaded_root, deliverable_spec, blocking)
         attempt_num = int(name.split("_")[-1]) if name.split("_")[-1].isdigit() else 0
-        candidates.append(
-            {
-                "attempt": attempt_num,
-                "name": name,
-                "root": downloaded_root,
-                "score": score,
-                "files": files,
-            }
-        )
+        scored.update({"attempt": attempt_num, "name": name})
+        candidates.append(scored)
     if not candidates:
-        return None
-    candidates.sort(key=lambda item: (item["score"], item["attempt"]), reverse=True)
-    return candidates[0]
+        return None, []
+    candidates.sort(key=lambda item: (item["score"], item.get("attempt", 0)), reverse=True)
+    best = candidates[0] if candidates[0].get("integrity_pass") else None
+    return best, candidates
 
 
 def build_recommendations_preview(
@@ -422,12 +547,13 @@ def build_recommendations_preview(
 ) -> Dict[str, Any]:
     contract = contract or {}
     policy = _normalize_reporting_policy(contract)
+    deliverable_spec = _normalize_deliverables(contract)
     governance_summary = governance_summary or {}
     run_outcome = governance_summary.get("run_outcome") or governance_summary.get("status") or "UNKNOWN"
     counterfactual_policy = contract.get("counterfactual_policy") or "unknown"
     recommendation_scope = contract.get("recommendation_scope") or ""
     max_examples = int(policy.get("max_examples") or 5)
-    sources_checked: List[str] = []
+    sources_checked: List[Dict[str, Any]] = []
     sources_used: List[str] = []
     caveats: List[str] = []
     items: List[Dict[str, Any]] = []
@@ -438,93 +564,96 @@ def build_recommendations_preview(
         rel = rel_path.replace("\\", "/")
         return f"{prefix}{rel}" if prefix else rel
 
-    def _scan_reports_dir(root_dir: str, prefix: str, include_legacy: bool) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
+    def _scan_reports_dir(root_dir: str, prefix: str) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
         checked: List[str] = []
         used: List[str] = []
         reports_dir = os.path.join(root_dir, "reports")
         if not os.path.isdir(reports_dir):
             return [], checked, used
-        legacy_files = {"optimization_results.json", "price_optimization_summary.json"}
         report_files = [name for name in os.listdir(reports_dir) if name.lower().endswith(".json")]
         report_files.sort()
-        preferred = "recommendations.json"
-        if preferred in report_files:
-            report_files.remove(preferred)
-            report_files.insert(0, preferred)
 
         for name in report_files:
-            if not include_legacy and name in legacy_files:
-                continue
             rel_path = _label_source(prefix, f"reports/{name}")
             checked.append(rel_path)
             payload = _safe_load_json(os.path.join(reports_dir, name))
             items = _extract_items_from_payload(payload, rel_path)
             if not items:
                 items = _extract_recommended_pairs(payload, rel_path)
+            if not items:
+                items = _extract_items_from_legacy_summary(payload, rel_path)
+            if not items:
+                items = _extract_items_from_optimization(payload, rel_path)
             if items:
                 used.append(rel_path)
                 return items, checked, used
         return [], checked, used
 
     def _collect_items_from_root(root_dir: str, prefix: str) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
-        collected: List[Dict[str, Any]] = []
         checked: List[str] = []
         used: List[str] = []
-        items, checked, used = _scan_reports_dir(root_dir, prefix, include_legacy=False)
-        if items:
-            return items, checked, used
-
-        legacy_checked: List[str] = []
-        legacy_used: List[str] = []
-        reports_dir = os.path.join(root_dir, "reports")
-        if os.path.isdir(reports_dir):
-            opt_path = os.path.join(reports_dir, "optimization_results.json")
-            if os.path.exists(opt_path):
-                rel_path = _label_source(prefix, "reports/optimization_results.json")
-                legacy_checked.append(rel_path)
-                payload = _safe_load_json(opt_path)
-                items = _extract_items_from_optimization(payload, rel_path)
-                if items:
-                    legacy_used.append(rel_path)
-            if not items:
-                summary_path = os.path.join(reports_dir, "price_optimization_summary.json")
-                if os.path.exists(summary_path):
-                    rel_path = _label_source(prefix, "reports/price_optimization_summary.json")
-                    legacy_checked.append(rel_path)
-                    payload = _safe_load_json(summary_path)
-                    items = _extract_items_from_legacy_summary(payload, rel_path)
-                    if items:
-                        legacy_used.append(rel_path)
-
-        checked.extend(legacy_checked)
-        used.extend(legacy_used)
+        items, checked, used = _scan_reports_dir(root_dir, prefix)
         return items, checked, used
 
-    items, checked, used = _collect_items_from_root(artifacts_dir, "")
-    sources_checked.extend(checked)
-    sources_used.extend(used)
-    if items:
-        chosen_source = {
-            "kind": "artifacts",
-            "root": os.path.abspath(artifacts_dir),
+    candidates: List[Dict[str, Any]] = []
+    artifact_blocking: List[str] = []
+    if isinstance(governance_summary, dict):
+        for key in ("failed_gates", "preflight_issues", "qa_reasons", "reviewer_reasons"):
+            vals = governance_summary.get(key)
+            if isinstance(vals, list):
+                artifact_blocking.extend([str(v) for v in vals if v])
+    artifacts_eval = _score_source_root(artifacts_dir, deliverable_spec, artifact_blocking)
+    sources_checked.append(
+        {
+            "attempt_root": os.path.abspath(artifacts_dir),
+            "integrity_pass": artifacts_eval["integrity_pass"],
+            "reasons": artifacts_eval["reasons"],
+            "score_breakdown": artifacts_eval["score_breakdown"],
         }
+    )
+    if artifacts_eval["integrity_pass"]:
+        candidates.append({"kind": "artifacts", **artifacts_eval})
 
-    if not items and governance_summary and governance_summary.get("run_id"):
+    attempt_candidates: List[Dict[str, Any]] = []
+    if governance_summary and governance_summary.get("run_id"):
         run_id = str(governance_summary.get("run_id"))
         run_dir = os.path.join("runs", run_id)
-        attempt = _select_best_attempt(run_dir)
-        if attempt:
-            prefix = f"sandbox/ml_engineer/attempt_{attempt['attempt']}/downloaded_artifacts/"
-            attempt_items, checked, used = _collect_items_from_root(attempt["root"], prefix)
-            sources_checked.extend(checked)
+        best_attempt, attempt_candidates = _select_best_attempt(run_dir, deliverable_spec)
+        for candidate in attempt_candidates:
+            sources_checked.append(
+                {
+                    "attempt_root": os.path.abspath(candidate["root"]),
+                    "integrity_pass": candidate["integrity_pass"],
+                    "reasons": candidate["reasons"],
+                    "score_breakdown": candidate["score_breakdown"],
+                }
+            )
+        if best_attempt and best_attempt.get("integrity_pass"):
+            best_attempt["run_id"] = run_id
+            candidates.append({"kind": "sandbox_attempt", **best_attempt})
+
+    if candidates:
+        candidates.sort(key=lambda item: item.get("score", -1e9), reverse=True)
+        best = candidates[0]
+        if best.get("kind") == "sandbox_attempt":
+            prefix = f"sandbox/ml_engineer/attempt_{best['attempt']}/downloaded_artifacts/"
+            attempt_items, checked, used = _collect_items_from_root(best["root"], prefix)
             sources_used.extend(used)
-            if attempt_items:
-                items = attempt_items
+            items = attempt_items
             chosen_source = {
                 "kind": "sandbox_attempt",
-                "run_id": run_id,
-                "attempt": attempt["attempt"],
-                "root": os.path.abspath(attempt["root"]),
+                "run_id": best.get("run_id"),
+                "attempt": best.get("attempt"),
+                "root": os.path.abspath(best.get("root")),
+                "score_breakdown": best.get("score_breakdown"),
+            }
+        else:
+            items, checked, used = _collect_items_from_root(artifacts_dir, "")
+            sources_used.extend(used)
+            chosen_source = {
+                "kind": "artifacts",
+                "root": os.path.abspath(artifacts_dir),
+                "score_breakdown": best.get("score_breakdown"),
             }
 
     items = [item for item in items if isinstance(item, dict)]
@@ -556,6 +685,14 @@ def build_recommendations_preview(
 
     if not items:
         reason = "insufficient_artifacts"
+        if not chosen_source and sources_checked:
+            reasons = []
+            for entry in sources_checked:
+                for item in entry.get("reasons", []) if isinstance(entry, dict) else []:
+                    reasons.append(str(item))
+            if reasons:
+                deduped = list(dict.fromkeys(reasons))[:6]
+                reason = f"no_valid_sources: {', '.join(deduped)}"
     if run_outcome in {"NO_GO", "GO_WITH_LIMITATIONS"}:
         caveats.append("Illustrative examples only; not production-ready.")
         caveats.append("Do not claim causal impact from these examples.")

@@ -89,7 +89,7 @@ class QAReviewerAgent:
            - If saving plots, `os.makedirs('static/plots', exist_ok=True)` MUST be called.
 
         5. INPUT CSV LOADING (only if gate enabled):
-           - The code MUST call pandas.read_csv(...) to load the provided dataset.
+           - The code MUST call pandas.read_csv(...) to load the ML dataset specified in context (ml_data_path).
 
         6. NO SYNTHETIC DATA (only if gate enabled):
            - The code MUST NOT fabricate datasets via random generators, sklearn.datasets.make_*, or literal DataFrame constructors.
@@ -101,6 +101,7 @@ class QAReviewerAgent:
         - Business Objective: "$business_objective"
         - Strategy: $strategy_title
         - Evaluation Spec (JSON): $evaluation_spec_json
+        - ML Dataset Path: $ml_data_path
         - QA Gates (only these can fail): $qa_gates
         - If QA Gates are empty, enforce minimal universal gates only (variance, train/eval separation, leakage basic, dialect mismatch handling, group split, security sandbox).
         
@@ -116,11 +117,13 @@ class QAReviewerAgent:
         $output_format_instructions
         """
         
+        ml_data_path = (evaluation_spec or {}).get("ml_data_path") or "data/cleaned_data.csv"
         system_prompt = render_prompt(
             SYSTEM_PROMPT_TEMPLATE,
             business_objective=business_objective,
             strategy_title=strategy.get('title', 'Unknown'),
             evaluation_spec_json=eval_spec_json,
+            ml_data_path=ml_data_path,
             qa_gates=qa_gates,
             output_format_instructions=output_format_instructions
         )
@@ -638,6 +641,7 @@ def run_static_qa_checks(
     require_group_split = "group_split_required" in qa_gate_set
     require_security = "security_sandbox" in qa_gate_set
     require_read_csv = "must_read_input_csv" in qa_gate_set
+    ml_data_path = (evaluation_spec or {}).get("ml_data_path") or "data/cleaned_data.csv"
     require_no_synth = "no_synthetic_data" in qa_gate_set
     require_contract_columns = "must_reference_contract_columns" in qa_gate_set
     train_eval_gate = None
@@ -682,8 +686,8 @@ def run_static_qa_checks(
     if require_read_csv and not scanner.has_read_csv:
         _flag(
             "must_read_input_csv",
-            "Missing pandas.read_csv call; code must load the provided input CSV.",
-            "Read the input CSV with pandas.read_csv and use it as the dataset source.",
+            f"Missing pandas.read_csv call; code must load the ML dataset ({ml_data_path}).",
+            f"Read the ML dataset via pandas.read_csv('{ml_data_path}') and use it as the dataset source.",
         )
 
     if require_no_synth and scanner.has_synthetic_data:

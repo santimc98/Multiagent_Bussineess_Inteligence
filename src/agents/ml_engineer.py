@@ -199,7 +199,7 @@ class MLEngineerAgent:
         rules_block = "\n".join(
             [
                 "- No synthetic/placeholder data. Load only the provided dataset.",
-                "- Do not create new df columns unless explicitly allowed by contract/patterns.",
+                "- Never assign new columns on df; use df_work = df.copy() for derived columns or compute Series directly.",
                 "- Baseline model is required.",
                 "- Include SimpleImputer in preprocessing when NaNs may exist.",
                 "- Write all required outputs to exact paths.",
@@ -287,7 +287,7 @@ class MLEngineerAgent:
         2) If RUNTIME_ERROR_CONTEXT is present in the audit, fix root cause and regenerate the FULL script.
         3) NEVER generate synthetic/placeholder data. Always load from '$data_path' only.
         4) Do NOT invent column names. Use only columns from the contract/canonical list and the loaded dataset.
-        5) Do NOT add/overwrite df columns unless the name is explicitly allowed by the contract. Prefer Pipeline/ColumnTransformer transforms over df["new_col"]=... .
+        5) NEVER assign columns to df or call df.assign(...). Do NOT use df["new_col"] = ... or df.assign(...). If you need derived columns, create df_work = df.copy() and assign there (or compute Series and use them directly for outputs). If a required column is missing, raise ValueError (no dummy values).
         6) NEVER create DataFrames from literals (pd.DataFrame({}), from_dict, or lists/tuples). No np.random/random/faker.
         7) scored_rows.csv may include ONLY allowed columns per the contract. Any extra derived columns (e.g., price_delta) must be written to a separate artifact file.
         8) Start the script with a short comment block labeled PLAN describing: detected columns, row_id construction, scored_rows columns, and where extra derived artifacts go.
