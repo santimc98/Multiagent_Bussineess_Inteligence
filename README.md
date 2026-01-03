@@ -48,6 +48,7 @@ Our system mimics a high-performing human data team:
 -   **🛡️ Self-Healing Pipelines**: Missing values? Typos? The ML Engineer agent detects these issues and writes code to impute or clean them automatically, ensuring the pipeline never breaks on "messy" real-world data.
 -   **💼 Business-First Approach**: We don't stop at `Accuracy: 0.85`. We tell you *what that means* for your bottom line. The system is aligned with business objectives, not just loss functions.
 -   **🔄 End-to-End Automation**: From `upload.csv` to a Board-ready report in minutes. No notebooks, no manual tuning, just results.
+-   **🧭 Illustrative Recommendations**: Optional `reports/recommendations_preview.json` provides policy-driven examples when outcomes are `NO_GO` or `GO_WITH_LIMITATIONS`, with strong disclaimers and scope limits.
 
 ---
 

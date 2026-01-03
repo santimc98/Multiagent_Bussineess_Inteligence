@@ -84,6 +84,7 @@ from src.utils.governance import write_governance_report, build_run_summary
 from src.utils.data_adequacy import build_data_adequacy_report, write_data_adequacy_report
 from src.utils.code_extract import is_syntax_valid
 from src.utils.visuals import generate_fallback_plots
+from src.utils.recommendations_preview import build_recommendations_preview
 
 def _norm_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
@@ -7642,7 +7643,7 @@ def run_translator(state: AgentState) -> AgentState:
     run_id = state.get("run_id")
     if run_id:
         log_run_event(run_id, "translator_start", {})
-    
+
     error_msg = state.get("error_message")
     
     # Extract visuals context
@@ -7651,6 +7652,14 @@ def run_translator(state: AgentState) -> AgentState:
     fallback_plots = state.get("fallback_plots", [])
     
     report_state = dict(state)
+    summary = None
+    try:
+        summary = build_run_summary(state)
+        os.makedirs("data", exist_ok=True)
+        with open("data/run_summary.json", "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+    except Exception:
+        summary = None
     report_error = error_msg
     if error_msg and "BUDGET_EXCEEDED" in str(error_msg) and state.get("last_successful_execution_output"):
         report_state["execution_output"] = state.get("last_successful_execution_output")
@@ -7660,6 +7669,59 @@ def run_translator(state: AgentState) -> AgentState:
         report_error = None
     report_state.setdefault("execution_error", state.get("execution_error", False))
     report_state.setdefault("sandbox_failed", state.get("sandbox_failed", False))
+    contract = report_state.get("execution_contract", {}) or {}
+    deliverables = (contract.get("spec_extraction") or {}).get("deliverables")
+    has_preview_deliverable = False
+    if isinstance(deliverables, list):
+        for item in deliverables:
+            if isinstance(item, dict) and item.get("path") == "reports/recommendations_preview.json":
+                has_preview_deliverable = True
+                break
+            if isinstance(item, str) and item == "reports/recommendations_preview.json":
+                has_preview_deliverable = True
+                break
+    reporting_policy = contract.get("reporting_policy") if isinstance(contract, dict) else {}
+    preview_enabled = True
+    if isinstance(reporting_policy, dict) and reporting_policy.get("demonstrative_examples_enabled") is False:
+        preview_enabled = False
+    if has_preview_deliverable and preview_enabled:
+        output_text = report_state.get("execution_output", "") or ""
+        artifact_guard = "ARTIFACT_ALIGNMENT_GUARD" in output_text
+        stale_guard = "STALE_OUTPUTS" in output_text
+        artifacts_valid = not (
+            report_state.get("execution_error")
+            or report_state.get("sandbox_failed")
+            or artifact_guard
+            or stale_guard
+        )
+        cleaned_path = "data/cleaned_full.csv" if os.path.exists("data/cleaned_full.csv") else "data/cleaned_data.csv"
+        preview_payload = build_recommendations_preview(
+            contract=contract,
+            governance_summary=summary or {},
+            artifacts_dir=".",
+            cleaned_data_path=cleaned_path if os.path.exists(cleaned_path) else None,
+        )
+        if not artifacts_valid:
+            preview_payload["items"] = []
+            preview_payload["reason"] = preview_payload.get("reason") or "artifacts_invalid"
+            preview_payload["status"] = "illustrative_only"
+            preview_payload["risk_level"] = "high"
+            preview_payload.setdefault("caveats", []).append(
+                "Artifacts were invalid or blocked; examples withheld."
+            )
+        try:
+            os.makedirs("reports", exist_ok=True)
+            with open("reports/recommendations_preview.json", "w", encoding="utf-8") as f_prev:
+                json.dump(preview_payload, f_prev, indent=2, ensure_ascii=False)
+            existing_index = _load_json_any("data/artifact_index.json")
+            normalized_existing = existing_index if isinstance(existing_index, list) else []
+            additions = _build_artifact_index(["reports/recommendations_preview.json"], deliverables)
+            merged_index = _merge_artifact_index_entries(normalized_existing, additions)
+            with open("data/artifact_index.json", "w", encoding="utf-8") as f_idx:
+                json.dump(merged_index, f_idx, indent=2)
+            report_state["artifact_index"] = merged_index
+        except Exception as prev_err:
+            print(f"Warning: failed to persist recommendations_preview.json: {prev_err}")
     report_plots = report_state.get("plots_local", plots_local)
     artifact_entries = report_state.get("artifact_index") or []
     report_artifacts = [
@@ -7749,7 +7811,7 @@ def run_translator(state: AgentState) -> AgentState:
     try:
         write_data_adequacy_report(state)
         write_governance_report(state)
-        summary = build_run_summary(state)
+        summary = summary or build_run_summary(state)
         try:
             os.makedirs("data", exist_ok=True)
             with open("data/run_summary.json", "w", encoding="utf-8") as f:

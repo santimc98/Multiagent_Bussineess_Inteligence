@@ -768,6 +768,7 @@ class ExecutionPlannerAgent:
                 "data/scored_rows.csv": "Row-level scores and key features.",
                 "data/alignment_check.json": "Alignment check results for contract requirements.",
                 "static/plots/*.png": "Required diagnostic plots.",
+                "reports/recommendations_preview.json": "Illustrative recommendation examples for the executive report.",
             }
             if path in known:
                 return known[path]
@@ -889,6 +890,12 @@ class ExecutionPlannerAgent:
             _add("data/predictions.csv", False, "predictions", "Optional predictions output.")
             _add("data/feature_importances.json", False, "feature_importances", "Optional feature importance output.")
             _add("data/error_analysis.json", False, "error_analysis", "Optional error analysis output.")
+            _add(
+                "reports/recommendations_preview.json",
+                False,
+                "report",
+                "Optional illustrative recommendation preview for executive reporting.",
+            )
 
             target_type = str(spec_obj.get("target_type") or "").lower()
             scoring_formula = spec_obj.get("scoring_formula")
@@ -1470,6 +1477,23 @@ class ExecutionPlannerAgent:
                 contract["iteration_policy"] = {}
             return contract
 
+        def _attach_reporting_policy(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            policy = contract.get("reporting_policy")
+            if not isinstance(policy, dict):
+                policy = {}
+            if "demonstrative_examples_enabled" not in policy:
+                policy["demonstrative_examples_enabled"] = True
+            if "demonstrative_examples_when_outcome_in" not in policy:
+                policy["demonstrative_examples_when_outcome_in"] = ["NO_GO", "GO_WITH_LIMITATIONS"]
+            if "max_examples" not in policy:
+                policy["max_examples"] = 5
+            if "require_strong_disclaimer" not in policy:
+                policy["require_strong_disclaimer"] = True
+            contract["reporting_policy"] = policy
+            return contract
+
         def _normalize_alignment_requirements(items: Any) -> List[Dict[str, Any]]:
             if not isinstance(items, list):
                 return []
@@ -1924,6 +1948,7 @@ class ExecutionPlannerAgent:
             contract = _attach_counterfactual_policy(contract)
             contract = _attach_alignment_requirements(contract)
             contract = _ensure_iteration_policy(contract)
+            contract = _attach_reporting_policy(contract)
             return _attach_spec_extraction_to_runbook(contract)
 
         if not self.client:
@@ -2043,6 +2068,7 @@ Return the contract JSON.
             contract = _attach_counterfactual_policy(contract)
             contract = _attach_alignment_requirements(contract)
             contract = _ensure_iteration_policy(contract)
+            contract = _attach_reporting_policy(contract)
             return _attach_spec_extraction_to_runbook(contract)
         except Exception:
             return _fallback()

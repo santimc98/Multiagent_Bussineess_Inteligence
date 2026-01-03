@@ -268,6 +268,7 @@ class BusinessTranslatorAgent:
         steward_summary = _safe_load_json("data/steward_summary.json") or {}
         cleaning_manifest = _safe_load_json("data/cleaning_manifest.json") or {}
         run_summary = _safe_load_json("data/run_summary.json") or {}
+        recommendations_preview = _safe_load_json("reports/recommendations_preview.json") or {}
         weights_path = _first_artifact_path(artifact_index, "weights")
         predictions_path = _first_artifact_path(artifact_index, "predictions")
         weights_payload = _safe_load_json(weights_path) if weights_path else None
@@ -528,6 +529,7 @@ class BusinessTranslatorAgent:
         model_metrics_context = _summarize_model_metrics()
         facts_context = _facts_from_insights(insights) or _build_fact_cards(case_summary_context, scored_rows_context, weights_context, data_adequacy_context)
         artifacts_context = artifact_index if artifact_index else []
+        reporting_policy_context = contract.get("reporting_policy", {}) if isinstance(contract, dict) else {}
 
         # Define Template
         SYSTEM_PROMPT_TEMPLATE = Template("""
@@ -569,10 +571,18 @@ class BusinessTranslatorAgent:
         - Scored Rows Snapshot: $scored_rows_context
         - Plot Insights (data-driven): $plot_insights_json
         - Artifacts Available: $artifacts_context
+        - Recommendations Preview: $recommendations_preview_context
+        - Reporting Policy: $reporting_policy_context
 
         GUIDANCE:
         - Use Insights as the primary evidence source; only reference other artifacts if they add clear value.
-        
+        - If reporting_policy.demonstrative_examples_enabled is true AND run_outcome is in reporting_policy.demonstrative_examples_when_outcome_in,
+          you MUST include a section titled "Ejemplos ilustrativos (no aptos para producción)".
+          Use recommendations_preview.items (max 3-5) and include strong disclaimers plus support (n, observed_support if available).
+          If items are empty, explain why using recommendations_preview.reason and mention which artifact was missing.
+        - If run_outcome is GO, you may include a short "Recommendations Snapshot" section if recommendations_preview.items exists,
+          without the "illustrative" labeling.
+
         ERROR CONDITION:
         $error_condition
         
@@ -642,7 +652,9 @@ class BusinessTranslatorAgent:
             case_summary_context=json.dumps(case_summary_context, ensure_ascii=False),
             scored_rows_context=json.dumps(scored_rows_context, ensure_ascii=False),
             plot_insights_json=json.dumps(plot_insights, ensure_ascii=False),
-            artifacts_context=json.dumps(artifacts_context, ensure_ascii=False)
+            artifacts_context=json.dumps(artifacts_context, ensure_ascii=False),
+            recommendations_preview_context=json.dumps(recommendations_preview, ensure_ascii=False),
+            reporting_policy_context=json.dumps(reporting_policy_context, ensure_ascii=False)
         )
         
         # Execution Results
