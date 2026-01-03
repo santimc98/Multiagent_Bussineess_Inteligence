@@ -86,7 +86,7 @@ from src.utils.data_adequacy import build_data_adequacy_report, write_data_adequ
 from src.utils.code_extract import is_syntax_valid
 from src.utils.visuals import generate_fallback_plots
 from src.utils.recommendations_preview import build_recommendations_preview
-from src.utils.segment_enrichment import enrich_segmented_summary_json
+from src.utils.label_enrichment import enrich_outputs
 
 def _norm_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
@@ -115,8 +115,7 @@ def _normalize_path_posix(path: str) -> str:
 def _stage_illustrative_assets(
     source_root: str,
     report_root: str = "report",
-    segment_label_column: str | None = None,
-    segment_id_key: str = "segment_id",
+    label_col_hint: str | None = None,
 ) -> Dict[str, Any]:
     staged = {"plots": [], "jsons": [], "csvs": [], "metadata_path": None}
     if not source_root or not os.path.isdir(source_root):
@@ -153,16 +152,16 @@ def _stage_illustrative_assets(
                 staged["csvs"].append(dest_posix)
                 scored_rows_dest = dest
 
-    if summary_dest and scored_rows_dest and segment_label_column:
+    if summary_dest and scored_rows_dest and label_col_hint:
         try:
-            enrich_segmented_summary_json(
-                summary_dest,
+            meta = enrich_outputs(
                 scored_rows_dest,
-                segment_label_column=segment_label_column,
-                segment_id_key=segment_id_key,
+                summary_json_path=summary_dest,
+                label_col_hint=label_col_hint,
             )
+            staged["label_enrichment_meta"] = meta
         except Exception as err:
-            print(f"Warning: illustrative segment enrichment failed: {err}")
+            print(f"Warning: illustrative label enrichment failed: {err}")
 
     metadata = {
         "status": "illustrative_only",
@@ -7845,13 +7844,13 @@ def run_translator(state: AgentState) -> AgentState:
             print(f"Warning: failed to persist recommendations_preview.json: {prev_err}")
 
         if isinstance(chosen_source, dict) and chosen_source.get("kind") == "sandbox_attempt":
-            segment_label_column = None
+            label_col_hint = None
             if isinstance(contract, dict):
-                segment_label_column = contract.get("segment_label_column")
+                label_col_hint = contract.get("segment_label_column")
             staged = _stage_illustrative_assets(
                 chosen_source.get("root"),
                 report_root="report",
-                segment_label_column=segment_label_column,
+                label_col_hint=label_col_hint,
             )
             if staged.get("plots") and not report_state.get("plots_local"):
                 report_state["plots_local"] = staged.get("plots")

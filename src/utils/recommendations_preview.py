@@ -49,71 +49,80 @@ def _normalize_reporting_policy(contract: Dict[str, Any]) -> Dict[str, Any]:
     return merged
 
 
-def _extract_segment_from_item(item: Dict[str, Any]) -> Dict[str, Any]:
-    segment = {}
-    if isinstance(item.get("segment"), dict):
-        segment.update(item.get("segment") or {})
-    segment_keys = [
-        k for k in item.keys()
-        if any(tok in str(k).lower() for tok in ["segment", "cluster", "group", "tier", "band", "bucket", "category"])
-    ]
-    for key in segment_keys:
-        val = item.get(key)
-        if val not in (None, ""):
-            segment[key] = val
-    return segment
+def _ensure_item_fields(item: Dict[str, Any], source_path: str) -> Dict[str, Any]:
+    normalized = dict(item)
+    if "title" not in normalized:
+        title = None
+        for key in ("title", "name", "action", "recommendation", "label", "id", "segment_id"):
+            val = normalized.get(key)
+            if val not in (None, ""):
+                title = str(val)
+                break
+        normalized["title"] = title or ""
+    if "reason" not in normalized:
+        reason = None
+        for key in ("reason", "rationale", "notes", "because"):
+            val = normalized.get(key)
+            if val not in (None, ""):
+                reason = val
+                break
+        normalized["reason"] = reason if reason is not None else ""
+    caveats = normalized.get("caveats")
+    if not isinstance(caveats, list):
+        if caveats in (None, ""):
+            caveats = []
+        else:
+            caveats = [str(caveats)]
+    normalized["caveats"] = caveats
+    normalized["source_path"] = source_path
+    return normalized
 
 
-def _extract_actions_from_item(item: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    current_action: Dict[str, Any] = {}
-    suggested_action: Dict[str, Any] = {}
-    for key, value in item.items():
-        if value in (None, ""):
+def _extract_items_from_payload(payload: Any, source_path: str) -> List[Dict[str, Any]]:
+    if not payload:
+        return []
+    candidates: List[Dict[str, Any]] = []
+    if isinstance(payload, list):
+        candidates = [item for item in payload if isinstance(item, dict)]
+    elif isinstance(payload, dict):
+        for key in ("items", "recommendations", "actions", "next_steps"):
+            if isinstance(payload.get(key), list):
+                candidates = [item for item in payload.get(key) if isinstance(item, dict)]
+                break
+    return [_ensure_item_fields(item, source_path) for item in candidates]
+
+
+def _extract_recommended_pairs(payload: Any, source_path: str) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    items: List[Dict[str, Any]] = []
+    for key, value in payload.items():
+        if not str(key).lower().startswith("recommended_"):
             continue
-        key_lower = str(key).lower()
-        if key_lower.startswith(("current_", "existing_", "baseline_", "prev_")):
-            current_action[key] = value
-        elif key_lower.startswith(("suggested_", "recommended_", "proposed_", "new_")):
-            suggested_action[key] = value
-    if isinstance(item.get("current_action"), dict):
-        current_action.update(item.get("current_action") or {})
-    if isinstance(item.get("suggested_action"), dict):
-        suggested_action.update(item.get("suggested_action") or {})
-    return current_action, suggested_action
+        items.append(
+            _ensure_item_fields(
+                {
+                    "title": str(key),
+                    "value": value,
+                },
+                source_path,
+            )
+        )
+    return items
 
 
-def _extract_expected_effect(item: Dict[str, Any]) -> Dict[str, Any]:
-    expected_effect: Dict[str, Any] = {}
-    if isinstance(item.get("expected_effect"), dict):
-        expected_effect.update(item.get("expected_effect") or {})
-    for key, value in item.items():
-        if value in (None, ""):
+def _extract_items_from_legacy_summary(payload: Any, source_path: str) -> List[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    segments = payload.get("segments")
+    if not isinstance(segments, list):
+        return []
+    items: List[Dict[str, Any]] = []
+    for entry in segments:
+        if not isinstance(entry, dict):
             continue
-        key_lower = str(key).lower()
-        if any(tok in key_lower for tok in ["delta", "uplift", "impact", "lift", "effect"]):
-            expected_effect[key] = value
-    if "metric" not in expected_effect:
-        metric = item.get("metric") or item.get("metric_name")
-        if metric:
-            expected_effect["metric"] = metric
-    if "notes" not in expected_effect:
-        notes = item.get("notes") or item.get("reason")
-        if notes:
-            expected_effect["notes"] = notes
-    return expected_effect
-
-
-def _extract_support(item: Dict[str, Any]) -> Dict[str, Any]:
-    support: Dict[str, Any] = {}
-    if isinstance(item.get("support"), dict):
-        support.update(item.get("support") or {})
-    for key in ["n", "count", "support_n", "sample_size"]:
-        if key in item and item.get(key) not in (None, ""):
-            support.setdefault("n", item.get(key))
-    for key in ["observed_support", "in_support", "within_support"]:
-        if key in item:
-            support["observed_support"] = bool(item.get(key))
-    return support
+        items.append(_ensure_item_fields(dict(entry), source_path))
+    return items
 
 
 def _load_cleaning_dialect(artifacts_dir: str) -> Dict[str, Any]:
@@ -186,16 +195,18 @@ def _apply_observational_policy(
     return item, notes
 
 
-def _extract_items_from_optimization(payload: Any) -> List[Dict[str, Any]]:
+def _extract_items_from_optimization(payload: Any, source_path: str) -> List[Dict[str, Any]]:
     if not payload:
         return []
+    candidates: List[Dict[str, Any]] = []
     if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
-    if isinstance(payload, dict):
+        candidates = [item for item in payload if isinstance(item, dict)]
+    elif isinstance(payload, dict):
         for key in ["recommendations", "items", "results", "recommendation_items"]:
             if isinstance(payload.get(key), list):
-                return [item for item in payload.get(key) if isinstance(item, dict)]
-    return []
+                candidates = [item for item in payload.get(key) if isinstance(item, dict)]
+                break
+    return [_ensure_item_fields(item, source_path) for item in candidates]
 
 
 def _build_items_from_scored_rows(path: str, max_examples: int) -> List[Dict[str, Any]]:
@@ -252,16 +263,15 @@ def _build_items_from_scored_rows(path: str, max_examples: int) -> List[Dict[str
                 segment[key] = val
                 if len(segment) >= 2:
                     break
-        current_action, suggested_action = _extract_actions_from_item(row)
-        expected_effect = {"metric": score_col, "value": score, "notes": "Ranked by observed score."}
         items.append(
-            {
-                "segment": segment,
-                "current_action": current_action,
-                "suggested_action": suggested_action,
-                "expected_effect": expected_effect,
-                "support": {},
-            }
+            _ensure_item_fields(
+                {
+                    "segment": segment,
+                    "score": score,
+                    "metric": score_col,
+                },
+                "data/scored_rows.csv",
+            )
         )
     return items
 
@@ -370,22 +380,20 @@ def _select_best_attempt(run_dir: str) -> Dict[str, Any] | None:
             continue
         files = _list_downloaded_files(downloaded_root)
         file_set = set(files)
-        has_metrics = "data/metrics.json" in file_set
-        has_preview_source = any(
-            rel in file_set
-            for rel in ("reports/optimization_results.json", "data/predictions.csv", "data/scored_rows.csv")
-        )
-        if not (has_metrics and has_preview_source):
+        report_files = [rel for rel in file_set if rel.startswith("reports/") and rel.endswith(".json")]
+        if not report_files:
             continue
         score = 0
-        if "data/metrics.json" in file_set:
-            score += 3
+        if "reports/recommendations.json" in file_set:
+            score += 5
+        if report_files:
+            score += 2
         if "reports/price_optimization_summary.json" in file_set:
-            score += 3
+            score += 1
         if "reports/optimization_results.json" in file_set:
             score += 2
-        if "data/scored_rows.csv" in file_set or "data/predictions.csv" in file_set:
-            score += 2
+        if "data/metrics.json" in file_set:
+            score += 1
         if "data/alignment_check.json" in file_set:
             score += 1
         if any(path.startswith("static/plots/") for path in file_set):
@@ -430,51 +438,68 @@ def build_recommendations_preview(
         rel = rel_path.replace("\\", "/")
         return f"{prefix}{rel}" if prefix else rel
 
+    def _scan_reports_dir(root_dir: str, prefix: str, include_legacy: bool) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
+        checked: List[str] = []
+        used: List[str] = []
+        reports_dir = os.path.join(root_dir, "reports")
+        if not os.path.isdir(reports_dir):
+            return [], checked, used
+        legacy_files = {"optimization_results.json", "price_optimization_summary.json"}
+        report_files = [name for name in os.listdir(reports_dir) if name.lower().endswith(".json")]
+        report_files.sort()
+        preferred = "recommendations.json"
+        if preferred in report_files:
+            report_files.remove(preferred)
+            report_files.insert(0, preferred)
+
+        for name in report_files:
+            if not include_legacy and name in legacy_files:
+                continue
+            rel_path = _label_source(prefix, f"reports/{name}")
+            checked.append(rel_path)
+            payload = _safe_load_json(os.path.join(reports_dir, name))
+            items = _extract_items_from_payload(payload, rel_path)
+            if not items:
+                items = _extract_recommended_pairs(payload, rel_path)
+            if items:
+                used.append(rel_path)
+                return items, checked, used
+        return [], checked, used
+
     def _collect_items_from_root(root_dir: str, prefix: str) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
         collected: List[Dict[str, Any]] = []
         checked: List[str] = []
         used: List[str] = []
-        opt_path = os.path.join(root_dir, "reports", "optimization_results.json")
-        if os.path.exists(opt_path):
-            checked.append(_label_source(prefix, "reports/optimization_results.json"))
-            payload = _safe_load_json(opt_path)
-            for raw_item in _extract_items_from_optimization(payload):
-                segment = _extract_segment_from_item(raw_item)
-                current_action, suggested_action = _extract_actions_from_item(raw_item)
-                expected_effect = _extract_expected_effect(raw_item)
-                support = _extract_support(raw_item)
-                item = {
-                    "segment": segment,
-                    "current_action": current_action,
-                    "suggested_action": suggested_action,
-                    "expected_effect": expected_effect,
-                    "support": support,
-                    "source": _label_source(prefix, "reports/optimization_results.json"),
-                }
-                item, notes = _apply_observational_policy(item, counterfactual_policy)
-                if notes:
-                    expected_effect.setdefault("notes", "; ".join(notes))
-                collected.append(item)
-            if collected:
-                used.append(_label_source(prefix, "reports/optimization_results.json"))
+        items, checked, used = _scan_reports_dir(root_dir, prefix, include_legacy=False)
+        if items:
+            return items, checked, used
 
-        if not collected:
-            for rel_path in ["data/predictions.csv", "data/scored_rows.csv"]:
-                path = os.path.join(root_dir, rel_path)
-                if not os.path.exists(path):
-                    continue
-                checked.append(_label_source(prefix, rel_path))
-                extracted = _build_items_from_scored_rows(path, max_examples=max_examples)
-                for item in extracted:
-                    item["source"] = _label_source(prefix, rel_path)
-                    item, notes = _apply_observational_policy(item, counterfactual_policy)
-                    if notes:
-                        item["expected_effect"].setdefault("notes", "; ".join(notes))
-                    collected.append(item)
-                if collected:
-                    used.append(_label_source(prefix, rel_path))
-                    break
-        return collected, checked, used
+        legacy_checked: List[str] = []
+        legacy_used: List[str] = []
+        reports_dir = os.path.join(root_dir, "reports")
+        if os.path.isdir(reports_dir):
+            opt_path = os.path.join(reports_dir, "optimization_results.json")
+            if os.path.exists(opt_path):
+                rel_path = _label_source(prefix, "reports/optimization_results.json")
+                legacy_checked.append(rel_path)
+                payload = _safe_load_json(opt_path)
+                items = _extract_items_from_optimization(payload, rel_path)
+                if items:
+                    legacy_used.append(rel_path)
+            if not items:
+                summary_path = os.path.join(reports_dir, "price_optimization_summary.json")
+                if os.path.exists(summary_path):
+                    rel_path = _label_source(prefix, "reports/price_optimization_summary.json")
+                    legacy_checked.append(rel_path)
+                    payload = _safe_load_json(summary_path)
+                    items = _extract_items_from_legacy_summary(payload, rel_path)
+                    if items:
+                        legacy_used.append(rel_path)
+
+        checked.extend(legacy_checked)
+        used.extend(legacy_used)
+        return items, checked, used
+
     items, checked, used = _collect_items_from_root(artifacts_dir, "")
     sources_checked.extend(checked)
     sources_used.extend(used)
@@ -504,7 +529,17 @@ def build_recommendations_preview(
 
     items = [item for item in items if isinstance(item, dict)]
     if items:
-        items = items[:max_examples]
+        processed = []
+        for item in items:
+            item, notes = _apply_observational_policy(item, counterfactual_policy)
+            if notes:
+                caveat_list = item.get("caveats")
+                if not isinstance(caveat_list, list):
+                    caveat_list = []
+                caveat_list.extend(notes)
+                item["caveats"] = caveat_list
+            processed.append(item)
+        items = processed[:max_examples]
 
     dialect = _load_cleaning_dialect(artifacts_dir)
     if cleaned_data_path and items:
@@ -548,6 +583,7 @@ def build_recommendations_preview(
         "recommendation_scope": recommendation_scope,
         "status": status,
         "risk_level": risk_level,
+        "illustrative_only": True,
         "reason": reason,
         "caveats": caveats,
         "policy_used": {
