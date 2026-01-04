@@ -327,6 +327,14 @@ class MLEngineerAgent:
         - Extended deps (rapidfuzz, plotly, pydantic, pandera, networkx) ONLY if listed in execution_contract.required_dependencies.
         - Do not import any other deps.
 
+        CAUSAL REASONING FOR OPTIMIZATION
+        - Consultation: check feature_availability in contract. Variables marked 'decision' or 'post-decision' CANNOT be features.
+        - Logic: If a model needs the decision_variable to predict, it cannot recommend it for new cases (unknown at prediction time).
+        - Modeling: Predict outcome using pre-decision features (F1, F2). Model decision_variable effect separately (curves/elasticity).
+        - Examples:
+          ✅ OK: Outcome ~ [F1, F2]; then model effect of decision_variable within segments.
+          ❌ FAIL: features = [F1, F2, decision_variable].
+
         DIALECT CONTRACT (must follow)
         - Prefer reading 'data/cleaning_manifest.json' to get output_dialect (sep, encoding, decimal). Default: Enc='$csv_encoding', Sep='$csv_sep', Decimal='$csv_decimal'.
         - After loading:
