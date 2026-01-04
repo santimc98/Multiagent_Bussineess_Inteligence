@@ -2914,6 +2914,295 @@ def _load_json_any(path: str) -> Any:
     except Exception:
         return None
 
+def _select_segment_column(columns: List[str], contract: Dict[str, Any] | None = None) -> str | None:
+    if not columns:
+        return None
+    label_hint = None
+    if isinstance(contract, dict):
+        label_hint = contract.get("segment_label_column")
+    if label_hint and label_hint in columns:
+        return label_hint
+    for candidate in [
+        "cluster_id",
+        "segment_id",
+        "segment",
+        "cluster",
+        "group_id",
+        "group",
+        "client_segment",
+    ]:
+        if candidate in columns:
+            return candidate
+    for col in columns:
+        norm = _norm_name(col)
+        if any(tok in norm for tok in ["segment", "cluster", "group"]):
+            return col
+    return None
+
+def _summarize_segmentation_stats(
+    scored_path: str,
+    csv_sep: str,
+    csv_decimal: str,
+    csv_encoding: str,
+    contract: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    stats = {
+        "n_rows": None,
+        "n_segments": None,
+        "min_segment_size": None,
+        "median_segment_size": None,
+        "segment_column": None,
+    }
+    if not scored_path or not os.path.exists(scored_path):
+        return stats
+    columns = _read_csv_header(scored_path, csv_encoding, csv_sep)
+    segment_col = _select_segment_column(columns, contract)
+    stats["segment_column"] = segment_col
+    try:
+        stats["n_rows"] = _count_raw_rows(scored_path, csv_encoding, csv_sep, csv_decimal)
+    except Exception:
+        stats["n_rows"] = None
+    if not segment_col:
+        return stats
+    try:
+        import pandas as pd
+        df = pd.read_csv(
+            scored_path,
+            sep=csv_sep,
+            decimal=csv_decimal,
+            encoding=csv_encoding,
+            usecols=[segment_col],
+            low_memory=False,
+        )
+        series = df[segment_col].dropna()
+        if not series.empty:
+            stats["n_segments"] = int(series.nunique())
+            sizes = series.value_counts()
+            if not sizes.empty:
+                stats["min_segment_size"] = int(sizes.min())
+                stats["median_segment_size"] = float(sizes.median())
+    except Exception:
+        return stats
+    return stats
+
+def _count_curve_points(payload: Any) -> int:
+    if payload is None:
+        return 0
+    if isinstance(payload, list):
+        if payload and all(isinstance(item, dict) for item in payload):
+            return len(payload)
+        return sum(_count_curve_points(item) for item in payload)
+    if isinstance(payload, dict):
+        if "points" in payload and isinstance(payload.get("points"), list):
+            return len(payload.get("points"))
+        total = 0
+        for value in payload.values():
+            total += _count_curve_points(value)
+        return total
+    return 0
+
+def _count_curves(payload: Any) -> int:
+    if payload is None:
+        return 0
+    if isinstance(payload, dict):
+        container = payload.get("curves") if isinstance(payload.get("curves"), (dict, list)) else payload
+        if isinstance(container, dict):
+            return len(container)
+        if isinstance(container, list):
+            return len(container)
+    if isinstance(payload, list):
+        return len(payload)
+    return 0
+
+def _summarize_pricing_artifacts(
+    curves_path: str,
+    guide_path: str,
+    csv_sep: str,
+    csv_decimal: str,
+    csv_encoding: str,
+) -> Dict[str, Any]:
+    summary = {
+        "curves_present": None,
+        "curves_count": 0,
+        "curves_points": 0,
+        "guide_rows": None,
+        "pct_nan_optimal_price": None,
+        "optimal_price_columns": [],
+    }
+    if curves_path and os.path.exists(curves_path):
+        payload = _load_json_any(curves_path)
+        summary["curves_count"] = _count_curves(payload)
+        summary["curves_points"] = _count_curve_points(payload)
+        summary["curves_present"] = bool(summary["curves_count"] or summary["curves_points"])
+    if guide_path and os.path.exists(guide_path):
+        try:
+            import pandas as pd
+            header = _read_csv_header(guide_path, csv_encoding, csv_sep)
+            target_cols = [c for c in header if "optimal_price" in _norm_name(c)]
+            summary["optimal_price_columns"] = target_cols
+            df = pd.read_csv(guide_path, sep=csv_sep, decimal=csv_decimal, encoding=csv_encoding)
+            summary["guide_rows"] = int(len(df))
+            if target_cols:
+                sub = df[target_cols]
+                nan_frac = float(sub.isna().mean().mean()) if not sub.empty else 1.0
+                summary["pct_nan_optimal_price"] = round(nan_frac, 4)
+        except Exception:
+            return summary
+    return summary
+
+def _collect_iteration_diagnostics(state: Dict[str, Any]) -> Dict[str, Any]:
+    csv_sep = state.get("csv_sep", ",")
+    csv_decimal = state.get("csv_decimal", ".")
+    csv_encoding = state.get("csv_encoding", "utf-8")
+    contract = state.get("execution_contract", {}) if isinstance(state, dict) else {}
+    scored_path = "data/scored_rows.csv"
+    seg_stats = _summarize_segmentation_stats(scored_path, csv_sep, csv_decimal, csv_encoding, contract)
+    n_rows = seg_stats.get("n_rows")
+    if n_rows is None:
+        fallback_path = "data/cleaned_full.csv" if os.path.exists("data/cleaned_full.csv") else "data/cleaned_data.csv"
+        if os.path.exists(fallback_path):
+            try:
+                n_rows = _count_raw_rows(fallback_path, csv_encoding, csv_sep, csv_decimal)
+                seg_stats["n_rows"] = n_rows
+            except Exception:
+                pass
+    pricing_stats = _summarize_pricing_artifacts(
+        curves_path="data/price_sensitivity_curves.json",
+        guide_path="data/optimal_pricing_guide.csv",
+        csv_sep=csv_sep,
+        csv_decimal=csv_decimal,
+        csv_encoding=csv_encoding,
+    )
+    diagnostics = {}
+    diagnostics.update(seg_stats)
+    diagnostics.update(pricing_stats)
+    diagnostics["curves_generated"] = bool(pricing_stats.get("curves_points") or 0)
+    runtime_tail = state.get("last_runtime_error_tail")
+    if runtime_tail:
+        diagnostics["root_cause"] = str(runtime_tail).strip().splitlines()[-1][:300]
+    return diagnostics
+
+def _validate_artifact_content(state: Dict[str, Any]) -> tuple[List[str], Dict[str, Any]]:
+    diagnostics = _collect_iteration_diagnostics(state)
+    issues: List[str] = []
+    curves_path = "data/price_sensitivity_curves.json"
+    guide_path = "data/optimal_pricing_guide.csv"
+    if curves_path and os.path.exists(curves_path):
+        if diagnostics.get("curves_points", 0) == 0:
+            issues.append("price_sensitivity_curves_empty")
+    if guide_path and os.path.exists(guide_path):
+        if diagnostics.get("guide_rows") == 0:
+            issues.append("optimal_pricing_guide_empty")
+    pct_nan_opt = diagnostics.get("pct_nan_optimal_price")
+    if isinstance(pct_nan_opt, (int, float)) and pct_nan_opt >= 0.99:
+        issues.append("optimal_price_all_nan")
+    n_rows = diagnostics.get("n_rows")
+    n_segments = diagnostics.get("n_segments")
+    if isinstance(n_rows, (int, float)) and isinstance(n_segments, (int, float)) and n_rows > 0:
+        if n_segments > 0.5 * n_rows:
+            issues.append("segmentation_degenerate")
+    return issues, diagnostics
+
+def _score_attempt(
+    outputs_valid: bool,
+    output_contract_report: Dict[str, Any],
+    content_issues: List[str],
+    artifact_paths: List[str],
+) -> float:
+    score = 0.0
+    present = output_contract_report.get("present", []) if isinstance(output_contract_report, dict) else []
+    missing = output_contract_report.get("missing", []) if isinstance(output_contract_report, dict) else []
+    if outputs_valid:
+        score += 10.0
+    score += float(len(present))
+    score += float(len(artifact_paths)) * 0.25
+    score -= float(len(missing)) * 2.0
+    score -= float(len(content_issues)) * 3.0
+    return score
+
+def _snapshot_best_attempt(
+    attempt_id: int,
+    artifact_paths: List[str],
+    output_contract_report: Dict[str, Any],
+    artifact_index: List[Dict[str, Any]],
+    execution_output: str,
+    plots_local: List[str],
+    diagnostics: Dict[str, Any] | None = None,
+    dest_root: str = os.path.join("artifacts", "best_attempt"),
+) -> str | None:
+    if attempt_id < 1:
+        return None
+    try:
+        if os.path.isdir(dest_root):
+            shutil.rmtree(dest_root)
+        os.makedirs(dest_root, exist_ok=True)
+        for path in artifact_paths or []:
+            if not path or not os.path.exists(path):
+                continue
+            rel = path.lstrip("./").replace("\\", "/")
+            dest = os.path.join(dest_root, rel)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.copy2(path, dest)
+        meta = {
+            "attempt_id": attempt_id,
+            "artifact_index": artifact_index,
+            "output_contract_report": output_contract_report,
+            "execution_output": execution_output,
+            "plots_local": plots_local,
+            "diagnostics": diagnostics or {},
+        }
+        with open(os.path.join(dest_root, "best_attempt.json"), "w", encoding="utf-8") as f_meta:
+            json.dump(meta, f_meta, indent=2, ensure_ascii=False)
+        return dest_root
+    except Exception:
+        return None
+
+def _promote_best_attempt(state: Dict[str, Any]) -> Dict[str, Any]:
+    best_dir = state.get("best_attempt_dir")
+    if not best_dir or not os.path.isdir(best_dir):
+        return {}
+    updated: Dict[str, Any] = {}
+    try:
+        for root, _, files in os.walk(best_dir):
+            for name in files:
+                if name == "best_attempt.json":
+                    continue
+                src = os.path.join(root, name)
+                rel = os.path.relpath(src, best_dir)
+                dest = os.path.join(".", rel)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                shutil.copy2(src, dest)
+        meta_path = os.path.join(best_dir, "best_attempt.json")
+        meta = _load_json_any(meta_path)
+        if isinstance(meta, dict):
+            if meta.get("artifact_index") is not None:
+                updated["artifact_index"] = meta.get("artifact_index")
+                updated["produced_artifact_index"] = meta.get("artifact_index")
+                try:
+                    os.makedirs("data", exist_ok=True)
+                    with open("data/produced_artifact_index.json", "w", encoding="utf-8") as f_idx:
+                        json.dump(meta.get("artifact_index"), f_idx, indent=2, ensure_ascii=False)
+                except Exception:
+                    pass
+            if meta.get("output_contract_report") is not None:
+                updated["output_contract_report"] = meta.get("output_contract_report")
+                try:
+                    os.makedirs("data", exist_ok=True)
+                    with open("data/output_contract_report.json", "w", encoding="utf-8") as f_oc:
+                        json.dump(meta.get("output_contract_report"), f_oc, indent=2, ensure_ascii=False)
+                except Exception:
+                    pass
+            if meta.get("execution_output"):
+                updated["execution_output"] = meta.get("execution_output")
+                updated["execution_output_stale"] = True
+                updated["execution_error"] = False
+                updated["sandbox_failed"] = False
+            if meta.get("plots_local") is not None:
+                updated["plots_local"] = meta.get("plots_local")
+    except Exception:
+        return updated
+    return updated
+
 def _normalize_alignment_check(
     alignment_check: Dict[str, Any],
     alignment_requirements: List[Any],
@@ -3711,6 +4000,7 @@ def _build_ml_iteration_memory_block(entries: List[Dict[str, Any]], max_chars: i
     if not entries:
         return ""
     last = entries[-1]
+    diagnostics = last.get("iteration_diagnostics") if isinstance(last, dict) else {}
     last_summary = {
         "iteration_id": last.get("iteration_id"),
         "preflight_issues": last.get("preflight_issues"),
@@ -3718,6 +4008,15 @@ def _build_ml_iteration_memory_block(entries: List[Dict[str, Any]], max_chars: i
         "outputs_missing": last.get("outputs_missing"),
         "reviewer_verdict": last.get("reviewer_verdict"),
         "qa_verdict": last.get("qa_verdict"),
+        "n_rows": diagnostics.get("n_rows") if isinstance(diagnostics, dict) else None,
+        "n_segments": diagnostics.get("n_segments") if isinstance(diagnostics, dict) else None,
+        "min_segment_size": diagnostics.get("min_segment_size") if isinstance(diagnostics, dict) else None,
+        "median_segment_size": diagnostics.get("median_segment_size") if isinstance(diagnostics, dict) else None,
+        "curves_generated": diagnostics.get("curves_generated") if isinstance(diagnostics, dict) else None,
+        "curves_points": diagnostics.get("curves_points") if isinstance(diagnostics, dict) else None,
+        "guide_rows": diagnostics.get("guide_rows") if isinstance(diagnostics, dict) else None,
+        "pct_nan_optimal_price": diagnostics.get("pct_nan_optimal_price") if isinstance(diagnostics, dict) else None,
+        "root_cause": diagnostics.get("root_cause") if isinstance(diagnostics, dict) else None,
     }
     counts: Dict[str, int] = {}
     for entry in entries:
@@ -3788,6 +4087,9 @@ def _build_ml_iteration_journal_entry(
     code = state.get("generated_code") or ""
     code_hash = hashlib.sha256(code.encode("utf-8", errors="replace")).hexdigest()[:12] if code else ""
     iter_id = int(state.get("iteration_count", 0)) + 1
+    diagnostics = _collect_iteration_diagnostics(state)
+    if runtime_error and isinstance(runtime_error, dict) and runtime_error.get("message"):
+        diagnostics.setdefault("root_cause", runtime_error.get("message"))
     return {
         "iteration_id": iter_id,
         "code_hash": code_hash,
@@ -3800,6 +4102,7 @@ def _build_ml_iteration_journal_entry(
         "qa_verdict": qa_verdict or "UNKNOWN",
         "qa_reasons": qa_reasons or [],
         "next_actions": next_actions or [],
+        "iteration_diagnostics": diagnostics,
     }
 
 def _build_iteration_memory(
@@ -3810,6 +4113,7 @@ def _build_iteration_memory(
     code: str,
     prev_summary: Dict[str, Any] | None,
     advisor_note: str | None,
+    diagnostics: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     objective_sig = _infer_objective_signature(code)
     weights = _extract_weights_from_obj(weights_report)
@@ -3828,6 +4132,8 @@ def _build_iteration_memory(
         "failures": case_report.get("failures", []) if isinstance(case_report, dict) else [],
         "metrics_snapshot": metrics_snapshot,
     }
+    if diagnostics:
+        summary["iteration_diagnostics"] = diagnostics
     if advisor_note:
         summary["advisor_note"] = advisor_note.strip()
     if prev_summary:
@@ -3988,9 +4294,20 @@ class AgentState(TypedDict):
     max_sandbox_retries: int
     ml_call_refund_pending: bool
     execution_call_refund_pending: bool
+    artifact_content_issues: List[str]
+    artifact_content_diagnostics: Dict[str, Any]
     last_successful_execution_output: str
     last_successful_plots: List[str]
     last_successful_output_contract_report: Dict[str, Any]
+    last_attempt_score: float
+    last_attempt_valid: bool
+    best_attempt_score: float
+    best_attempt_id: int
+    best_attempt_dir: str
+    best_attempt_artifact_index: List[Dict[str, Any]]
+    best_attempt_output_contract_report: Dict[str, Any]
+    best_attempt_execution_output: str
+    best_attempt_plots: List[str]
     model_performance: float
     feedback_history: List[str]
     # PDF
@@ -7177,6 +7494,11 @@ def execute_code(state: AgentState) -> AgentState:
     stale_outputs = _find_stale_outputs(required_outputs, exec_start_ts)
     if stale_outputs:
         output = f"{output}\nEXECUTION ERROR: STALE_OUTPUTS: {stale_outputs}"
+
+    content_issues, content_diagnostics = _validate_artifact_content(state)
+    if content_issues:
+        issue_text = ", ".join(content_issues)
+        output = f"{output}\nEXECUTION ERROR: ARTIFACT_CONTENT_INVALID: {issue_text}"
     
     # Check for Runtime Errors in Output (Traceback)
     sandbox_failed = (
@@ -7191,7 +7513,7 @@ def execute_code(state: AgentState) -> AgentState:
         or sandbox_failed
     )
 
-    outputs_valid = not bool(artifact_issues or stale_outputs or error_in_output)
+    outputs_valid = not bool(artifact_issues or stale_outputs or content_issues or error_in_output)
     if not outputs_valid:
         _purge_execution_outputs(required_outputs, expected_outputs)
         plots_local = []
@@ -7205,6 +7527,7 @@ def execute_code(state: AgentState) -> AgentState:
             artifacts_valid=outputs_valid,
             artifact_issues=artifact_issues,
             stale_outputs=stale_outputs,
+            content_issues=content_issues,
         )
     
     runtime_tail = None
@@ -7282,6 +7605,9 @@ def execute_code(state: AgentState) -> AgentState:
     except Exception as idx_err:
         print(f"Warning: failed to persist produced_artifact_index.json: {idx_err}")
 
+    attempt_score = _score_attempt(outputs_valid, oc_report, content_issues, artifact_paths)
+    attempt_valid = bool(outputs_valid and not oc_report.get("missing") and not content_issues)
+
     result = {
         "execution_output": output,
         "plots_local": plots_local,
@@ -7295,6 +7621,10 @@ def execute_code(state: AgentState) -> AgentState:
         "artifact_index": artifact_index,
         "produced_artifact_index": artifact_index,
         "artifact_paths": artifact_paths,
+        "artifact_content_issues": content_issues,
+        "artifact_content_diagnostics": content_diagnostics,
+        "last_attempt_score": attempt_score,
+        "last_attempt_valid": attempt_valid,
         "sandbox_failed": sandbox_failed,
         "sandbox_retry_count": 0 if not sandbox_failed else state.get("sandbox_retry_count", 0),
         "ml_call_refund_pending": False,
@@ -7306,6 +7636,24 @@ def execute_code(state: AgentState) -> AgentState:
         result["last_successful_execution_output"] = output
         result["last_successful_plots"] = plots_local
         result["last_successful_output_contract_report"] = oc_report
+    best_score = state.get("best_attempt_score")
+    if attempt_valid and (best_score is None or attempt_score > float(best_score)):
+        dest = _snapshot_best_attempt(
+            attempt_id=attempt_id,
+            artifact_paths=artifact_paths,
+            output_contract_report=oc_report,
+            artifact_index=artifact_index,
+            execution_output=output,
+            plots_local=plots_local,
+            diagnostics=content_diagnostics,
+        )
+        result["best_attempt_score"] = attempt_score
+        result["best_attempt_id"] = attempt_id
+        result["best_attempt_dir"] = dest
+        result["best_attempt_artifact_index"] = artifact_index
+        result["best_attempt_output_contract_report"] = oc_report
+        result["best_attempt_execution_output"] = output
+        result["best_attempt_plots"] = plots_local
     return result
 
 def retry_handler(state: AgentState) -> AgentState:
@@ -7837,6 +8185,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     # Iteration memory (delta + objective + weights) for patch-mode guidance
     iteration_memory = list(state.get("ml_iteration_memory", []) or [])
     prev_summary = iteration_memory[-1] if iteration_memory else None
+    diagnostics = _collect_iteration_diagnostics(state)
     summary = _build_iteration_memory(
         iter_id=iter_id,
         metrics_report=metrics_report,
@@ -7845,6 +8194,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         code=code,
         prev_summary=prev_summary,
         advisor_note=result_state.get("ml_results_advice"),
+        diagnostics=diagnostics,
     )
     if summary:
         iteration_memory.append(summary)
@@ -8097,6 +8447,27 @@ def run_translator(state: AgentState) -> AgentState:
     run_id = state.get("run_id")
     if run_id:
         log_run_event(run_id, "translator_start", {})
+
+    best_score = state.get("best_attempt_score")
+    last_score = state.get("last_attempt_score")
+    promote_best = False
+    if best_score is not None and state.get("best_attempt_dir"):
+        if state.get("execution_error") or state.get("sandbox_failed"):
+            promote_best = True
+        if state.get("artifact_content_issues"):
+            promote_best = True
+        missing_outputs = (state.get("output_contract_report") or {}).get("missing") if isinstance(state.get("output_contract_report"), dict) else []
+        if missing_outputs:
+            promote_best = True
+        try:
+            if last_score is not None and float(best_score) > float(last_score):
+                promote_best = True
+        except Exception:
+            pass
+    if promote_best:
+        updates = _promote_best_attempt(state)
+        if updates:
+            state = {**state, **updates}
 
     error_msg = state.get("error_message")
     

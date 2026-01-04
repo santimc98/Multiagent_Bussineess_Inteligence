@@ -346,6 +346,15 @@ class MLEngineerAgent:
         missingness, high-cardinality categoricals, suspected IDs, leakage/post-outcome features (use availability + semantics).
         - If the contract marks any columns as post-decision/post-outcome/leakage_risk, never include them as model features; record them in a leakage audit note.
         - Use signal_summary to choose model complexity (avoid overfitting).
+        - Probability columns (e.g., Probability/prob/score) are audit-only; NEVER use for segmentation or modeling.
+          For audit stats, use dropna on the joined sample; do not impute with zeros.
+
+        Step 1.5) Segmentation sanity (required if segmentation is used):
+        - Compute and log: n_rows, n_segments, min/median segment_size.
+        - Respect execution_contract.segmentation_constraints (max_segments, min_segment_size, preferred_k_range).
+        - If constraints violated, reduce k, or use quantile binning for numerics, top-K + "Other" for categoricals,
+          or fallback to a coarser segmentation (never 1-row-per-segment).
+        - Do NOT create segment_id by concatenating raw columns if it yields unique IDs per row.
 
         Step 2) Decide validation correctly:
         - If objective_type == "forecasting" or requires_time_series_split=true -> use TimeSeriesSplit or chronological holdout (shuffle=False). Do NOT use random KFold.
@@ -365,6 +374,7 @@ class MLEngineerAgent:
         - A baseline (simple, interpretable).
         - A stronger model (more expressive) appropriate for dataset size and task.
         - Prefer stable sklearn models unless the contract explicitly requires others.
+        - Any predict_proba call must pass a 2D array (e.g., X.reshape(1, -1) or [[x]] for a single row).
 
         Step 5) Contract compliance outputs:
         - Do NOT invent global rules. Use execution_contract to decide:
@@ -374,6 +384,8 @@ class MLEngineerAgent:
         - Print a "MAPPING SUMMARY" block with canonical columns, selected features, and any derived outputs used.
         - Only enforce segmentation/weights/pricing logic IF deliverables require those outputs or decision_variables exist.
         (Example: if a required deliverable includes "data/weights.json" or execution_contract.decision_variables present -> run the corresponding logic; else skip.)
+        - If price sensitivity curves or optimal pricing guide are required, they must NOT be empty.
+          If segment-level estimation is too sparse, fallback to global curves or coarser segments; never emit empty artifacts.
 
         REQUIRED ARTIFACT RULES (minimal, contract-driven)
         - Always:
@@ -383,6 +395,8 @@ class MLEngineerAgent:
         - Write all required deliverables; write optional deliverables only if they materially support the objective.
         - Plotting: matplotlib.use('Agg') BEFORE pyplot; save at least one plot IF required deliverables include plots; otherwise skip gracefully.
         - If computing optimal prices or using minimize_scalar, ensure the objective returns float and coerce optimal_price = float(optimal_price) before assignment.
+        - scored_rows.csv must include canonical columns plus derived outputs required by the contract
+          (e.g., is_success, cluster_id, pred_prob_success, recommended_* and expected_value_at_recommendation).
 
         ALIGNMENT CHECK (contract-driven)
         - Write data/alignment_check.json with:

@@ -1,5 +1,6 @@
 import json
 import os
+import ast
 from typing import Dict, Any, List
 from string import Template
 import re
@@ -16,6 +17,51 @@ from src.utils.contract_validation import (
 )
 
 load_dotenv()
+
+def parse_derive_from_expression(expr: str) -> Dict[str, Any]:
+    if not expr or not isinstance(expr, str):
+        return {}
+    text = expr.strip()
+    if not text:
+        return {}
+
+    def _coerce_values(raw: str) -> List[str]:
+        if not raw:
+            return []
+        cleaned = raw.strip()
+        try:
+            parsed = ast.literal_eval(cleaned)
+            if isinstance(parsed, (list, tuple, set)):
+                return [str(item) for item in parsed]
+            if isinstance(parsed, str):
+                return [parsed]
+            return [str(parsed)]
+        except Exception:
+            pass
+        if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {"'", "\""}:
+            cleaned = cleaned[1:-1].strip()
+        if cleaned.startswith("(") and cleaned.endswith(")"):
+            cleaned = cleaned[1:-1].strip()
+        if "," in cleaned:
+            parts = [part.strip(" \"'") for part in cleaned.split(",") if part.strip()]
+            return parts
+        return [cleaned] if cleaned else []
+
+    match = re.match(r"^\s*([A-Za-z0-9_][A-Za-z0-9_ %\.\-]*)\s*==\s*(.+?)\s*$", text)
+    if match:
+        column = match.group(1).strip()
+        values = _coerce_values(match.group(2))
+        return {"column": column, "positive_values": values}
+    match = re.match(r"^\s*([A-Za-z0-9_][A-Za-z0-9_ %\.\-]*)\s+in\s+(.+?)\s*$", text, flags=re.IGNORECASE)
+    if match:
+        column = match.group(1).strip()
+        values = _coerce_values(match.group(2))
+        return {"column": column, "positive_values": values}
+    token_match = re.search(r"[A-Za-z0-9_][A-Za-z0-9_ %\.\-]*", text)
+    if token_match:
+        column = token_match.group(0).strip()
+        return {"column": column, "positive_values": []}
+    return {}
 
 def enforce_percentage_ranges(contract: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(contract, dict):
@@ -401,8 +447,6 @@ class ExecutionPlannerAgent:
                     if not canonical:
                         canonical = _canonicalize_name(name)
                         req["canonical_name"] = canonical
-                    if canonical:
-                        canonical_cols.append(canonical)
                     continue
                 raw_match = _resolve_exact_header(canonical or name)
                 if raw_match:
@@ -752,6 +796,11 @@ class ExecutionPlannerAgent:
                 return ""
             return re.sub(r"[^0-9a-zA-Z]+", "_", str(name)).strip("_").lower()
 
+        def _recommended_column_name(name: str) -> str:
+            if not name:
+                return ""
+            return re.sub(r"[^0-9a-zA-Z]+", "_", str(name)).strip("_")
+
         def _collect_text_blob() -> str:
             parts = []
             if business_objective:
@@ -766,6 +815,57 @@ class ExecutionPlannerAgent:
             text = _collect_text_blob().lower()
             tokens = ["segment", "segmentation", "cluster", "clustering", "typology", "tipolog"]
             return any(tok in text for tok in tokens)
+
+        def _estimate_n_rows(summary_text: str) -> int | None:
+            profile_path = os.path.join("data", "dataset_profile.json")
+            if os.path.exists(profile_path):
+                try:
+                    with open(profile_path, "r", encoding="utf-8") as f_profile:
+                        profile = json.load(f_profile)
+                    if isinstance(profile, dict):
+                        rows = profile.get("rows") or profile.get("row_count") or profile.get("n_rows")
+                        if isinstance(rows, int) and rows >= 0:
+                            return rows
+                except Exception:
+                    pass
+            if summary_text:
+                match = re.search(r"\brows\s*[:=]\s*(\d+)", summary_text, flags=re.IGNORECASE)
+                if match:
+                    try:
+                        return int(match.group(1))
+                    except Exception:
+                        return None
+            return None
+
+        def _compute_segmentation_constraints(n_rows: int | None) -> Dict[str, Any]:
+            n_val = int(n_rows) if isinstance(n_rows, int) and n_rows >= 0 else 0
+            max_segments = min(15, max(3, n_val // 20))
+            min_segment_size = max(10, n_val // 100)
+            if n_val > 0:
+                max_segments = min(max_segments, max(2, n_val // max(min_segment_size, 1)))
+            preferred_max = min(10, max_segments)
+            preferred_min = 2 if preferred_max >= 2 else 1
+            return {
+                "n_rows_estimate": n_val if n_rows is not None else None,
+                "max_segments": int(max_segments),
+                "min_segment_size": int(min_segment_size),
+                "preferred_k_range": [int(preferred_min), int(preferred_max)],
+            }
+
+        def _attach_segmentation_constraints(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            constraints = contract.get("segmentation_constraints")
+            if not isinstance(constraints, dict):
+                constraints = {}
+            n_rows = _estimate_n_rows(data_summary)
+            computed = _compute_segmentation_constraints(n_rows)
+            for key, value in computed.items():
+                if value is None:
+                    continue
+                constraints[key] = value
+            contract["segmentation_constraints"] = constraints
+            return contract
 
         def _extract_summary_candidates(summary_text: str) -> List[str]:
             if not summary_text:
@@ -1109,6 +1209,8 @@ class ExecutionPlannerAgent:
                     required_cols.append(f"pred_{safe_target}")
                 else:
                     required_cols.append("prediction")
+                if _norm(target_name) in {"issuccess", "success"}:
+                    required_cols.append("pred_prob_success")
             else:
                 required_cols.append("prediction")
 
@@ -1120,7 +1222,7 @@ class ExecutionPlannerAgent:
                 for var in decision_vars:
                     if not var:
                         continue
-                    safe_var = _safe_column_name(var)
+                    safe_var = _recommended_column_name(var)
                     if safe_var:
                         required_cols.append(f"recommended_{safe_var}")
                 if decision_vars:
@@ -1517,10 +1619,19 @@ class ExecutionPlannerAgent:
             for req in reqs:
                 if not isinstance(req, dict):
                     continue
+                source = (req.get("source") or "input").lower()
+                if source == "derived":
+                    continue
                 name = req.get("canonical_name") or req.get("name")
                 if name:
                     derived.append(str(name))
             existing = contract.get("canonical_columns") if isinstance(contract.get("canonical_columns"), list) else []
+            input_norms = {
+                _norm(req.get("canonical_name") or req.get("name") or "")
+                for req in reqs
+                if isinstance(req, dict) and str(req.get("source") or "input").lower() == "input"
+            }
+            existing = [col for col in existing if _norm(col) in input_norms]
             combined = []
             seen = set()
             for col in list(existing) + derived:
@@ -1777,6 +1888,21 @@ class ExecutionPlannerAgent:
             sanity = contract.get("business_sanity_checks")
             if not isinstance(sanity, list) or not sanity:
                 contract["business_sanity_checks"] = _build_business_sanity_checks(contract, semantics)
+            return contract
+
+        def _attach_probability_audit_note(contract: Dict[str, Any]) -> Dict[str, Any]:
+            if not isinstance(contract, dict):
+                return contract
+            notes = contract.get("notes_for_engineers")
+            if not isinstance(notes, list):
+                notes = []
+            note = (
+                "Probability columns (e.g., *prob*, *probability*, *score*) are post-decision audit only; "
+                "do not use for segmentation or modeling."
+            )
+            if note not in notes:
+                notes.append(note)
+            contract["notes_for_engineers"] = notes
             return contract
 
         def _detect_decision_context(text: str) -> bool:
@@ -2505,6 +2631,8 @@ class ExecutionPlannerAgent:
             contract = _attach_business_alignment(contract)
             contract = _attach_strategy_context(contract)
             contract = _attach_semantic_guidance(contract)
+            contract = _attach_probability_audit_note(contract)
+            contract = _attach_segmentation_constraints(contract)
             contract = _complete_contract_inference(contract)
             contract = _assign_derived_owners(contract)
             contract = _attach_variable_semantics(contract)
@@ -2656,7 +2784,15 @@ Return the contract JSON.
             if not isinstance(target_payload, dict):
                 target_payload = {}
             target_name = target_payload.get("name")
-            derive_from = target_payload.get("derive_from") if isinstance(target_payload.get("derive_from"), dict) else None
+            derive_from_raw = target_payload.get("derive_from")
+            derive_from = derive_from_raw if isinstance(derive_from_raw, dict) else None
+            if isinstance(derive_from_raw, str):
+                parsed = parse_derive_from_expression(derive_from_raw)
+                if parsed:
+                    parsed.setdefault("positive_values", [])
+                    derive_from = parsed
+            if isinstance(derive_from, dict) and not isinstance(derive_from.get("positive_values"), list):
+                derive_from["positive_values"] = []
 
             reqs = contract.get("data_requirements", []) if isinstance(contract, dict) else []
             target_req = None

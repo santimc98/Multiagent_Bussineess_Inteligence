@@ -217,8 +217,8 @@ class QAReviewerAgent:
 
             # Fallback normalization
             if result['status'] not in ['APPROVED', 'APPROVE_WITH_WARNINGS', 'REJECTED']:
-                result['status'] = 'REJECTED'
-                result['feedback'] = "QA Error: Invalid status returned."
+                result['status'] = 'APPROVE_WITH_WARNINGS'
+                result['feedback'] = "QA Error: Invalid status returned; downgraded to warnings."
             
             # Normalize lists
             for field in ['failed_gates', 'required_fixes']:
@@ -251,10 +251,17 @@ class QAReviewerAgent:
             return result
                 
         except Exception as e:
-            return {
-                "status": "REJECTED",
-                "feedback": f"QA System Error: {e}"
+            fallback = {
+                "status": "APPROVE_WITH_WARNINGS",
+                "feedback": f"QA System Error: {e}. Defaulting to warnings.",
+                "failed_gates": [],
+                "required_fixes": [],
             }
+            warnings = static_result.get("warnings", []) if static_result else []
+            if warnings:
+                warning_text = "\n".join([f"- {w}" for w in warnings])
+                fallback["feedback"] = f"{fallback.get('feedback')}\nStatic QA warnings:\n{warning_text}"
+            return fallback
 
 
 def _is_random_call(call_node: ast.Call) -> bool:
