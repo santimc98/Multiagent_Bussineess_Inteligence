@@ -3481,13 +3481,31 @@ def _artifact_alignment_gate(
     if not has_row_id and not has_overlap:
         issues.append("scored_rows_missing_row_id_or_overlap")
 
+    def _normalize_schema(raw: Any) -> Dict[str, Dict[str, Any]]:
+        normalized: Dict[str, Dict[str, Any]] = {}
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                if not key:
+                    continue
+                normalized[str(key)] = value if isinstance(value, dict) else {}
+            return normalized
+        if isinstance(raw, list):
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                path = item.get("path") or item.get("artifact") or item.get("output")
+                if not path:
+                    continue
+                normalized[str(path)] = item
+        return normalized
+
     schema = {}
     if isinstance(contract, dict):
-        schema = contract.get("artifact_schemas") if isinstance(contract.get("artifact_schemas"), dict) else {}
+        schema = _normalize_schema(contract.get("artifact_schemas"))
         if not schema:
             spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else {}
             if isinstance(spec, dict):
-                schema = spec.get("artifact_schemas") if isinstance(spec.get("artifact_schemas"), dict) else {}
+                schema = _normalize_schema(spec.get("artifact_schemas"))
     scored_schema = schema.get("data/scored_rows.csv") if isinstance(schema, dict) else {}
     allowed_extra = scored_schema.get("allowed_extra_columns") if isinstance(scored_schema, dict) else None
     allowed_patterns = scored_schema.get("allowed_name_patterns") if isinstance(scored_schema, dict) else None

@@ -215,6 +215,55 @@ class ExecutionPlannerAgent:
                 return best_match
             return None
 
+        def _contract_column_norms(contract_obj: Dict[str, Any] | None = None) -> set[str]:
+            norms: set[str] = set()
+            canonical = contract_obj.get("canonical_columns") if isinstance(contract_obj, dict) else []
+            if isinstance(canonical, list):
+                for col in canonical:
+                    if col:
+                        norm_col = _norm(col)
+                        if norm_col:
+                            norms.add(norm_col)
+            for col in column_inventory or []:
+                if not col:
+                    continue
+                norm_col = _norm(col)
+                if norm_col:
+                    norms.add(norm_col)
+            return norms
+
+        def _filter_columns_against_contract(columns: List[str] | None, contract_obj: Dict[str, Any] | None = None) -> List[str]:
+            if not columns:
+                return []
+            allowed = _contract_column_norms(contract_obj)
+            if not allowed:
+                return [col for col in columns if col]
+            filtered: List[str] = []
+            for col in columns:
+                if not col:
+                    continue
+                if _norm(col) in allowed:
+                    filtered.append(col)
+            return filtered
+
+        def _normalize_artifact_schema_payload(raw: Any) -> Dict[str, Dict[str, Any]]:
+            normalized: Dict[str, Dict[str, Any]] = {}
+            if isinstance(raw, dict):
+                for key, value in raw.items():
+                    if not key:
+                        continue
+                    normalized[str(key)] = dict(value) if isinstance(value, dict) else {}
+                return normalized
+            if isinstance(raw, list):
+                for item in raw:
+                    if not isinstance(item, dict):
+                        continue
+                    path = item.get("path") or item.get("artifact") or item.get("output")
+                    if not path:
+                        continue
+                    normalized[str(path)] = item
+            return normalized
+
         def _parse_summary_kinds(summary_text: str) -> Dict[str, str]:
             kind_map: Dict[str, str] = {}
             if not summary_text:
@@ -1339,6 +1388,10 @@ class ExecutionPlannerAgent:
                         r"^expected_value_at_recommendation$",
                     ]
                 )
+            extra_patterns = ["^recommended_.*", "^expected_.*"]
+            for pattern in extra_patterns:
+                if pattern not in allowed_patterns:
+                    allowed_patterns.append(pattern)
 
             return {
                 "rowcount": "match_cleaned",
@@ -1393,9 +1446,12 @@ class ExecutionPlannerAgent:
         def _apply_artifact_schemas(contract: Dict[str, Any]) -> Dict[str, Any]:
             if not isinstance(contract, dict):
                 return contract
-            schemas = contract.get("artifact_schemas")
-            if not isinstance(schemas, dict):
-                schemas = {}
+            spec = contract.get("spec_extraction") if isinstance(contract.get("spec_extraction"), dict) else {}
+            schemas = _normalize_artifact_schema_payload(contract.get("artifact_schemas"))
+            spec_schemas = _normalize_artifact_schema_payload(spec.get("artifact_schemas"))
+            for path, payload in spec_schemas.items():
+                if path not in schemas:
+                    schemas[path] = payload
             scored_schema = _build_scored_rows_schema(contract)
             if scored_schema:
                 existing = schemas.get("data/scored_rows.csv")
@@ -1415,6 +1471,10 @@ class ExecutionPlannerAgent:
                     scored_schema.get("allowed_name_patterns", []),
                     merged.get("allowed_name_patterns", []) or [],
                 )
+                extra_patterns = ["^recommended_.*", "^expected_.*"]
+                for pattern in extra_patterns:
+                    if pattern not in merged.get("allowed_name_patterns", []):
+                        merged.setdefault("allowed_name_patterns", []).append(pattern)
                 base_allowlist = {
                     "is_success",
                     "success_probability",
@@ -1429,9 +1489,13 @@ class ExecutionPlannerAgent:
                     base_allowlist,
                     max_count=30,
                 )
+                if merged.get("allowed_name_patterns"):
+                    merged["allowed_name_patterns"] = _merge_unique(
+                        merged["allowed_name_patterns"],
+                        [],
+                    )
                 schemas["data/scored_rows.csv"] = merged
-            if schemas:
-                contract["artifact_schemas"] = schemas
+            contract["artifact_schemas"] = schemas
             return contract
 
         def _ensure_spec_extraction(contract: Dict[str, Any]) -> Dict[str, Any]:
@@ -1560,50 +1624,54 @@ class ExecutionPlannerAgent:
             if objective_type in {"predictive", "prescriptive", "forecasting"} and not target_explicit:
                 status_col = _find_status_candidate()
                 if status_col:
-                    positive_labels, rule_hint = _extract_positive_labels_from_objective(business_objective, status_col)
-                    original_target_name = target_req_name
-                    if target_req and str(target_req.get("source") or "").lower() == "derived":
-                        target_req["name"] = "is_success"
-                        target_req["canonical_name"] = "is_success"
-                        target_req["role"] = "target"
-                        if not target_req.get("expected_kind"):
-                            target_req["expected_kind"] = "categorical"
-                        if not target_req.get("derived_owner"):
-                            target_req["derived_owner"] = "ml_engineer"
-                        target_req_name = "is_success"
-                    rule = "1 if status in positive_labels else 0"
-                    if rule_hint == "contains":
-                        rule = "1 if status contains positive_labels else 0"
-                    entry = {
-                        "name": "is_success",
-                        "canonical_name": "is_success",
-                        "role": "target",
-                        "dtype": "boolean",
-                        "derived_from": status_col,
-                        "rule": rule,
-                        "positive_values": positive_labels,
-                    }
-                    if original_target_name:
+                    resolved_status = _resolve_exact_header(status_col) or status_col
+                    allowed_norms = _contract_column_norms(contract)
+                    status_norm = _norm(resolved_status) if resolved_status else ""
+                    if not resolved_status or (allowed_norms and status_norm not in allowed_norms):
+                        resolved_status = None
+                    if resolved_status:
+                        positive_labels, rule_hint = _extract_positive_labels_from_objective(business_objective, resolved_status)
+                        if target_req and str(target_req.get("source") or "").lower() == "derived":
+                            target_req["name"] = "is_success"
+                            target_req["canonical_name"] = "is_success"
+                            target_req["role"] = "target"
+                            if not target_req.get("expected_kind"):
+                                target_req["expected_kind"] = "categorical"
+                            if not target_req.get("derived_owner"):
+                                target_req["derived_owner"] = "ml_engineer"
+                            target_req_name = "is_success"
+                        rule = "1 if status in positive_labels else 0"
+                        if rule_hint == "contains":
+                            rule = "1 if status contains positive_labels else 0"
+                        entry = {
+                            "name": "is_success",
+                            "canonical_name": "is_success",
+                            "role": "target",
+                            "dtype": "boolean",
+                            "derived_from": resolved_status,
+                            "column": resolved_status,
+                            "rule": rule,
+                            "positive_values": positive_labels,
+                        }
                         derived = [
                             item
                             for item in derived
-                            if _norm(item.get("name") or item.get("canonical_name") or "") != _norm(original_target_name)
-                            or str(item.get("role") or "").lower() == "target"
+                            if _norm(item.get("name") or item.get("canonical_name") or "") != _norm("is_success")
                         ]
-                    derived.append(entry)
-                    derived_keys.add(_norm("is_success"))
-                    _ensure_requirement(reqs, "is_success", "target", expected_kind="categorical")
-                    if not positive_labels:
-                        checklist = contract.get("compliance_checklist")
-                        if not isinstance(checklist, list):
-                            checklist = []
-                        note = (
-                            "Infer positive_labels for is_success from unique values of the status column "
-                            f"('{status_col}') before training."
-                        )
-                        if note not in checklist:
-                            checklist.append(note)
-                        contract["compliance_checklist"] = checklist
+                        derived.append(entry)
+                        derived_keys.add(_norm("is_success"))
+                        _ensure_requirement(reqs, "is_success", "target", expected_kind="categorical")
+                        if not positive_labels:
+                            checklist = contract.get("compliance_checklist")
+                            if not isinstance(checklist, list):
+                                checklist = []
+                            note = (
+                                "Infer positive_labels for is_success from unique values of the status column "
+                                f"('{resolved_status}') before training."
+                            )
+                            if note not in checklist:
+                                checklist.append(note)
+                            contract["compliance_checklist"] = checklist
 
             if _infer_segmentation_required() and _norm("cluster_id") not in derived_keys:
                 derived.append(
@@ -2477,6 +2545,8 @@ class ExecutionPlannerAgent:
                 for item in feature_availability
                 if isinstance(item, dict) and "post" in str(item.get("availability", "")).lower()
             ]
+            leakage_features = _filter_columns_against_contract(leakage_features, contract)
+            leakage_features = _filter_columns_against_contract(leakage_features, contract)
             derived_target_required = False
             for req in contract.get("data_requirements", []) or []:
                 if not isinstance(req, dict):
@@ -2887,9 +2957,9 @@ Return the contract JSON.
             if not target_name and target_req:
                 target_name = target_req.get("canonical_name") or target_req.get("name")
 
+            spec_extraction = contract.get("spec_extraction") if isinstance(contract, dict) else {}
+            derived_cols = spec_extraction.get("derived_columns") if isinstance(spec_extraction, dict) else []
             if target_req and (target_req.get("source") or "").lower() == "derived" and not derive_from:
-                spec_extraction = contract.get("spec_extraction") if isinstance(contract, dict) else None
-                derived_cols = spec_extraction.get("derived_columns") if isinstance(spec_extraction, dict) else None
                 if isinstance(derived_cols, list):
                     for entry in derived_cols:
                         if isinstance(entry, dict):
@@ -2905,16 +2975,38 @@ Return the contract JSON.
                                     depends = entry.get("depends_on")
                                     if isinstance(depends, list) and depends:
                                         source_col = depends[0]
-                                positive_vals = entry.get("positive_values") or entry.get("positive") or entry.get("values")
+                                positive_vals = entry.get("positive_values") or entry.get("positive") or entry.get("values") or []
                                 if isinstance(positive_vals, str):
                                     positive_vals = [positive_vals]
                                 if source_col or positive_vals:
-                                    derive_from = {"column": source_col, "positive_values": positive_vals or []}
+                                    derive_from = {"column": source_col, "positive_values": positive_vals}
                                 break
 
             if target_name:
                 target_payload = {"name": target_name, "derive_from": derive_from}
                 spec["target"] = target_payload
+            if isinstance(derived_cols, list):
+                for entry in derived_cols:
+                    if not isinstance(entry, dict):
+                        continue
+                    name = entry.get("name") or entry.get("canonical_name")
+                    if not name:
+                        continue
+                    if _norm_text(name) in {"issuccess", "success"}:
+                        positive_vals = entry.get("positive_values") or entry.get("positive") or entry.get("values") or []
+                        column = (
+                            entry.get("column")
+                            or entry.get("source_column")
+                            or entry.get("derived_from")
+                            or entry.get("from_column")
+                            or entry.get("base_column")
+                        )
+                        if column or positive_vals:
+                            derive_from = {"column": column, "positive_values": positive_vals}
+                        else:
+                            derive_from = {"column": entry.get("derived_from") or column, "positive_values": positive_vals}
+                        spec["target"] = {"name": name, "derive_from": derive_from}
+                        break
             return spec
 
         def _derive_flag_defaults(spec: Dict[str, Any]) -> Dict[str, Any]:
