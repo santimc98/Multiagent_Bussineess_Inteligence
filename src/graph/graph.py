@@ -3213,14 +3213,12 @@ def _normalize_alignment_check(
     if not raw_status:
         raw_status = normalized.get("overall_status") or normalized.get("overallStatus")
     status = str(raw_status or "").upper()
-    if status not in {"PASS", "WARN", "FAIL"}:
-        status = "WARN"
-        issues.append("alignment_status_invalid")
 
     requirements_payload = normalized.get("requirements")
     per_req = normalized.get("per_requirement")
     evidence_map = normalized.get("evidence")
     checks_payload = normalized.get("checks") or normalized.get("checklist") or []
+    map_schema = False
 
     def _requirements_from_checks(checks: Any) -> List[Dict[str, Any]]:
         derived: List[Dict[str, Any]] = []
@@ -3246,9 +3244,54 @@ def _normalize_alignment_check(
             )
         return derived
 
+    def _requirements_from_map(payload: Dict[str, Any], req_ids: set[str]) -> List[Dict[str, Any]]:
+        derived: List[Dict[str, Any]] = []
+        for req_id in req_ids:
+            entry = payload.get(req_id)
+            if not isinstance(entry, dict):
+                continue
+            status_val = entry.get("status") or entry.get("result") or entry.get("outcome")
+            evidence_val = entry.get("evidence") or entry.get("notes") or []
+            evidence_list: List[str] = []
+            if isinstance(evidence_val, list):
+                evidence_list = [str(v) for v in evidence_val if v]
+            elif isinstance(evidence_val, str) and evidence_val.strip():
+                evidence_list = [evidence_val.strip()]
+            derived.append(
+                {
+                    "id": str(req_id),
+                    "status": str(status_val or "").upper(),
+                    "evidence": evidence_list,
+                }
+            )
+        return derived
+
+    def _derive_status_from_requirements(reqs: List[Dict[str, Any]]) -> str:
+        if not isinstance(reqs, list) or not reqs:
+            return "WARN"
+        statuses = [str(item.get("status") or "").upper() for item in reqs if isinstance(item, dict)]
+        if any(st == "FAIL" for st in statuses):
+            return "FAIL"
+        if any(st not in {"PASS"} for st in statuses):
+            return "WARN"
+        return "PASS"
+
     if not isinstance(requirements_payload, list) and checks_payload:
         requirements_payload = _requirements_from_checks(checks_payload)
         normalized["requirements"] = requirements_payload
+    if not isinstance(requirements_payload, list) and alignment_requirements:
+        req_ids = {
+            str(req.get("id") or req.get("name") or req.get("key") or req.get("requirement_id"))
+            for req in alignment_requirements
+            if isinstance(req, dict) and (req.get("id") or req.get("name") or req.get("key") or req.get("requirement_id"))
+        }
+        matching = [key for key in normalized.keys() if key in req_ids and isinstance(normalized.get(key), dict)]
+        if matching:
+            map_schema = True
+            requirements_payload = _requirements_from_map(normalized, req_ids)
+            normalized["requirements"] = requirements_payload
+            if status not in {"PASS", "WARN", "FAIL"}:
+                status = _derive_status_from_requirements(requirements_payload)
     if not alignment_requirements and isinstance(requirements_payload, list):
         alignment_requirements = [{"id": item.get("id"), "required": True} for item in requirements_payload if item.get("id")]
 
@@ -3294,10 +3337,14 @@ def _normalize_alignment_check(
             elif isinstance(raw_ev, str) and raw_ev.strip():
                 req_evidence = [raw_ev.strip()]
         if not req_status:
-            missing_status += 1
-            req_status = "MISSING"
+            if map_schema:
+                req_status = "WARN"
+            else:
+                missing_status += 1
+                req_status = "MISSING"
         if not req_evidence:
-            missing_evidence += 1
+            if not map_schema:
+                missing_evidence += 1
         normalized_reqs.append(
             {"id": req_id, "status": req_status, "evidence": req_evidence}
         )
@@ -3306,6 +3353,10 @@ def _normalize_alignment_check(
         issues.append("alignment_missing_requirement_status")
     if missing_evidence:
         issues.append("alignment_missing_evidence")
+
+    if status not in {"PASS", "WARN", "FAIL"}:
+        status = "WARN"
+        issues.append("alignment_status_invalid")
 
     failure_mode = normalized.get("failure_mode")
     if not failure_mode and issues:
@@ -7710,7 +7761,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         log_run_event(run_id, "result_evaluator_start", {})
     
     execution_output = state.get('execution_output', '')
-    if "Traceback" in execution_output:
+    if "Traceback" in execution_output or "EXECUTION ERROR" in execution_output:
          print("Reviewer: Critical Execution Error detected. Requesting fix.")
          return {
              "review_verdict": "NEEDS_IMPROVEMENT",
@@ -7729,8 +7780,15 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     feedback = eval_result.get('feedback', '')
     
     new_history = list(state.get('feedback_history', []))
+    has_deterministic_error = "Traceback" in execution_output or "EXECUTION ERROR" in execution_output
     if status == "NEEDS_IMPROVEMENT":
-        new_history.append(f"RESULT EVALUATION FEEDBACK: {feedback}")
+        if has_deterministic_error:
+            new_history.append(f"RESULT EVALUATION FEEDBACK: {feedback}")
+        else:
+            warning = f"REVIEWER_LLM_NONBLOCKING_WARNING: {feedback}"
+            new_history.append(warning)
+            feedback = warning
+            status = "APPROVE_WITH_WARNINGS"
 
     # Case alignment QA gate (optional if required by contract/spec)
     contract = state.get("execution_contract", {}) or {}

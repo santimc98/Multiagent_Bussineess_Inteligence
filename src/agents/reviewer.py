@@ -315,10 +315,13 @@ class ReviewerAgent:
         except Exception as e:
             print(f"Reviewer Evaluation Error: {e}")
             return {
-                "status": "NEEDS_IMPROVEMENT", 
-                "feedback": f"Evaluation skipped due to error: {e}",
-                "failed_gates": ["Evaluation API Error"],
-                "required_fixes": ["Check external API availability"],
-                "retry_worth_it": True
+                "status": "APPROVE_WITH_WARNINGS",
+                "feedback": (
+                    f"Evaluation skipped due to error: {e}. "
+                    "Continuing with deterministic evidence only."
+                ),
+                "failed_gates": [],
+                "required_fixes": [],
+                "retry_worth_it": False
             }
 

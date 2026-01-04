@@ -290,16 +290,29 @@ def _is_sklearn_make_call(call_node: ast.Call) -> bool:
     return False
 
 
+def _is_pure_literal_node(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return all(_is_pure_literal_node(elt) for elt in node.elts)
+    if isinstance(node, ast.Dict):
+        keys = [k for k in node.keys if k is not None]
+        return all(_is_pure_literal_node(k) for k in keys) and all(
+            _is_pure_literal_node(v) for v in node.values
+        )
+    return False
+
+
 def _is_dataframe_literal_call(call_node: ast.Call) -> bool:
     name = _call_name(call_node)
     name_lower = name.lower()
     if not name_lower.endswith("dataframe"):
         return False
     for arg in call_node.args[:1]:
-        if isinstance(arg, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+        if _is_pure_literal_node(arg):
             return True
     for kw in call_node.keywords:
-        if kw.arg in (None, "data") and isinstance(kw.value, (ast.List, ast.Tuple, ast.Set, ast.Dict)):
+        if kw.arg in (None, "data") and _is_pure_literal_node(kw.value):
             return True
     return False
 

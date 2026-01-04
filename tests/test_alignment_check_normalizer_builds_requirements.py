@@ -31,3 +31,20 @@ def test_alignment_check_normalizer_accepts_overall_status():
     normalized, issues = _normalize_alignment_check(alignment_check, [])
     assert normalized.get("status") == "PASS"
     assert "alignment_status_invalid" not in issues
+
+
+def test_alignment_check_normalizer_accepts_map_schema():
+    alignment_check = {
+        "objective_alignment": {"status": "PASS", "evidence": ["ok"]},
+        "segment_alignment": {"status": "PASS", "evidence": "fine"},
+    }
+    requirements = [{"id": "objective_alignment"}, {"id": "segment_alignment"}]
+
+    normalized, issues = _normalize_alignment_check(alignment_check, requirements)
+    assert normalized.get("status") == "PASS"
+    assert "alignment_missing_requirement_status" not in issues
+    assert "alignment_missing_evidence" not in issues
+    reqs = normalized.get("requirements") or []
+    status_map = {req.get("id"): req.get("status") for req in reqs}
+    assert status_map.get("objective_alignment") == "PASS"
+    assert status_map.get("segment_alignment") == "PASS"
