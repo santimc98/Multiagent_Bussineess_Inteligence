@@ -938,7 +938,7 @@ class ExecutionPlannerAgent:
         def _parse_label_list(text: str) -> List[str]:
             if not text:
                 return []
-            parts = [p.strip() for p in re.split(r"[;,/|]", text) if p.strip()]
+            parts = [p.strip(" \"'") for p in re.split(r"[;,/|]", text) if p.strip()]
             return [p for p in parts if p]
 
         def _extract_positive_labels(summary_text: str) -> List[str]:
@@ -954,13 +954,90 @@ class ExecutionPlannerAgent:
                     labels = _parse_label_list(match.group(1))
                     if labels:
                         return labels
-            fallback_tokens = ["won", "success", "converted", "approved", "active", "yes", "true"]
-            found = []
-            lower = summary_text.lower()
-            for tok in fallback_tokens:
-                if tok in lower:
-                    found.append(tok)
-            return found
+            return []
+
+        def _normalize_quotes(text: str) -> str:
+            if not text:
+                return ""
+            return (
+                text.replace("\u201c", "\"")
+                .replace("\u201d", "\"")
+                .replace("\u2018", "'")
+                .replace("\u2019", "'")
+            )
+
+        def _column_mentioned(text: str, column: str) -> bool:
+            if not text or not column:
+                return False
+            return _norm(column) in _norm(text)
+
+        def _column_name_pattern(column: str) -> str:
+            if not column:
+                return ""
+            tokens = re.findall(r"[A-Za-z0-9]+", column)
+            if not tokens:
+                return re.escape(column)
+            return r"[\\s_\\-\\.]*".join([re.escape(tok) for tok in tokens])
+
+        def _extract_positive_labels_from_objective(
+            objective_text: str,
+            status_col: str | None,
+        ) -> tuple[List[str], str | None]:
+            if not objective_text or not status_col:
+                return [], None
+            normalized_text = _normalize_quotes(objective_text)
+            resolved_col = _resolve_exact_header(status_col) or status_col
+            column_referenced = _column_mentioned(normalized_text, resolved_col)
+            col_pattern = _column_name_pattern(resolved_col)
+            if not col_pattern:
+                return [], None
+
+            label_pattern = r"(?P<label>\"[^\"]+\"|'[^']+'|[A-Za-z0-9_%\\.-]+)"
+            contains_patterns = []
+            equals_patterns = []
+            if column_referenced:
+                contains_patterns.extend(
+                    [
+                        rf"{col_pattern}[^\n\r]{{0,200}}?(contiene|contains)[^\n\r]{{0,80}}?{label_pattern}",
+                        rf"(contiene|contains)[^\n\r]{{0,80}}?{label_pattern}[^\n\r]{{0,200}}?{col_pattern}",
+                    ]
+                )
+                equals_patterns.extend(
+                    [
+                        rf"{col_pattern}[^\n\r]{{0,200}}?(==|=|equals|equal to|es|igual)[^\n\r]{{0,80}}?{label_pattern}",
+                        rf"(==|=|equals|equal to|es|igual)[^\n\r]{{0,80}}?{label_pattern}[^\n\r]{{0,200}}?{col_pattern}",
+                    ]
+                )
+
+            phase_tokens = r"(status|phase|stage|estado|fase)"
+            contains_patterns.append(
+                rf"{phase_tokens}[^\n\r]{{0,60}}?(contiene|contains)[^\n\r]{{0,80}}?{label_pattern}"
+            )
+            equals_patterns.append(
+                rf"{phase_tokens}[^\n\r]{{0,60}}?(==|=|equals|equal to|es|igual)[^\n\r]{{0,80}}?{label_pattern}"
+            )
+            equals_patterns.append(
+                rf"{label_pattern}(?:\s+|\s*[-_/:,]+\s*){phase_tokens}"
+            )
+
+            for pattern in contains_patterns:
+                match = re.search(pattern, normalized_text, flags=re.IGNORECASE)
+                if match:
+                    labels = _parse_label_list(match.group("label"))
+                    if labels:
+                        return labels, "contains"
+
+            for pattern in equals_patterns:
+                match = re.search(pattern, normalized_text, flags=re.IGNORECASE)
+                if match:
+                    labels = _parse_label_list(match.group("label"))
+                    if labels:
+                        return labels, "equals"
+
+            labels = _extract_positive_labels(normalized_text)
+            if labels:
+                return labels, None
+            return [], None
 
         def _deliverable_id_from_path(path: str) -> str:
             base = os.path.basename(str(path)) or str(path)
@@ -1483,7 +1560,7 @@ class ExecutionPlannerAgent:
             if objective_type in {"predictive", "prescriptive", "forecasting"} and not target_explicit:
                 status_col = _find_status_candidate()
                 if status_col:
-                    positive_labels = _extract_positive_labels(data_summary)
+                    positive_labels, rule_hint = _extract_positive_labels_from_objective(business_objective, status_col)
                     original_target_name = target_req_name
                     if target_req and str(target_req.get("source") or "").lower() == "derived":
                         target_req["name"] = "is_success"
@@ -1494,13 +1571,16 @@ class ExecutionPlannerAgent:
                         if not target_req.get("derived_owner"):
                             target_req["derived_owner"] = "ml_engineer"
                         target_req_name = "is_success"
+                    rule = "1 if status in positive_labels else 0"
+                    if rule_hint == "contains":
+                        rule = "1 if status contains positive_labels else 0"
                     entry = {
                         "name": "is_success",
                         "canonical_name": "is_success",
                         "role": "target",
                         "dtype": "boolean",
                         "derived_from": status_col,
-                        "rule": "1 if status in positive_labels else 0",
+                        "rule": rule,
                         "positive_values": positive_labels,
                     }
                     if original_target_name:
