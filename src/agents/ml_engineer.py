@@ -194,9 +194,62 @@ class MLEngineerAgent:
         allowed_columns = self._resolve_allowed_columns_for_prompt(execution_contract or {})
         allowed_patterns = self._resolve_allowed_name_patterns_for_prompt(execution_contract or {})
         feedback_blocks = self._select_feedback_blocks(feedback_history, gate_context, max_blocks=2)
+        
+        # STRUCTURED CRITICAL ERRORS SECTION
+        critical_errors: List[str] = []
+        recent_history = (iteration_memory or [])[-2:]
+        current_failure = gate_context or {}
+        
+        # 1. Process Current failure (from gate_context)
+        if current_failure:
+            att_num = len(iteration_memory or []) + 1
+            f_gates = current_failure.get("failed_gates", [])
+            f_type = ", ".join(f_gates) if isinstance(f_gates, list) and f_gates else "MODEL_REJECTION"
+            f_feedback = str(current_failure.get("feedback", "")).strip()
+            f_fixes = current_failure.get("required_fixes", [])
+            f_fix_str = "; ".join(f_fixes) if isinstance(f_fixes, list) and f_fixes else "Address feedback"
+            
+            critical_errors.append(
+                f"ATTEMPT {att_num} - REJECTED:\n"
+                f"  - Error Type: {f_type}\n"
+                f"  - Root Cause: {f_feedback or 'General methodological failure'}\n"
+                f"  - Required Fix: {f_fix_str}"
+            )
+            
+        # 2. Process historical failures (from iteration_memory)
+        for i, entry in enumerate(recent_history):
+            att_id = entry.get("iteration_id", i + 1)
+            # Skip if it's the current one (not expected in iteration_memory yet, but just in case)
+            if current_failure and att_id == len(iteration_memory or []) + 1:
+                continue
+                
+            e_type = ", ".join(entry.get("reviewer_reasons", []) + entry.get("qa_reasons", [])) or "PREVIOUS_FAILURE"
+            e_cause = entry.get("runtime_error", {}).get("message") if isinstance(entry.get("runtime_error"), dict) else None
+            # Fallback to general reasons if no runtime error message
+            if not e_cause:
+                e_cause = "; ".join(entry.get("reviewer_reasons", []) or ["Historical rejection"])
+                
+            e_fix = "; ".join(entry.get("next_actions", [])) or "Improve implementation"
+            
+            critical_errors.append(
+                f"ATTEMPT {att_id} - REJECTED:\n"
+                f"  - Error Type: {e_type}\n"
+                f"  - Root Cause: {e_cause}\n"
+                f"  - Required Fix: {e_fix}"
+            )
+            
+        critical_section = ""
+        if critical_errors:
+            critical_section = (
+                "!!! CRITICAL ERRORS FROM PREVIOUS ATTEMPTS (DO NOT REPEAT) !!!\n" +
+                "\n".join(critical_errors) +
+                "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+            )
+
         memory_block = iteration_memory_block.strip()
         if not memory_block:
             memory_block = json.dumps(iteration_memory or [], indent=2)
+            
         rules_block = "\n".join(
             [
                 "- No synthetic/placeholder data. Load only the provided dataset.",
@@ -210,6 +263,7 @@ class MLEngineerAgent:
         )
         return "\n".join(
             [
+                critical_section,
                 "CONTRACT_MIN_CONTEXT:",
                 json.dumps(contract_min, indent=2),
                 "REQUIRED OUTPUTS:",
