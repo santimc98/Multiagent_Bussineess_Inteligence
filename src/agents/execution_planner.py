@@ -18,6 +18,65 @@ from src.utils.contract_validation import (
 
 load_dotenv()
 
+
+def _normalize_column_identifier(value: Any) -> str:
+    if not value:
+        return ""
+    cleaned = re.sub(r"[^0-9a-zA-Z]+", "", str(value).lower())
+    return cleaned
+
+
+def _build_allowed_column_norms(column_sets: List[str] | None, *more_sets: List[str] | None) -> set[str]:
+    norms: set[str] = set()
+    for collection in (column_sets, *more_sets):
+        if not isinstance(collection, list):
+            continue
+        for col in collection:
+            normed = _normalize_column_identifier(col)
+            if normed:
+                norms.add(normed)
+    return norms
+
+
+def _filter_leakage_audit_features(
+    spec: Dict[str, Any],
+    canonical_columns: List[str] | None,
+    column_inventory: List[str] | None,
+) -> List[str]:
+    policy = spec.get("leakage_policy")
+    if not isinstance(policy, dict):
+        return []
+    features = policy.get("audit_features")
+    if not isinstance(features, list):
+        return []
+    allowed_norms = _build_allowed_column_norms(canonical_columns, column_inventory)
+    filtered_out: List[str] = []
+
+    if not allowed_norms:
+        filtered_out = [str(item) for item in features if item]
+        policy["audit_features"] = []
+    else:
+        kept: List[str] = []
+        for item in features:
+            if not item:
+                continue
+            normed = _normalize_column_identifier(item)
+            if normed not in allowed_norms:
+                filtered_out.append(str(item))
+                continue
+            kept.append(item)
+        policy["audit_features"] = kept
+
+    if filtered_out:
+        detail = spec.get("leakage_policy_detail")
+        if not isinstance(detail, dict):
+            detail = {}
+            spec["leakage_policy_detail"] = detail
+        detail.setdefault("filtered_audit_features", [])
+        existing = detail["filtered_audit_features"]
+        existing.extend(filtered_out)
+    return filtered_out
+
 def parse_derive_from_expression(expr: str) -> Dict[str, Any]:
     if not expr or not isinstance(expr, str):
         return {}
@@ -1568,6 +1627,54 @@ class ExecutionPlannerAgent:
             }
             reqs.append(payload)
 
+        def _column_candidate_from_value(value: Any) -> str | None:
+            if isinstance(value, str):
+                parsed = parse_derive_from_expression(value)
+                candidate = parsed.get("column") if parsed else None
+                return candidate or value
+            if isinstance(value, dict):
+                for key in ("column", "source_column", "base_column", "from_column"):
+                    val = value.get(key)
+                    if isinstance(val, str):
+                        return val
+                return None
+            return None
+
+        def _validate_column(column: str | None, allowed_norms: set[str]) -> str | None:
+            if not column:
+                return None
+            resolved = _resolve_exact_header(column) or column
+            normed = _norm(resolved)
+            if not normed:
+                return None
+            if allowed_norms and normed not in allowed_norms:
+                return None
+            return resolved
+
+        def _extract_explicit_is_success(derived_entries: List[Dict[str, Any]], allowed_norms: set[str]) -> tuple[str | None, Dict[str, Any] | None]:
+            for entry in derived_entries:
+                if not isinstance(entry, dict):
+                    continue
+                role = str(entry.get("role") or "").lower()
+                if "target" not in role and "label" not in role:
+                    continue
+                name = entry.get("canonical_name") or entry.get("name")
+                if not name or _norm(name) not in {"issuccess", "success"}:
+                    continue
+                candidates: List[str | None] = []
+                for key in ("column", "derived_from", "source_column", "base_column", "from_column"):
+                    candidates.append(_column_candidate_from_value(entry.get(key)))
+                depends = entry.get("depends_on")
+                if isinstance(depends, list):
+                    for item in depends:
+                        if isinstance(item, str):
+                            candidates.append(item)
+                for candidate in candidates:
+                    resolved = _validate_column(candidate, allowed_norms)
+                    if resolved:
+                        return resolved, entry
+            return None, None
+
         def _target_name_from_contract(contract: Dict[str, Any], derived: List[Dict[str, Any]]) -> str | None:
             reqs = contract.get("data_requirements", []) or []
             for req in reqs:
@@ -1603,14 +1710,6 @@ class ExecutionPlannerAgent:
                     target_req = req
                     target_req_name = req.get("canonical_name") or req.get("name")
                     break
-            derived_has_target = False
-            for entry in derived:
-                if not isinstance(entry, dict):
-                    continue
-                role = str(entry.get("role") or "").lower()
-                if "target" in role or "label" in role:
-                    derived_has_target = True
-                    break
             target_in_inventory = bool(_resolve_exact_header(target_req_name)) if target_req_name else False
             target_role = str(target_req.get("role") or "").lower() if target_req else ""
             target_source_like = any(tok in target_role for tok in ["target_source", "outcome", "status", "phase"])
@@ -1620,9 +1719,13 @@ class ExecutionPlannerAgent:
                 and target_in_inventory
                 and not target_source_like
             )
-            target_explicit = derived_has_target or target_is_input
+            allowed_norms = _contract_column_norms(contract)
+            explicit_status_column, _ = _extract_explicit_is_success(derived, allowed_norms)
+            status_source_col = explicit_status_column
+            target_explicit = bool(explicit_status_column) or target_is_input
             if objective_type in {"predictive", "prescriptive", "forecasting"} and not target_explicit:
                 status_col = _find_status_candidate()
+                status_source_col = status_col
                 if status_col:
                     resolved_status = _resolve_exact_header(status_col) or status_col
                     allowed_norms = _contract_column_norms(contract)
@@ -1630,6 +1733,7 @@ class ExecutionPlannerAgent:
                     if not resolved_status or (allowed_norms and status_norm not in allowed_norms):
                         resolved_status = None
                     if resolved_status:
+                        status_source_col = resolved_status
                         positive_labels, rule_hint = _extract_positive_labels_from_objective(business_objective, resolved_status)
                         if target_req and str(target_req.get("source") or "").lower() == "derived":
                             target_req["name"] = "is_success"
@@ -1687,7 +1791,7 @@ class ExecutionPlannerAgent:
                 derived_keys.add(_norm("cluster_id"))
                 _ensure_requirement(reqs, "cluster_id", "segment", expected_kind="categorical")
 
-            status_col = _find_status_candidate()
+            status_col = status_source_col or _find_status_candidate()
             for req in reqs:
                 if not isinstance(req, dict):
                     continue
@@ -3079,6 +3183,8 @@ Return the contract JSON.
                                 break
                 if target_name:
                     spec["target"] = {"name": target_name, "derive_from": None}
+            canonical_for_leakage = spec.get("canonical_columns") or canonical_cols
+            _filter_leakage_audit_features(spec, canonical_for_leakage, column_inventory)
             return spec
 
         def _fallback() -> Dict[str, Any]:

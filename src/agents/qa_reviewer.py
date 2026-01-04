@@ -266,18 +266,36 @@ class QAReviewerAgent:
 
 def _is_random_call(call_node: ast.Call) -> bool:
     """
-    Detects calls that rely on random generators (numpy.random, random.*, default_rng, etc.).
+    Detects calls that rely on random generators by checking AST paths (numpy/random modules).
     """
-    try:
-        func_repr = ast.unparse(call_node.func)
-    except Exception:
-        func_repr = ""
-    func_lower = func_repr.lower()
-    random_tokens = ["np.random", "numpy.random", "random.", "random("]
-    random_funcs = ["normal", "uniform", "randint", "randn", "rand", "default_rng"]
-    if any(tok in func_lower for tok in random_tokens):
+    def _unwind_name(node: ast.AST) -> List[str]:
+        parts: List[str] = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+        return list(reversed(parts))
+
+    parts = _unwind_name(call_node.func)
+    if not parts:
+        return False
+    normalized_parts = [part.lower() for part in parts if part]
+    if not normalized_parts:
+        return False
+    func_name = normalized_parts[-1]
+    module_prefix = ".".join(normalized_parts[:-1]).rstrip(".")
+    if module_prefix in {"np.random", "numpy.random", "random"}:
         return True
-    return any(func in func_lower for func in random_funcs)
+    if module_prefix and module_prefix.endswith("random"):
+        return True
+    random_func_names = {"rand", "randn", "randint", "uniform", "normal", "choice"}
+    if func_name in random_func_names:
+        if module_prefix in {"np.random", "numpy.random", "np", "numpy", "random"} or module_prefix.endswith("random"):
+            return True
+    if func_name == "default_rng":
+        return True
+    return False
 
 
 def _is_sklearn_make_call(call_node: ast.Call) -> bool:
