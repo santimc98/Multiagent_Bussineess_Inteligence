@@ -7113,7 +7113,7 @@ def run_ml_preflight(state: AgentState) -> AgentState:
             feedback += f" | Unknown columns ({len(unknown_cols)}): {preview}"
         if forbidden_assignments:
             preview = forbidden_assignments[:10]
-            feedback += f" | Forbidden df column assignments ({len(forbidden_assignments)}): {preview}"
+            feedback += f" | Forbidden df column assignments ({len(forbidden_assignments)}): {preview}. SOLUTION: Use df.assign() instead of df['col']=value. Pattern: df = df.assign(new_col=expression). Example: df = df.assign(derived_target=(df['source_col']==condition).astype(int))"
         history = list(state.get("feedback_history", []))
         history.append(feedback)
         gate_context = {
@@ -7299,7 +7299,7 @@ def execute_code(state: AgentState) -> AgentState:
             msg += f" | Unknown columns ({len(unknown_cols)}): {preview}"
         if forbidden_assignments:
             preview = forbidden_assignments[:10]
-            msg += f" | Forbidden df column assignments ({len(forbidden_assignments)}): {preview}"
+            msg += f" | Forbidden df column assignments ({len(forbidden_assignments)}): {preview}. SOLUTION: Use df.assign() instead of df['col']=value. Pattern: df = df.assign(new_col=expression). Example: df = df.assign(derived_target=(df['source_col']==condition).astype(int))"
         snippet_tokens = [f"'{col}'" for col in (unknown_cols + forbidden_assignments)[:10]]
         snippets = _collect_violation_snippets(code, snippet_tokens)
         if snippets:

@@ -357,6 +357,32 @@ class MLEngineerAgent:
         - No filesystem discovery: do NOT use os.listdir, os.walk, glob.
         - Read only '$data_path'. Save outputs only to ./data and plots to ./static/plots.
 
+        FORBIDDEN PATTERNS & CORRECT ALTERNATIVES:
+        Problem: The sandbox blocks direct DataFrame column creation for safety.
+        Solution: Use .assign() or Pipeline transformers instead.
+
+        ❌ FORBIDDEN:
+          df['new_col'] = value
+          df.loc[:, 'new_col'] = value
+          df[['col1', 'col2']] = [val1, val2]
+
+        ✅ CORRECT:
+          df = df.assign(new_col=value)
+          df = df.assign(col1=val1, col2=val2)
+          
+        ✅ CORRECT (for complex logic in Pipelines):
+          from sklearn.preprocessing import FunctionTransformer
+          def add_derived_column(X):
+              return X.assign(derived_target=(X['status_col']==target_value).astype(int))
+          pipeline = Pipeline([('add_derived', FunctionTransformer(add_derived_column)), ...])
+
+        Universal patterns:
+          ✅ df = df.assign(binary_flag=(df['categorical_col'] == 'target_value').astype(int))
+          ✅ df = df.assign(has_quantity=(df['numeric_col'] > threshold))
+          ✅ df = df.assign(segment_id=clustering_model.fit_predict(df[feature_cols]))
+
+
+
         INPUT CONTEXT (authoritative)
         - Business Objective: "$business_objective"
         - Strategy: $strategy_title ($analysis_type)

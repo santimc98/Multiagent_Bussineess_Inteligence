@@ -64,6 +64,42 @@ class StrategistAgent:
           leakage risk, and signal sufficiency. If you see risk, propose a fallback approach (e.g., descriptive
           segmentation instead of predictive modeling). This is reasoning guidance, not a rigid rule.
         
+        *** TEAM CAPABILITIES & CONSTRAINTS ***
+        You are designing a plan for AI engineers (Data Engineer, ML Engineer) with specific strengths and limitations.
+        Consider dataset size and complexity when proposing strategies.
+        
+        ML Engineer Capabilities:
+        ✅ Strong: Supervised learning (Linear/Logistic Regression, Random Forest, Gradient Boosting), 
+            clustering (KMeans, DBSCAN), segmentation analysis, baseline comparisons, 
+            simple pipelines, visualization, cross-validation
+        ⚠️ Limited: Complex causal inference (small n), advanced time series (requires n>=1000), 
+            deep learning, automatic feature engineering beyond standard transforms
+        ❌ Cannot: Generate synthetic data, access external APIs, train models requiring >5000 samples
+        
+        Data Engineer Capabilities:
+        ✅ Strong: Data cleaning, type inference, missing value handling, outlier detection,
+            basic transformations, duplicate removal, format standardization
+        ⚠️ Limited: Complex feature engineering, advanced imputation strategies
+        ❌ Cannot: External data joins, API calls, database writes
+        
+        Dataset Size Guidelines (UNIVERSAL):
+        - If n < 200: Recommend DESCRIPTIVE approaches (segmentation, summary statistics, simple viz)
+        - If n < 500: Recommend SIMPLE PREDICTIVE (baseline models, segmentation + LR, avoid complex causal)
+        - If n >= 500: Full modeling freedom (complex models, elasticity, causal if data supports)
+        
+        Strategy Complexity Rules:
+        1. Small datasets (n<500): Prefer simple, interpretable models (LR, KMeans) over complex (GBM, causal)
+        2. If proposing COMPLEX techniques (elasticity modeling, causal inference, multi-stage optimization):
+           → Include FALLBACK to simpler approach (e.g., "If modeling fails, use descriptive segmentation")
+        3. Always consider: Can this be implemented with available data and engineer capabilities?
+        
+        Implementation Feasibility Check:
+        Before finalizing strategy, ask yourself:
+        - Does this require data we don't have (time series with n=300)?
+        - Does this need capabilities engineers lack (deep learning, causal DAGs)?
+        - Is there a simpler approach that delivers 80% of the value with 20% of the risk?
+
+        
         *** DATA SCIENCE FIRST PRINCIPLES (UNIVERSAL REASONING) ***
         1. **REPRESENTATIVENESS (The "Bias" Check):**
            - Does your selected data subset represent the *Full Reality* of the problem?
