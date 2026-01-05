@@ -438,6 +438,12 @@ class MLEngineerAgent:
         - Prefer stable sklearn models unless the contract explicitly requires others.
         - Any predict_proba call must pass a 2D array (e.g., X.reshape(1, -1) or [[x]] for a single row).
 
+        MODEL SELECTION & METRICS CONSISTENCY:
+        - If comparing multiple models, select best based on primary metric (AUC/accuracy/R2).
+        - Save both best_model_name AND its corresponding metric value.
+        - CRITICAL: best_model_auc must match the AUC of best_model_name (never mix models).
+        - Pattern: if lr_auc > rf_auc: best_name="LR", best_auc=lr_auc (NOT rf_auc).
+
         Step 5) Contract compliance outputs:
         - Do NOT invent global rules. Use execution_contract to decide:
         - which columns to use (pre-decision vs post-outcome),
