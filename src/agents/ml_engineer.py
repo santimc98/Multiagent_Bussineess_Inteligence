@@ -381,6 +381,25 @@ class MLEngineerAgent:
           ✅ df = df.assign(has_quantity=(df['numeric_col'] > threshold))
           ✅ df = df.assign(segment_id=clustering_model.fit_predict(df[feature_cols]))
 
+        ⚠️ CRITICAL: .assign() only works on DataFrames, NOT on Series:
+        
+        ❌ FORBIDDEN (Series has no .assign() method):
+          df.apply(lambda row: row[['col1', 'col2']].assign(new_col=value), axis=1)
+          #                     ↑ row[['col1', 'col2']] is a Series, not DataFrame!
+        
+        ✅ CORRECT (build dict first, then create DataFrame):
+          df.apply(lambda row: pd.DataFrame([{**row[['col1', 'col2']].to_dict(), 'new_col': value}]), axis=1)
+        
+        ✅ BETTER (avoid lambda entirely, compute outside apply):
+          # Step 1: Compute derived column without lambda
+          df = df.assign(new_col=df.apply(lambda row: compute_value(row), axis=1))
+          # Step 2: Use the result
+          result = df[['col1', 'col2', 'new_col']]
+
+        Universal example (optimization scenario):
+          ❌ WRONG: row[model_features].assign(decision_var=optimal_value)  # Series!
+          ✅ RIGHT: pd.DataFrame([{**row[model_features].to_dict(), 'decision_var': optimal_value}])
+
 
 
         INPUT CONTEXT (authoritative)

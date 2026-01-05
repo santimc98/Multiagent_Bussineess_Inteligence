@@ -1240,12 +1240,109 @@ def _infer_deliverable_kind(path: str) -> str:
         return "json"
     return "artifact"
 
+def _infer_scored_rows_schema(
+    contract: Dict[str, Any],
+    evaluation_spec: Dict[str, Any] | None = None,
+) -> Dict[str, Any] | None:
+    """
+    UNIVERSAL: Infer schema for scored_rows.csv based on strategy type and contract.
+    
+    Works for ANY objective type (prediction, optimization, clustering, descriptive)
+    with NO hardcoded column names or business logic.
+    
+    Returns dict with:
+      - required_columns: list of canonical input columns (always included)
+      - derived_columns: list of derived output columns (based on strategy type)
+      - row_count: "must_match_input" (always)
+    """
+    if not isinstance(contract, dict):
+        return None
+    
+    # Base schema: always include input columns
+    canonical_columns = contract.get("canonical_columns") or []
+    if not isinstance(canonical_columns, list):
+        canonical_columns = []
+    
+    schema = {
+        "required_columns": canonical_columns.copy(),
+        "derived_columns": [],
+        "row_count": "must_match_input",
+        "description": "One row per input record with canonical columns plus derived outputs (predictions, scores, segments, optimal values as applicable)"
+    }
+    
+    # Infer strategy type from contract
+    strategy_context = contract.get("strategy_context") or {}
+    analysis_type = str(strategy_context.get("analysis_type", "")).lower()
+    
+    # Check if evaluation spec requires specific outputs
+    eval_spec = evaluation_spec or contract.get("evaluation_spec") or {}
+    objective_type = str(eval_spec.get("objective_type", "")).lower()
+    requires_target = bool(eval_spec.get("requires_target"))
+    
+    # Derive output columns based on objective type (UNIVERSAL)
+    derived_cols = schema["derived_columns"]
+    
+    # 1. Segmentation/Clustering outputs
+    segmentation = eval_spec.get("segmentation") or {}
+    if segmentation.get("required") or "segment" in analysis_type or "cluster" in analysis_type:
+        # Generic segment identifier (not hardcoded to specific name)
+        derived_cols.append("segment_id")  # or cluster_id
+    
+    # 2. Predictive modeling outputs  
+    if "predict" in analysis_type or "predict" in objective_type or requires_target:
+        # Generic prediction columns (adapt to target type)
+        target_info = eval_spec.get("target") or {}
+        target_name = target_info.get("name", "target")
+        
+        # Add prediction column (name based on target if available)
+        if target_name and target_name != "target":
+            derived_cols.append(f"predicted_{target_name}")
+        else:
+            derived_cols.append("predicted_value")  # generic
+        
+        # Add probability for classification tasks
+        if requires_target:  # Likely binary/multi-class
+            derived_cols.append("predicted_probability")
+    
+    # 3. Optimization/Prescriptive outputs
+    decision_var = eval_spec.get("decision_variable") or {}
+    decision_var_name = decision_var.get("name")
+    
+    if decision_var_name or "optim" in analysis_type or "prescript" in objective_type:
+        # Add optimal value for decision variable (generic name)
+        if decision_var_name:
+            derived_cols.append(f"optimal_{decision_var_name}")
+        else:
+            derived_cols.append("optimal_value")  # fallback generic
+        
+        # Optionally add expected outcome at optimal
+        if requires_target:
+            derived_cols.append("expected_outcome_at_optimal")
+    
+    # 4. Ranking/Scoring outputs
+    if "rank" in analysis_type or "scor" in analysis_type:
+        derived_cols.append("score")
+        derived_cols.append("rank")
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_derived = []
+    for col in derived_cols:
+        if col not in seen:
+            seen.add(col)
+            unique_derived.append(col)
+    schema["derived_columns"] = unique_derived
+    
+    return schema
+
+
 def _ensure_contract_deliverable(
     contract: Dict[str, Any],
     path: str,
     required: bool = True,
     kind: str | None = None,
     description: str | None = None,
+    schema: Dict[str, Any] | None = None,  # ← NEW: optional schema
 ) -> Dict[str, Any]:
     if not isinstance(contract, dict):
         return {}
@@ -1285,18 +1382,22 @@ def _ensure_contract_deliverable(
             existing["kind"] = kind
         if description:
             existing["description"] = description
+        if schema:  # ← NEW: attach schema if provided
+            existing["schema"] = schema
         if not existing.get("id"):
             existing["id"] = _deliverable_id_from_path(path)
     else:
-        deliverables.append(
-            {
-                "id": _deliverable_id_from_path(path),
-                "path": path,
-                "required": bool(required),
-                "kind": kind or _infer_deliverable_kind(path),
-                "description": description or "Requested deliverable.",
-            }
-        )
+        new_deliverable = {
+            "id": _deliverable_id_from_path(path),
+            "path": path,
+            "required": bool(required),
+            "kind": kind or _infer_deliverable_kind(path),
+            "description": description or "Requested deliverable.",
+        }
+        if schema:  # ← NEW: attach schema if provided
+            new_deliverable["schema"] = schema
+        deliverables.append(new_deliverable)
+
 
     spec["deliverables"] = deliverables
     contract["spec_extraction"] = spec
@@ -1339,12 +1440,16 @@ def _ensure_scored_rows_output(
     if "data/scored_rows.csv" in required_outputs:
         explicit_required = True
     if explicit_required or requires_row_scoring:
+        # ← NEW: Generate universal schema for scored_rows.csv
+        scored_rows_schema = _infer_scored_rows_schema(contract, evaluation_spec)
+        
         contract = _ensure_contract_deliverable(
             contract,
             "data/scored_rows.csv",
             required=True,
             kind="dataset",
             description="Row-level scores and key features.",
+            schema=scored_rows_schema,  # ← NEW: attach inferred schema
         )
         return contract
     if isinstance(deliverables, list):
@@ -7568,10 +7673,59 @@ def execute_code(state: AgentState) -> AgentState:
         csv_decimal=state.get("csv_decimal", "."),
         csv_encoding=state.get("csv_encoding", "utf-8"),
     )
+    
+    # ← NEW: UNIVERSAL soft-warn logic for artifact alignment issues
+    # Works for ANY artifact type (scored_rows, metrics, alignment_check, etc.)
+    # No hardcoding of specific issues or objectives
     if artifact_issues:
-        issue_text = "; ".join(artifact_issues)
-        output = f"{output}\nEXECUTION ERROR: ARTIFACT_ALIGNMENT_GUARD: {issue_text}"
-
+        # Track issue history across iterations to enable learning
+        issue_history = state.get("artifact_alignment_issue_history", [])
+        
+        # Count occurrences of each specific issue across all previous iterations
+        issue_occurrence_counts = {}
+        for past_issues in issue_history:
+            for issue in past_issues:
+                issue_occurrence_counts[issue] = issue_occurrence_counts.get(issue, 0) + 1
+        
+        # Determine max occurrence count for current issues (to decide soft vs hard block)
+        max_occurrence = 0
+        for issue in artifact_issues:
+            count = issue_occurrence_counts.get(issue, 0)
+            if count > max_occurrence:
+                max_occurrence = count
+        
+        # UNIVERSAL POLICY: Soft warn for first 2 occurrences, hard block on 3rd+
+        # This gives ML Engineer 2 chances to learn and fix before failing
+        SOFT_WARN_THRESHOLD = 2  # Can be made configurable per strategy if needed
+        
+        if max_occurrence < SOFT_WARN_THRESHOLD:
+            # Soft warning: Add to feedback but DON'T block execution
+            issue_text = "; ".join(artifact_issues)
+            iteration_num = max_occurrence + 1
+            warning_msg = (
+                f"⚠️ ARTIFACT_ALIGNMENT_WARNING (iteration {iteration_num}/{SOFT_WARN_THRESHOLD + 1}): {issue_text}\n"
+                f"   Note: These artifacts will be required for final validation. "
+                f"Please generate them in the next iteration."
+            )
+            
+            # Add to feedback history so ML Engineer receives this in next prompt
+            if "feedback_history" not in state:
+                state["feedback_history"] = []
+            state["feedback_history"].append(warning_msg)
+            
+            # Print to logs for visibility
+            print(warning_msg)
+            
+        else:
+            # Hard block: This is the 3rd+ occurrence, fail the execution
+            issue_text = "; ".join(artifact_issues)
+            output = f"{output}\nEXECUTION ERROR: ARTIFACT_ALIGNMENT_GUARD: {issue_text}"
+        
+        # Track current issues for next iteration (universal tracking)
+        if "artifact_alignment_issue_history" not in state:
+            state["artifact_alignment_issue_history"] = []
+        state["artifact_alignment_issue_history"].append(artifact_issues)
+    
     stale_outputs = _find_stale_outputs(required_outputs, exec_start_ts)
     if stale_outputs:
         output = f"{output}\nEXECUTION ERROR: STALE_OUTPUTS: {stale_outputs}"

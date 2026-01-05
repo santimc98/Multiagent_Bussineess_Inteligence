@@ -33,6 +33,8 @@ diff.patch
 run_bundle.zip
 runs/
 
+
+
 # Data artifacts (keep raw fixtures and other CSVs)
 data/cleaned_data.csv
 data/cleaned_full.csv
