@@ -7,6 +7,7 @@ import re
 import difflib
 
 from dotenv import load_dotenv
+from src.agents.prompts import SENIOR_PLANNER_PROMPT
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from src.utils.contract_validation import (
@@ -17,6 +18,259 @@ from src.utils.contract_validation import (
 )
 
 load_dotenv()
+
+
+def _create_v41_skeleton(
+    strategy: Dict[str, Any],
+    business_objective: str,
+    column_inventory: List[str] | None = None,
+    output_dialect: Dict[str, str] | None = None,
+    reason: str = "LLM failure"
+) -> Dict[str, Any]:
+    """
+    Returns a complete, safe V4.1 schema skeleton with all required fields.
+    Used as fallback when LLM fails or for validation.
+    """
+    strategy_title = strategy.get("title", "Unknown") if isinstance(strategy, dict) else "Unknown"
+    required_cols = strategy.get("required_columns", []) if isinstance(strategy, dict) else []
+    available_cols = column_inventory or []
+    
+    # Minimal safe canonical_columns from strategy.required_columns filtered by inventory
+    canonical_cols = []
+    missing_cols = []
+    fuzzy_matches = {}
+    
+    if required_cols and available_cols:
+        inv_norm = {re.sub(r"[^0-9a-zA-Z]+", "", str(c).lower()): c for c in available_cols}
+        for req in required_cols:
+            req_norm = re.sub(r"[^0-9a-zA-Z]+", "", str(req).lower())
+            if req_norm in inv_norm:
+                canonical_cols.append(inv_norm[req_norm])
+            else:
+                # Column missing from inventory, try fuzzy matching
+                missing_cols.append(str(req))
+                # Use difflib to find close matches
+                close_matches = difflib.get_close_matches(
+                    str(req).lower(),
+                    [str(c).lower() for c in available_cols],
+                    n=3,
+                    cutoff=0.6
+                )
+                if close_matches:
+                    # Map back to original case
+                    matched_originals = [
+                        c for c in available_cols 
+                        if str(c).lower() in close_matches
+                    ]
+                    fuzzy_matches[str(req)] = matched_originals[:3]
+    
+    n_rows = 0  # Unknown without data profile parsing
+    
+    return {
+        "contract_version": 2,
+        "strategy_title": strategy_title,
+        "business_objective": business_objective or "",
+        
+        "missing_columns_handling": {
+            "missing_from_inventory": missing_cols,
+            "attempted_fuzzy_matches": fuzzy_matches,
+            "resolution": "unknown" if not missing_cols else "require_verification",
+            "impact": "none" if not missing_cols else f"{len(missing_cols)} required columns not found",
+            "contract_updates": {
+                "canonical_columns_update": "Fuzzy matches suggested" if fuzzy_matches else "",
+                "artifact_schema_update": "",
+                "derived_plan_update": "",
+                "gates_update": ""
+            }
+        },
+        
+        "execution_constraints": {
+            "inplace_column_creation_policy": "unknown_or_forbidden",
+            "preferred_patterns": ["df = df.assign(...)", "derived_arrays_then_concat", "build_new_df_from_columns"],
+            "rationale": "Fallback: prefer safe patterns when uncertain."
+        },
+        
+        "objective_analysis": {
+            "problem_type": "unknown",
+            "decision_variable": None,
+            "business_decision": "unknown",
+            "success_criteria": "unknown",
+            "complexity": "unknown"
+        },
+        
+        "data_analysis": {
+            "dataset_size": n_rows,
+            "features_with_nulls": [],
+            "type_distribution": {},
+            "risk_features": [],
+            "data_sufficiency": "unknown"
+        },
+        
+        "column_roles": {
+            "pre_decision": [],
+            "decision": [],
+            "outcome": [],
+            "post_decision_audit_only": [],
+            "unknown": available_cols
+        },
+        
+        "preprocessing_requirements": {},
+        
+        "feature_engineering_plan": {
+            "derived_columns": []
+        },
+        
+        "validation_requirements": {
+            "method": "cross_validation",
+            "stratification": False,
+            "min_samples_required": 100
+        },
+        
+        "leakage_execution_plan": {
+            "audit_features": [],
+            "method": "correlation_with_target",
+            "threshold": 0.9,
+            "action_if_exceeds": "exclude_from_features"
+        },
+        
+        "optimization_specification": None,
+        "segmentation_constraints": None,
+        
+        "data_limited_mode": {
+            "is_active": False,
+            "activation_reasons": [],
+            "fallback_methodology": "unknown",
+            "minimum_outputs": ["data/metrics.json", "data/scored_rows.csv", "data/alignment_check.json"],
+            "artifact_reductions_allowed": True
+        },
+        
+        "allowed_feature_sets": {
+            "segmentation_features": [],
+            "model_features": [],
+            "audit_only_features": [],
+            "forbidden_for_modeling": [],
+            "rationale": "Fallback: empty feature sets pending analysis."
+        },
+        
+        "artifact_requirements": {
+            "required_files": ["data/cleaned_data.csv", "data/metrics.json"],
+            "file_schemas": {}
+        },
+        
+        "qa_gates": [
+            {"id": "mapping_summary", "required": True, "description": "Column mapping validated"},
+            {"id": "consistency_checks", "required": True, "description": "Basic consistency verified"},
+            {"id": "outputs_required", "required": True, "description": "Required outputs present"}
+        ],
+        
+        "reviewer_gates": [
+            {"id": "methodology_alignment", "required": True, "description": "Methodology aligns with objective"},
+            {"id": "business_value", "required": True, "description": "Business value demonstrated"}
+        ],
+        
+        "data_engineer_runbook": DEFAULT_DATA_ENGINEER_RUNBOOK,
+        "ml_engineer_runbook": DEFAULT_ML_ENGINEER_RUNBOOK,
+        
+        "available_columns": available_cols,
+        "canonical_columns": canonical_cols,
+        "derived_columns": [],
+        "required_outputs": ["data/cleaned_data.csv", "data/metrics.json", "data/alignment_check.json"],
+        
+        "iteration_policy": {
+            "max_iterations": 3,
+            "early_stop_on_success": True
+        },
+        
+        "unknowns": [
+            {
+                "item": reason,
+                "impact": "Using skeletal V4.1 fallback",
+                "mitigation": "Manual review required",
+                "requires_verification": True
+            }
+        ],
+        
+        "assumptions": [
+            "Minimal safe defaults used due to planner unavailability"
+        ],
+        
+        "notes_for_engineers": [
+            "This is a fallback contract. Proceed conservatively.",
+            "Verify column inventory and semantics manually if possible."
+        ]
+    }
+
+
+def ensure_v41_schema(contract: Dict[str, Any], strict: bool = False) -> Dict[str, Any]:
+    """
+    Validates and fills missing V4.1 schema keys.
+    Adds to 'unknowns' array when filling defaults.
+    
+    Args:
+        contract: Contract dict from LLM
+        strict: If True, raise error on missing keys (for tests)
+    
+    Returns:
+        Contract with all V4.1 keys present
+    """
+    if not isinstance(contract, dict):
+        return contract
+    
+    required_keys = [
+        "contract_version", "strategy_title", "business_objective",
+        "missing_columns_handling", "execution_constraints",
+        "objective_analysis", "data_analysis", "column_roles",
+        "preprocessing_requirements", "feature_engineering_plan",
+        "validation_requirements", "leakage_execution_plan",
+        "optimization_specification", "segmentation_constraints",
+        "data_limited_mode", "allowed_feature_sets",
+        "artifact_requirements", "qa_gates", "reviewer_gates",
+        "data_engineer_runbook", "ml_engineer_runbook",
+        "available_columns", "canonical_columns", "derived_columns",
+        "required_outputs", "iteration_policy", "unknowns",
+        "assumptions", "notes_for_engineers"
+    ]
+    
+    repairs = []
+    
+    for key in required_keys:
+        if key not in contract:
+            if strict:
+                raise ValueError(f"Missing required V4.1 key: {key}")
+            
+            # Fill with safe default
+            if key == "contract_version":
+                contract[key] = 2
+            elif key in ("optimization_specification", "segmentation_constraints"):
+                contract[key] = None
+            elif key in ("unknowns", "assumptions", "notes_for_engineers", "available_columns", 
+                         "canonical_columns", "derived_columns", "required_outputs"):
+                contract[key] = []
+            elif key in ("qa_gates", "reviewer_gates"):
+                contract[key] = []
+            elif key in ("strategy_title", "business_objective"):
+                contract[key] = ""
+            else:
+                contract[key] = {}
+            
+            repairs.append(f"Added missing key: {key}")
+    
+    # Ensure unknowns is a list
+    unknowns = contract.get("unknowns")
+    if not isinstance(unknowns, list):
+        unknowns = []
+        contract["unknowns"] = unknowns
+    
+    # Add repair notes to unknowns
+    for repair in repairs:
+        unknowns.append({
+            "item": repair,
+            "impact": "Schema validation filled missing field",
+            "mitigation": "Review LLM output quality",
+            "requires_verification": False
+        })
+    
+    return contract
 
 
 def _normalize_column_identifier(value: Any) -> str:
@@ -244,7 +498,15 @@ class ExecutionPlannerAgent:
         self.last_prompt = None
         self.last_response = None
 
-    def generate_contract(self, strategy: Dict[str, Any], data_summary: str = "", business_objective: str = "", column_inventory: list[str] | None = None) -> Dict[str, Any]:
+    def generate_contract(
+        self,
+        strategy: Dict[str, Any],
+        data_summary: str = "",
+        business_objective: str = "",
+        column_inventory: list[str] | None = None,
+        output_dialect: Dict[str, str] | None = None,
+        env_constraints: Dict[str, Any] | None = None
+    ) -> Dict[str, Any]:
         def _norm(name: str) -> str:
             return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
 
@@ -2520,504 +2782,74 @@ class ExecutionPlannerAgent:
                 )
 
             segment_required = False
-            spec = contract.get("spec_extraction") or {}
-            case_taxonomy = spec.get("case_taxonomy") if isinstance(spec, dict) else None
-            if isinstance(case_taxonomy, list) and case_taxonomy:
-                segment_required = True
-            roles = [
-                str(req.get("role") or "").lower()
-                for req in contract.get("data_requirements", [])
-                if isinstance(req, dict)
-            ]
-            if any(tok in role for role in roles for tok in ["segment", "group", "cluster"]):
-                segment_required = True
-            combined_text = "\n".join(
-                [
-                    business_objective or "",
-                    data_summary or "",
-                    json.dumps(strategy, ensure_ascii=True) if isinstance(strategy, dict) else "",
-                ]
-            )
-            if _detect_segment_context(combined_text):
-                segment_required = True
-            if segment_required:
-                _add(
-                    "segment_alignment",
-                    "Segment-level or case-level analysis is produced when segmentation is part of the strategy.",
-                    "Global-only results can mask segment variability required for the decision.",
-                    [
-                        "Segment-level metrics or elasticity are reported.",
-                        "If only one segment is valid, warn and aggregate with rationale.",
-                    ],
-                    "segmentation_relevant",
-                    "data_limited",
-                )
-
-            feature_availability = contract.get("feature_availability")
-            if isinstance(feature_availability, list) and feature_availability:
-                _add(
-                    "availability_alignment",
-                    "Training uses only pre-decision features; post-outcome fields are excluded or audited.",
-                    "Ensures recommendations are based on information available at decision time.",
-                    [
-                        "Features used for modeling are available at decision time.",
-                        "Post-outcome fields are excluded or documented as leakage risks.",
-                    ],
-                    "feature_availability_present",
-                    "method_choice",
-                )
-
-            quality_gates = contract.get("quality_gates")
-            if isinstance(quality_gates, dict) and quality_gates:
-                _add(
-                    "validation_minimum",
-                    "Validation metrics are computed and compared to quality gates.",
-                    "Keeps the solution aligned with the minimum acceptance criteria.",
-                    [
-                        "Metrics are reported and checked against quality_gates.",
-                        "Shortfalls are explained with data limitations or remediation steps.",
-                    ],
-                    "quality_gates_present",
-                    "method_choice",
-                )
-
-            return requirements
-
-        def _attach_alignment_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
-            if not isinstance(contract, dict):
-                return contract
-            existing = contract.get("alignment_requirements")
-            base_reqs = _build_alignment_requirements(contract)
-            merged: List[Dict[str, Any]] = []
-            base_by_id = {req.get("id"): dict(req) for req in base_reqs if isinstance(req, dict)}
-            merged.extend(base_reqs)
-
-            normalized_existing = _normalize_alignment_requirements(existing)
-            for item in normalized_existing:
-                req_id = item.get("id")
-                if not req_id:
-                    continue
-                if req_id in base_by_id:
-                    base_item = base_by_id[req_id]
-                    for key in ("requirement", "rationale", "applies_when", "failure_mode_on_miss"):
-                        if item.get(key):
-                            base_item[key] = item[key]
-                    if item.get("success_criteria"):
-                        base_item["success_criteria"] = item["success_criteria"]
-                    if item.get("evidence"):
-                        base_item["evidence"] = item["evidence"]
-                else:
-                    merged.append(item)
-                    base_by_id[req_id] = item
-
-            contract["alignment_requirements"] = merged
-
-            checklist = contract.get("compliance_checklist")
-            if not isinstance(checklist, list):
-                checklist = []
-            for req in merged:
-                req_id = req.get("id")
-                req_text = req.get("requirement")
-                if not req_id or not req_text:
-                    continue
-                line = f"Alignment requirement ({req_id}): {req_text}"
-                if line not in checklist:
-                    checklist.append(line)
-            contract["compliance_checklist"] = checklist
-            return contract
-
-        def _build_evaluation_spec_fallback(contract: Dict[str, Any]) -> Dict[str, Any]:
-            objective_text = (contract.get("business_objective") or business_objective or "").lower()
-            strategy_text = json.dumps(strategy or {}).lower()
-            objective_type = "descriptive"
-            if any(tok in objective_text for tok in ["optimiz", "maximize", "optimal price", "precio", "revenue", "expected value"]):
-                objective_type = "prescriptive"
-            elif any(tok in objective_text for tok in ["predict", "classif", "regress", "forecast", "probability"]):
-                objective_type = "predictive"
-
-            decision_vars = contract.get("decision_variables") or []
-            decision_var = decision_vars[0] if decision_vars else None
-            segmentation_required = any(tok in strategy_text for tok in ["segment", "cluster", "typology", "tipolog"])
-            feature_availability = contract.get("feature_availability") or []
-            pre_decision = [
-                item.get("column")
-                for item in feature_availability
-                if isinstance(item, dict) and str(item.get("availability", "")).lower() == "pre-decision"
-            ]
-            leakage_features = [
-                item.get("column")
-                for item in feature_availability
-                if isinstance(item, dict) and "post" in str(item.get("availability", "")).lower()
-            ]
-            leakage_features = _filter_columns_against_contract(leakage_features, contract)
-            leakage_features = _filter_columns_against_contract(leakage_features, contract)
-            derived_target_required = False
-            for req in contract.get("data_requirements", []) or []:
-                if not isinstance(req, dict):
-                    continue
-                if str(req.get("role", "")).lower() == "target" and str(req.get("source", "input")).lower() == "derived":
-                    derived_target_required = True
-                    break
-
-            qa_gates = [
-                "mapping_summary",
-                "canonical_mapping",
-                "consistency_checks",
-                "target_variance_guard",
-                "outputs_required",
-            ]
-            if derived_target_required:
-                qa_gates.append("target_derivation_required")
-            if leakage_features:
-                qa_gates.append("leakage_prevention")
-            if segmentation_required:
-                qa_gates.append("segmentation_predecision")
-            reviewer_gates = ["methodology_alignment", "business_value"]
-            if objective_type in {"predictive", "prescriptive"}:
-                reviewer_gates.append("validation_required")
-            spec = contract.get("spec_extraction") or {}
-            decision_opt_required = bool(
-                decision_var
-                and (
-                    spec.get("scoring_formula")
-                    or spec.get("constraints")
-                    or contract.get("optimization_constraints")
-                )
-            )
-            if decision_opt_required:
-                reviewer_gates.append("decision_optimization_required")
-
-            alignment_requirements = contract.get("alignment_requirements") or []
-            if not alignment_requirements:
-                alignment_requirements = [
-                    {"id": "objective_alignment", "description": "Output aligns with business objective.", "required": True},
-                    {"id": "decision_variable_handling", "description": "Decision variables used correctly.", "required": bool(decision_var)},
-                    {"id": "segment_alignment", "description": "Segmentation uses only pre-decision features.", "required": segmentation_required},
-                    {"id": "validation_minimum", "description": "Validation performed per policy.", "required": True},
-                ]
-
-            deliverables = (contract.get("spec_extraction") or {}).get("deliverables")
-            evidence_requirements: List[Dict[str, Any]] = []
-            if isinstance(deliverables, list) and deliverables:
-                for item in deliverables:
-                    if isinstance(item, dict) and item.get("path"):
-                        evidence_requirements.append(
-                            {"artifact": item.get("path"), "required": bool(item.get("required", True))}
-                        )
-                    elif isinstance(item, str):
-                        evidence_requirements.append({"artifact": item, "required": True})
-            else:
-                evidence_requirements = [{"artifact": out, "required": True} for out in contract.get("required_outputs", [])]
-
-            return {
-                "objective_type": objective_type,
-                "segmentation": {
-                    "required": segmentation_required,
-                    "features": pre_decision if segmentation_required else [],
-                    "confidence": 0.4,
-                    "rationale": "Derived from strategy text and feature availability."
-                },
-                "decision_variable": {
-                    "name": decision_var,
-                    "confidence": 0.4,
-                    "rationale": "Derived from contract decision_variables."
-                },
-                "leakage_policy": {
-                    "audit_features": leakage_features,
-                    "correlation_threshold": 0.9,
-                    "exclude_on_leakage": True
-                },
-                "validation_policy": {
-                    "require_cv": objective_type in {"predictive", "prescriptive"},
-                    "baseline_required": objective_type in {"predictive", "prescriptive"}
-                },
-                "qa_gates": qa_gates,
-                "reviewer_gates": reviewer_gates,
-                "alignment_requirements": alignment_requirements,
-                "evidence_requirements": evidence_requirements,
-                "confidence": 0.4,
-                "justification": "Fallback evaluation spec derived heuristically from contract and strategy."
-            }
-
-        def _normalize_quality_gates(contract: Dict[str, Any]) -> Dict[str, Any]:
-            if not isinstance(contract, dict):
-                return contract
-            gates = contract.get("quality_gates")
-            if isinstance(gates, dict) and gates:
-                return contract
-            raw = contract.get("quality_gates_raw")
-            if not isinstance(raw, list):
-                return contract
-            normalized: Dict[str, Any] = {}
-            for item in raw:
-                if not isinstance(item, dict):
-                    continue
-                metric = item.get("metric")
-                threshold = item.get("threshold")
-                if metric and threshold is not None:
-                    normalized[str(metric)] = threshold
-            if normalized:
-                contract["quality_gates"] = normalized
-                planner_self_check = contract.get("planner_self_check")
-                if not isinstance(planner_self_check, list):
-                    planner_self_check = []
-                msg = "Derived quality_gates from quality_gates_raw for downstream gating."
-                if msg not in planner_self_check:
-                    planner_self_check.append(msg)
-                contract["planner_self_check"] = planner_self_check
-            return contract
-
-        def _attach_spec_extraction_to_runbook(contract: Dict[str, Any]) -> Dict[str, Any]:
-            if not isinstance(contract, dict):
-                return contract
-            spec = contract.get("spec_extraction")
-            if not isinstance(spec, dict):
-                return contract
-            runbooks = contract.get("role_runbooks")
-            if not isinstance(runbooks, dict):
-                return contract
-            ml_runbook = runbooks.get("ml_engineer")
-            if not isinstance(ml_runbook, dict):
-                return contract
-            ml_runbook["spec_extraction"] = spec
-            runbooks["ml_engineer"] = ml_runbook
-            contract["role_runbooks"] = runbooks
-            return contract
-
-        def _attach_business_alignment(contract: Dict[str, Any]) -> Dict[str, Any]:
-            return _propagate_business_alignment(contract)
 
         def _fallback() -> Dict[str, Any]:
-            required_cols = strategy.get("required_columns", []) or []
-            data_requirements: List[Dict[str, Any]] = []
-            for col in required_cols:
-                name_lower = str(col).lower()
-                role = "feature"
-                expected_range = None
-                if any(tok in name_lower for tok in ["pct", "percent", "ratio", "prob", "rate"]):
-                    role = "percentage"
-                    expected_range = [0, 1]
-                elif "score" in name_lower:
-                    role = "risk_score"
-                    expected_range = [0, 1]
-                data_requirements.append(
-                    {
-                        "name": col,
-                        "role": role,
-                        "expected_range": expected_range,
-                        "allowed_null_frac": None,
-                        "source": "input",
-                    }
-                )
-            outputs = ["data/cleaned_data.csv"]
-            title_lower = str(strategy.get("title", "")).lower()
-            required_deps: List[str] = []
-            if "xgboost" in title_lower:
-                required_deps.append("xgboost")
-            if "statsmodel" in title_lower or "statsmodels" in title_lower:
-                required_deps.append("statsmodels")
-            if "parquet" in title_lower:
-                required_deps.append("pyarrow")
-            if "excel" in title_lower or "xlsx" in title_lower:
-                required_deps.append("openpyxl")
-            contract = {
-                "contract_version": 1,
-                "strategy_title": strategy.get("title", ""),
-                "business_objective": business_objective,
-                "required_outputs": outputs,
-                "data_requirements": data_requirements,
-                "required_dependencies": required_deps,
-                "feature_availability": [],
-                "availability_summary": "Planner fallback used; no explicit availability reasoning provided.",
-                "compliance_checklist": [],
-                "iteration_policy": {
-                    "compliance_bootstrap_max": 2,
-                    "metric_improvement_max": 6,
-                    "runtime_fix_max": 3,
-                },
-                "quality_gates": {
-                    "spearman_min": 0.85,
-                    "violations_max": 0,
-                    "inactive_share_max": 0.01,
-                    "max_weight_max": 0.70,
-                    "hhi_max": 0.60,
-                    "near_zero_max": 1,
-                },
-                "optimization_preferences": {
-                    "regularization": {"l2": 0.05, "concentration_penalty": 0.1},
-                    "ranking_loss": "hinge_pairwise",
-                },
-                "business_alignment": {},
-                "validations": [],
-                "notes_for_engineers": [
-                    "Refine roles/ranges using data_summary evidence; adjust in Patch Mode if needed.",
-                    "Align cleaning/modeling with this contract; avoid hardcoded business rules.",
-                    "Planner fallback used; spec_extraction may be empty.",
-                ],
-                "role_runbooks": {
-                    "data_engineer": DEFAULT_DATA_ENGINEER_RUNBOOK,
-                    "ml_engineer": DEFAULT_ML_ENGINEER_RUNBOOK,
-                },
-                "spec_extraction": {
-                    "derived_columns": [],
-                    "case_taxonomy": [],
-                    "constraints": [],
-                    "deliverables": [],
-                    "scoring_formula": None,
-                    "target_type": None,
-                    "leakage_policy": None,
-                },
-                "planner_self_check": [],
-            }
-            contract = _ensure_formula_requirements(contract)
-            contract = _ensure_strategy_requirements(contract)
-            contract = _apply_inventory_source(contract)
-            contract = _apply_expected_kind(contract)
-            contract = _ensure_case_id_requirement(contract)
-            contract = _attach_canonical_names(contract)
-            contract = enforce_percentage_ranges(contract)
-            contract = ensure_role_runbooks(contract)
-            contract = _attach_data_risks(contract)
-            contract = _attach_spec_extraction_issues(contract)
-            contract = _normalize_quality_gates(contract)
-            contract = _ensure_spec_extraction(contract)
-            contract = _apply_deliverables(contract)
-            contract = _attach_business_alignment(contract)
-            contract = _attach_strategy_context(contract)
-            contract = _attach_semantic_guidance(contract)
-            contract = _attach_probability_audit_note(contract)
-            contract = _attach_segmentation_constraints(contract)
-            contract = _complete_contract_inference(contract)
-            contract = _assign_derived_owners(contract)
-            contract = _attach_variable_semantics(contract)
-            contract = _apply_artifact_schemas(contract)
-            contract = _ensure_availability_reasoning(contract)
-            contract = _attach_counterfactual_policy(contract)
-            contract = _attach_alignment_requirements(contract)
-            contract = _ensure_iteration_policy(contract)
-            contract = _attach_reporting_policy(contract)
-            return _attach_spec_extraction_to_runbook(contract)
+            return _create_v41_skeleton(
+                strategy=strategy,
+                business_objective=business_objective,
+                column_inventory=column_inventory,
+                output_dialect=output_dialect,
+                reason="Planner LLM Failed"
+            )
 
         if not self.client:
             return _fallback()
 
+        strategy_json = json.dumps(strategy, indent=2)
         column_inventory_json = json.dumps(column_inventory or [])
-        system_prompt = Template(
-            """
-You are a senior execution planner inside a multi-agent system. Produce a JSON contract that helps
-downstream AI engineers reason better (guidance, not rigid imperative rules).
+        
+        # Ensure data_summary is a string
+        data_summary_str = ""
+        if isinstance(data_summary, dict):
+            data_summary_str = json.dumps(data_summary, indent=2)
+        else:
+            data_summary_str = str(data_summary)
 
-Requirements:
-- Output JSON ONLY (no markdown/code fences).
-- Include: contract_version, strategy_title, business_objective, required_outputs, data_requirements, validations,
-  notes_for_engineers, required_dependencies, data_risks, spec_extraction, planner_self_check,
-  compliance_checklist, iteration_policy.
-- Include feature_availability (list of {column, availability, rationale}) and availability_summary (string).
-  Use this to reason about pre-decision vs post-outcome fields and leakage risk. This is a reasoning aid, not a rule.
-- data_requirements: list of {name, role, expected_range, allowed_null_frac, source, expected_kind}.
-  expected_kind in {numeric, datetime, categorical, unknown}.
-- Each data_requirement may include source: "input" | "derived" (default input).
-- Use expected_range when the business context implies it (e.g., [0,1] for normalized scores/ratios).
-- validations: generic checks (ranking coherence, out-of-range, weight constraints).
-- Prefer using columns from the strategy and data_summary; if something must be derived, mark source="derived"
-  and explain in data_risks.
-- SPEC EXTRACTION deliverables must be a list of objects with keys {id, path, required, kind, description}.
-- Include artifact_schemas with per-output schemas (e.g., data/scored_rows.csv) specifying allowed_extra_columns and allowed_name_patterns.
-- required_outputs must equal [d.path for d in spec_extraction.deliverables if d.required] and include data/cleaned_data.csv.
-- Include role_runbooks to guide reasoning (goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist).
-- COLUMN INVENTORY (detected from CSV header) to help decide source input/derived: $column_inventory
-- required_dependencies is optional; include only if strongly implied by the strategy title or data_summary.
-- ALWAYS include quality_gates with explicit metrics + thresholds for this specific business objective.
-  Do NOT leave quality_gates empty. Do NOT rely on defaults.
-- If you use quality_gates_raw (list form), also populate quality_gates (metric -> threshold) so evaluators can act.
-- ALWAYS include business_alignment with ordered optimization priorities and acceptance criteria.
-  This must be derived from the objective (not generic).
-- SPEC EXTRACTION: map explicit formulas, derived columns, cases, constraints, deliverables, target_type, leakage_policy.
-  If not stated, leave empty/null; do not invent.
-- Infer expected_kind using evidence from data_summary and column inventory. If a column looks like a person/role/channel/sector
-  or identifier, treat as categorical; if it looks like a date/time, treat as datetime; otherwise use numeric only when justified.
-- Provide feature_semantics (short business meaning per column) and business_sanity_checks (checks to interpret results).
-  These are reasoning aids, not hard rules.
-- Include compliance_checklist (list of concrete compliance items that must pass before metric tuning begins).
-  Derive it from the contract itself (quality_gates, deliverables, leakage policy) rather than generic boilerplate.
-- Include alignment_requirements: concise alignment checks derived from objective/strategy (decision variables,
-  segment-level validity, validation minima). Keep them universal and evidence-focused.
-- Include iteration_policy with:
-  * compliance_bootstrap_max (iterations to fix compliance issues),
-  * metric_improvement_max (iterations to improve metrics),
-  * runtime_fix_max (runtime error retries).
-  Choose values appropriate to the task difficulty and budget.
-- If the objective involves pricing, segmentation, or threshold-based recommendations, consider whether a derived tier/segment
-  column (e.g., size deciles or sector groups) would materially improve downstream reasoning; include it only if justified
-  by the strategy and data. Do not treat tiering as universally required.
-- SELF CHECK: short statements confirming you defined quality_gates and business_alignment consistent with the objective.
-  """
-        ).substitute(column_inventory=column_inventory_json)
-        user_prompt_template = Template(
-            """
-BUSINESS_OBJECTIVE:
-$business_objective
+        # Construct Input
+        user_input = f"""
+strategy:
+{strategy_json}
 
-STRATEGY:
-$strategy_json
+business_objective:
+{business_objective}
 
-DATA_SUMMARY:
-$data_summary
+column_inventory:
+{column_inventory_json}
 
-CSV COLUMN INVENTORY:
-$column_inventory
+data_profile_summary:
+{data_summary_str}
 
-Return the contract JSON.
+output_dialect:
+{json.dumps(output_dialect or "unknown")}
+
+env_constraints:
+{json.dumps(env_constraints or {"forbid_inplace_column_creation": True})}
 """
-        )
-        user_prompt = user_prompt_template.substitute(
-            business_objective=business_objective,
-            strategy_json=json.dumps(strategy, indent=2),
-            data_summary=data_summary,
-            column_inventory=json.dumps(column_inventory or []),
-        )
+        full_prompt = SENIOR_PLANNER_PROMPT + "\n\nINPUTS:\n" + user_input
+        self.last_prompt = full_prompt
+        
         try:
-            full_prompt = system_prompt + "\n\nUSER_INPUT:\n" + user_prompt
-            self.last_prompt = full_prompt
             response = self.client.generate_content(full_prompt)
             content = response.text
             self.last_response = content
+            # Clean markdown
             content = content.replace("```json", "").replace("```", "").strip()
+            # Handle potential preamble text if model is chatty (though V4.1 says JSON only)
+            if "{" in content:
+                content = content[content.find("{"):content.rfind("}")+1]
+                
             contract = json.loads(content)
-            if not isinstance(contract, dict) or "data_requirements" not in contract:
+            
+            # Validate structure
+            if not isinstance(contract, dict):
+                # Fallback if output is not a dict
                 return _fallback()
-            if "required_dependencies" not in contract:
-                contract["required_dependencies"] = []
-            if "quality_gates" not in contract:
-                contract["quality_gates"] = {}
-            if "optimization_preferences" not in contract:
-                contract["optimization_preferences"] = {}
-            contract = _ensure_formula_requirements(contract)
-            contract = _ensure_strategy_requirements(contract)
-            contract = _apply_inventory_source(contract)
-            contract = _apply_expected_kind(contract)
-            contract = _ensure_case_id_requirement(contract)
-            contract = _attach_canonical_names(contract)
-            contract = enforce_percentage_ranges(contract)
-            contract = ensure_role_runbooks(contract)
-            contract = _attach_data_risks(contract)
-            contract = _attach_spec_extraction_issues(contract)
-            contract = _normalize_quality_gates(contract)
-            contract = _ensure_spec_extraction(contract)
-            contract = _apply_deliverables(contract)
-            contract = _attach_business_alignment(contract)
-            contract = _attach_strategy_context(contract)
-            contract = _attach_semantic_guidance(contract)
-            contract = _complete_contract_inference(contract)
-            contract = _assign_derived_owners(contract)
-            contract = _attach_variable_semantics(contract)
-            contract = _apply_artifact_schemas(contract)
-            contract = _ensure_availability_reasoning(contract)
-            contract = _attach_counterfactual_policy(contract)
-            contract = _attach_alignment_requirements(contract)
-            contract = _ensure_iteration_policy(contract)
-            contract = _attach_reporting_policy(contract)
-            return _attach_spec_extraction_to_runbook(contract)
+            
+            # Ensure V4.1 schema completeness
+            contract = ensure_v41_schema(contract)
+            
+            return contract
+
         except Exception:
             return _fallback()
 
@@ -3029,322 +2861,62 @@ Return the contract JSON.
         business_objective: str = "",
         column_inventory: list[str] | None = None,
     ) -> Dict[str, Any]:
-        def _derive_target_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
-            if not isinstance(spec, dict):
-                return spec
-            def _norm_text(value: Any) -> str:
-                return re.sub(r"[^0-9a-zA-Z]+", "", str(value).lower())
-            target_payload = spec.get("target")
-            if not isinstance(target_payload, dict):
-                target_payload = {}
-            target_name = target_payload.get("name")
-            derive_from_raw = target_payload.get("derive_from")
-            derive_from = derive_from_raw if isinstance(derive_from_raw, dict) else None
-            if isinstance(derive_from_raw, str):
-                parsed = parse_derive_from_expression(derive_from_raw)
-                if parsed:
-                    parsed.setdefault("positive_values", [])
-                    derive_from = parsed
-            if isinstance(derive_from, dict) and not isinstance(derive_from.get("positive_values"), list):
-                derive_from["positive_values"] = []
-
-            reqs = contract.get("data_requirements", []) if isinstance(contract, dict) else []
-            target_req = None
-            for req in reqs:
-                if not isinstance(req, dict):
-                    continue
-                role = (req.get("role") or "").lower()
-                if "target" in role or "label" in role:
-                    target_req = req
-                    break
-
-            if not target_name and target_req:
-                target_name = target_req.get("canonical_name") or target_req.get("name")
-
-            spec_extraction = contract.get("spec_extraction") if isinstance(contract, dict) else {}
-            derived_cols = spec_extraction.get("derived_columns") if isinstance(spec_extraction, dict) else []
-            if target_req and (target_req.get("source") or "").lower() == "derived" and not derive_from:
-                if isinstance(derived_cols, list):
-                    for entry in derived_cols:
-                        if isinstance(entry, dict):
-                            name = entry.get("name") or entry.get("canonical_name")
-                            if name and target_name and _norm_text(name) == _norm_text(target_name):
-                                source_col = (
-                                    entry.get("source_column")
-                                    or entry.get("column")
-                                    or entry.get("from_column")
-                                    or entry.get("base_column")
-                                )
-                                if not source_col:
-                                    depends = entry.get("depends_on")
-                                    if isinstance(depends, list) and depends:
-                                        source_col = depends[0]
-                                positive_vals = entry.get("positive_values") or entry.get("positive") or entry.get("values") or []
-                                if isinstance(positive_vals, str):
-                                    positive_vals = [positive_vals]
-                                if source_col or positive_vals:
-                                    derive_from = {"column": source_col, "positive_values": positive_vals}
-                                break
-
-            if target_name:
-                target_payload = {"name": target_name, "derive_from": derive_from}
-                spec["target"] = target_payload
-            if isinstance(derived_cols, list):
-                for entry in derived_cols:
-                    if not isinstance(entry, dict):
-                        continue
-                    name = entry.get("name") or entry.get("canonical_name")
-                    if not name:
-                        continue
-                    if _norm_text(name) in {"issuccess", "success"}:
-                        positive_vals = entry.get("positive_values") or entry.get("positive") or entry.get("values") or []
-                        column = (
-                            entry.get("column")
-                            or entry.get("source_column")
-                            or entry.get("derived_from")
-                            or entry.get("from_column")
-                            or entry.get("base_column")
-                        )
-                        if column or positive_vals:
-                            derive_from = {"column": column, "positive_values": positive_vals}
-                        else:
-                            derive_from = {"column": entry.get("derived_from") or column, "positive_values": positive_vals}
-                        spec["target"] = {"name": name, "derive_from": derive_from}
-                        break
-            return spec
-
-        def _derive_flag_defaults(spec: Dict[str, Any]) -> Dict[str, Any]:
-            objective_type = str(spec.get("objective_type") or "").lower()
-            requires_target = spec.get("requires_target")
-            if requires_target is None:
-                requires_target = objective_type in {"predictive", "prescriptive", "forecasting"}
-            requires_time_series_split = spec.get("requires_time_series_split")
-            if requires_time_series_split is None:
-                requires_time_series_split = objective_type == "forecasting"
-            requires_supervised_split = spec.get("requires_supervised_split")
-            if requires_supervised_split is None:
-                requires_supervised_split = bool(requires_target)
-            requires_row_scoring = spec.get("requires_row_scoring")
-            if requires_row_scoring is None:
-                deliverables = (contract.get("spec_extraction") or {}).get("deliverables") if isinstance(contract, dict) else []
-                requires_row_scoring = False
-                if isinstance(deliverables, list):
-                    for item in deliverables:
-                        if isinstance(item, dict) and item.get("path") == "data/scored_rows.csv":
-                            requires_row_scoring = bool(item.get("required", True))
-                            break
-                        if isinstance(item, str) and item == "data/scored_rows.csv":
-                            requires_row_scoring = True
-                            break
-            spec["requires_target"] = bool(requires_target)
-            spec["requires_time_series_split"] = bool(requires_time_series_split)
-            spec["requires_supervised_split"] = bool(requires_supervised_split)
-            spec["requires_row_scoring"] = bool(requires_row_scoring)
-            return _derive_target_spec(spec)
-
-        def _inject_contract_context(spec: Dict[str, Any]) -> Dict[str, Any]:
-            if not isinstance(spec, dict):
-                return spec
-            canonical_cols = contract.get("canonical_columns") if isinstance(contract, dict) else []
-            if canonical_cols and not spec.get("canonical_columns"):
-                spec["canonical_columns"] = canonical_cols
-            spec_extraction = contract.get("spec_extraction") if isinstance(contract, dict) else None
-            derived_cols = spec_extraction.get("derived_columns") if isinstance(spec_extraction, dict) else None
-            if derived_cols and not spec.get("derived_columns"):
-                spec["derived_columns"] = derived_cols
-            deliverables = (spec_extraction or {}).get("deliverables") if isinstance(spec_extraction, dict) else []
-            if isinstance(deliverables, list):
-                required_outputs = []
-                for item in deliverables:
-                    if isinstance(item, dict) and item.get("path") and item.get("required", True):
-                        required_outputs.append(item.get("path"))
-                    elif isinstance(item, str):
-                        required_outputs.append(item)
-                if required_outputs and not spec.get("required_outputs"):
-                    spec["required_outputs"] = required_outputs
-            if not spec.get("target"):
-                target_name = None
-                reqs = contract.get("data_requirements", []) if isinstance(contract, dict) else []
-                for req in reqs:
-                    if not isinstance(req, dict):
-                        continue
-                    role = str(req.get("role") or "").lower()
-                    if "target_source" in role:
-                        continue
-                    if "target" in role or "label" in role:
-                        target_name = req.get("canonical_name") or req.get("name")
-                        break
-                if not target_name and isinstance(derived_cols, list):
-                    for entry in derived_cols:
-                        if isinstance(entry, dict):
-                            role = str(entry.get("role") or "").lower()
-                            if "target" in role or "label" in role:
-                                target_name = entry.get("name") or entry.get("canonical_name")
-                                break
-                if target_name:
-                    spec["target"] = {"name": target_name, "derive_from": None}
-            canonical_for_leakage = spec.get("canonical_columns") or canonical_cols
-            _filter_leakage_audit_features(spec, canonical_for_leakage, column_inventory)
-            return spec
-
-        def _fallback() -> Dict[str, Any]:
-            # Reuse the heuristic builder inside generate_contract scope via a lightweight copy
-            objective_text = (contract.get("business_objective") or business_objective or "").lower()
-            strategy_text = json.dumps(strategy or {}).lower()
-            objective_type = "descriptive"
-            if any(tok in objective_text for tok in ["optimiz", "maximize", "optimal price", "precio", "revenue", "expected value"]):
-                objective_type = "prescriptive"
-            elif any(tok in objective_text for tok in ["predict", "classif", "clasific", "regress", "forecast", "probability", "probabilidad", "conversion", "churn", "contract"]):
-                objective_type = "predictive"
-
-            decision_vars = contract.get("decision_variables") or []
-            decision_var = decision_vars[0] if decision_vars else None
-            segmentation_required = any(tok in strategy_text for tok in ["segment", "cluster", "typology", "tipolog"]) or any(
-                tok in objective_text for tok in ["segment", "cluster", "typology", "tipolog"]
-            )
-            feature_availability = contract.get("feature_availability") or []
-            pre_decision = [
-                item.get("column")
-                for item in feature_availability
-                if isinstance(item, dict) and str(item.get("availability", "")).lower() == "pre-decision"
-            ]
-            leakage_features = [
-                item.get("column")
-                for item in feature_availability
-                if isinstance(item, dict) and "post" in str(item.get("availability", "")).lower()
-            ]
-            qa_gates = ["mapping_summary", "consistency_checks", "target_variance_guard", "outputs_required"]
-            if leakage_features:
-                qa_gates.append("leakage_prevention")
-            if segmentation_required:
-                qa_gates.append("segmentation_predecision")
-            reviewer_gates = ["methodology_alignment", "business_value"]
-            if objective_type in {"predictive", "prescriptive"}:
-                reviewer_gates.append("validation_required")
-            if objective_type == "prescriptive":
-                spec = contract.get("spec_extraction") or {}
-                decision_opt_required = bool(
-                    decision_var
-                    and (
-                        spec.get("scoring_formula")
-                        or spec.get("constraints")
-                        or contract.get("optimization_constraints")
-                    )
-                )
-                if decision_opt_required:
-                    reviewer_gates.append("decision_optimization_required")
-
-            alignment_requirements = contract.get("alignment_requirements") or []
-            if not alignment_requirements:
-                alignment_requirements = [
-                    {"id": "objective_alignment", "description": "Output aligns with business objective.", "required": True},
-                    {"id": "decision_variable_handling", "description": "Decision variables used correctly.", "required": bool(decision_var)},
-                    {"id": "segment_alignment", "description": "Segmentation uses only pre-decision features.", "required": segmentation_required},
-                    {"id": "validation_minimum", "description": "Validation performed per policy.", "required": True},
-                ]
-
-            deliverables = (contract.get("spec_extraction") or {}).get("deliverables")
-            evidence_requirements: List[Dict[str, Any]] = []
-            if isinstance(deliverables, list) and deliverables:
-                for item in deliverables:
-                    if isinstance(item, dict) and item.get("path"):
-                        evidence_requirements.append(
-                            {"artifact": item.get("path"), "required": bool(item.get("required", True))}
-                        )
-                    elif isinstance(item, str):
-                        evidence_requirements.append({"artifact": item, "required": True})
-            else:
-                evidence_requirements = [{"artifact": out, "required": True} for out in contract.get("required_outputs", [])]
-
-            spec = {
-                "objective_type": objective_type,
-                "segmentation": {
-                    "required": segmentation_required,
-                    "features": pre_decision if segmentation_required else [],
-                    "confidence": 0.4,
-                    "rationale": "Derived from strategy text and feature availability."
-                },
-                "decision_variable": {
-                    "name": decision_var,
-                    "confidence": 0.4,
-                    "rationale": "Derived from contract decision_variables."
-                },
-                "leakage_policy": {
-                    "audit_features": leakage_features,
-                    "correlation_threshold": 0.9,
-                    "exclude_on_leakage": True
-                },
-                "validation_policy": {
-                    "require_cv": objective_type in {"predictive", "prescriptive"},
-                    "baseline_required": objective_type in {"predictive", "prescriptive"}
-                },
-                "qa_gates": qa_gates,
-                "reviewer_gates": reviewer_gates,
-                "alignment_requirements": alignment_requirements,
-                "evidence_requirements": evidence_requirements,
-                "confidence": 0.4,
-                "justification": "Fallback evaluation spec derived heuristically from contract and strategy."
+        """
+        Generate evaluation spec by extracting ONLY from V4.1 contract fields.
+        NO legacy fields (data_requirements, spec_extraction) allowed.
+        """
+        if not isinstance(contract, dict):
+            return {
+                "confidence": 0.1,
+                "qa_gates": [],
+                "reviewer_gates": [],
+                "artifact_requirements": {},
+                "notes": ["Invalid contract structure"],
+                "source": "error_fallback",
+                "unknowns": ["Contract is not a valid dictionary"]
             }
-            return _inject_contract_context(_derive_flag_defaults(spec))
-
-        if not self.client:
-            return _fallback()
-
-        spec_template = {
-            "objective_type": "prescriptive|predictive|descriptive|causal|unknown",
-            "segmentation": {"required": False, "features": [], "confidence": 0.0, "rationale": ""},
-            "decision_variable": {"name": None, "confidence": 0.0, "rationale": ""},
-            "leakage_policy": {"audit_features": [], "correlation_threshold": 0.9, "exclude_on_leakage": True},
-            "validation_policy": {"require_cv": False, "baseline_required": False},
-            "qa_gates": [],
-            "reviewer_gates": [],
-            "alignment_requirements": [],
-            "evidence_requirements": [],
-            "target": {"name": None, "derive_from": None},
-            "requires_target": False,
-            "requires_supervised_split": False,
-            "requires_time_series_split": False,
-            "requires_row_scoring": False,
-            "confidence": 0.0,
-            "justification": ""
+        
+        # Extract ONLY from V4.1 fields
+        qa_gates = contract.get("qa_gates", [])
+        reviewer_gates = contract.get("reviewer_gates", [])
+        artifact_requirements = contract.get("artifact_requirements", {})
+        validation_requirements = contract.get("validation_requirements", {})
+        leakage_execution_plan = contract.get("leakage_execution_plan", {})
+        allowed_feature_sets = contract.get("allowed_feature_sets", {})
+        canonical_columns = contract.get("canonical_columns", [])
+        derived_columns = contract.get("derived_columns", [])
+        required_outputs = contract.get("required_outputs", [])
+        data_limited_mode = contract.get("data_limited_mode", {})
+        
+        # Build evaluation spec from V4.1 contract
+        spec = {
+            "qa_gates": qa_gates if isinstance(qa_gates, list) else [],
+            "reviewer_gates": reviewer_gates if isinstance(reviewer_gates, list) else [],
+            "artifact_requirements": artifact_requirements if isinstance(artifact_requirements, dict) else {},
+            "validation_requirements": validation_requirements if isinstance(validation_requirements, dict) else {},
+            "leakage_execution_plan": leakage_execution_plan if isinstance(leakage_execution_plan, dict) else {},
+            "allowed_feature_sets": allowed_feature_sets if isinstance(allowed_feature_sets, dict) else {},
+            "canonical_columns": canonical_columns if isinstance(canonical_columns, list) else [],
+            "derived_columns": derived_columns if isinstance(derived_columns, list) else [],
+            "required_outputs": required_outputs if isinstance(required_outputs, list) else [],
+            "data_limited_mode": data_limited_mode if isinstance(data_limited_mode, dict) else {},
+            "confidence": 0.9,
+            "source": "contract_driven_v41",
+            "notes": ["Extracted directly from V4.1 contract fields"]
         }
+        
+        # Add unknowns if critical fields are missing
+        unknowns = []
+        if not qa_gates:
+            unknowns.append("qa_gates missing from contract")
+        if not reviewer_gates:
+            unknowns.append("reviewer_gates missing from contract")
+        if not required_outputs:
+            unknowns.append("required_outputs missing from contract")
+        
+        if unknowns:
+            spec["unknowns"] = unknowns
+            spec["confidence"] = 0.6  # Lower confidence if fields missing
+        
+        return spec
 
-        system_prompt = (
-            "You are a senior evaluation architect. Derive an evaluation_spec for QA/Reviewer based on the "
-            "business objective, strategy, and execution contract. Do NOT use static templates. "
-            "If unsure, set low confidence and mark requirements as non-required instead of inventing gates. "
-            "Return JSON only, matching the template. "
-            "Gate vocabulary (use only these ids): "
-            "mapping_summary, consistency_checks, target_variance_guard, leakage_prevention, outputs_required, "
-            "segmentation_predecision, decision_variable_handling, validation_required, decision_optimization_required, "
-            "methodology_alignment, business_value. "
-            "Include requires_target/requires_supervised_split/requires_time_series_split/requires_row_scoring flags "
-            "and a target object {name, derive_from} when a target exists."
-        )
-        user_payload = {
-            "business_objective": business_objective,
-            "strategy": strategy,
-            "contract_summary": {
-                "required_outputs": contract.get("required_outputs"),
-                "decision_variables": contract.get("decision_variables"),
-                "feature_availability": contract.get("feature_availability"),
-                "alignment_requirements": contract.get("alignment_requirements"),
-                "quality_gates": contract.get("quality_gates"),
-            },
-            "data_summary": data_summary,
-            "column_inventory": column_inventory,
-            "template": spec_template,
-        }
-
-        try:
-            payload_text = json.dumps({"system": system_prompt, "input": user_payload})
-            self.last_prompt = payload_text
-            response = self.client.generate_content(payload_text)
-            content = getattr(response, "text", "")
-            self.last_response = content
-            spec = json.loads(content) if content else {}
-            if not isinstance(spec, dict):
-                return _fallback()
-            return _inject_contract_context(_derive_flag_defaults(spec))
-        except Exception:
-            return _fallback()

@@ -3694,7 +3694,7 @@ def _artifact_alignment_gate(
                     continue
             if matched:
                 continue
-        if any(tok in norm for tok in ["pred", "score", "prob", "rank", "segment", "cluster", "group"]):
+        if any(tok in norm for tok in ["pred", "score", "prob", "rank", "segment", "cluster", "group", "optimal", "recommended", "expected"]):
             continue
         scored_extras.append(col)
     if scored_extras:
@@ -4838,21 +4838,35 @@ def run_execution_planner(state: AgentState) -> AgentState:
     except Exception as inv_err:
         print(f"Warning: failed to read column inventory: {inv_err}")
     try:
+        # Prepare output_dialect from state (csv dialect detected by steward)
+        output_dialect = {
+            "sep": csv_sep,
+            "decimal": csv_decimal,
+            "encoding": csv_encoding
+        }
+        
+        # Prepare env_constraints (conservative default)
+        env_constraints = {"forbid_inplace_column_creation": True}
+        
         contract = execution_planner.generate_contract(
             strategy=strategy,
             data_summary=data_summary,
             business_objective=business_objective,
             column_inventory=column_inventory,
+            output_dialect=output_dialect,
+            env_constraints=env_constraints
         )
     except Exception as e:
         print(f"Warning: execution planner failed ({e}); using fallback contract.")
-        contract = {
-            "contract_version": 1,
-            "data_requirements": [],
-            "validations": [],
-            "required_outputs": ["data/cleaned_data.csv"],
-            "notes_for_engineers": ["Planner failed; use strategy + data_summary."],
-        }
+        # Use V4.1 skeleton fallback instead of legacy
+        from src.agents.execution_planner import _create_v41_skeleton
+        contract = _create_v41_skeleton(
+            strategy=strategy,
+            business_objective=business_objective,
+            column_inventory=column_inventory,
+            output_dialect=output_dialect,
+            reason=f"Execution planner exception: {e}"
+        )
     contract = _normalize_execution_contract(contract)
     contract = ensure_role_runbooks(contract)
     contract = _ensure_alignment_check_output(contract)
