@@ -76,7 +76,7 @@ class DataEngineerAgent:
         $data_audit
         
         *** CLEANING OUTPUT REQUIREMENTS ***
-        - Read input using the provided dialect (sep/decimal/encoding).
+        - CRITICAL: Read input with pd.read_csv(..., sep='$csv_sep', decimal='$csv_decimal', encoding='$csv_encoding'). DO NOT rely on defaults.
         - Save cleaned CSV to data/cleaned_data.csv.
         - Save manifest to data/cleaning_manifest.json (json.dump(..., default=_json_default)).
         - CRITICAL: Manifest MUST include "output_dialect": {"sep": "...", "decimal": "...", "encoding": "..."} matching the saved file.

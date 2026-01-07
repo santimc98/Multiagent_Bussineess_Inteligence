@@ -5020,6 +5020,22 @@ def run_data_engineer(state: AgentState) -> AgentState:
         if sample_context:
             data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, sample_context)
     state["data_engineer_audit_override"] = data_engineer_audit_override
+    
+    # Inject Raw Snippet for Dialect Grounding
+    try:
+        raw_lines = []
+        with open(csv_path, "r", encoding=csv_encoding, errors="replace") as f:
+            for _ in range(5):
+                line = f.readline()
+                if not line: break
+                raw_lines.append(line.rstrip())
+        raw_snippet = "\n".join(raw_lines)
+        raw_context = f"\n*** RAW FILE SNIPPET (First 5 lines) ***\n{raw_snippet}\n"
+        data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, raw_context)
+    except Exception as e:
+        print(f"Warning: could not read raw snippet for DE: {e}")
+        
+    state["data_engineer_audit_override"] = data_engineer_audit_override
     de_contract = _filter_contract_for_data_engineer(state.get("execution_contract", {}))
     try:
         os.makedirs("artifacts", exist_ok=True)
