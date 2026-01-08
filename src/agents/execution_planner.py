@@ -317,6 +317,104 @@ def ensure_v41_schema(contract: Dict[str, Any], strict: bool = False) -> Dict[st
     return contract
 
 
+def validate_artifact_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Validates artifact_requirements to ensure required_columns are subset of canonical/derived columns.
+    Moves non-canonical columns to optional_passthrough_columns.
+
+    Args:
+        contract: Contract dict with V4.1 schema
+
+    Returns:
+        Contract with validated artifact_requirements
+    """
+    if not isinstance(contract, dict):
+        return contract
+
+    # Get canonical and derived columns
+    canonical_columns = contract.get("canonical_columns", [])
+    derived_columns = contract.get("derived_columns", [])
+    available_columns = contract.get("available_columns", [])
+
+    if not isinstance(canonical_columns, list):
+        canonical_columns = []
+    if not isinstance(derived_columns, list):
+        derived_columns = []
+    if not isinstance(available_columns, list):
+        available_columns = []
+
+    # Build allowed column set (canonical + derived)
+    allowed_columns_set = set(canonical_columns) | set(derived_columns)
+
+    # Normalize for comparison (case-insensitive)
+    allowed_norms = {_normalize_column_identifier(col): col for col in allowed_columns_set}
+    available_norms = {_normalize_column_identifier(col): col for col in available_columns}
+
+    # Get artifact_requirements
+    artifact_requirements = contract.get("artifact_requirements", {})
+    if not isinstance(artifact_requirements, dict):
+        return contract
+
+    schema_binding = artifact_requirements.get("schema_binding", {})
+    if not isinstance(schema_binding, dict):
+        return contract
+
+    required_columns = schema_binding.get("required_columns", [])
+    if not isinstance(required_columns, list):
+        return contract
+
+    # Validate required_columns
+    valid_required = []
+    moved_to_optional = []
+
+    for col in required_columns:
+        if not col:
+            continue
+        col_norm = _normalize_column_identifier(col)
+
+        # Check if column is in canonical or derived columns
+        if col_norm in allowed_norms:
+            valid_required.append(col)
+        # If it's in available_columns but not canonical, move to optional
+        elif col_norm in available_norms:
+            moved_to_optional.append(col)
+        # If it's not even in available_columns, it's invalid - skip it
+        else:
+            moved_to_optional.append(col)
+
+    # Update schema_binding
+    if moved_to_optional:
+        schema_binding["required_columns"] = valid_required
+
+        # Add to optional_passthrough_columns
+        optional_passthrough = schema_binding.get("optional_passthrough_columns", [])
+        if not isinstance(optional_passthrough, list):
+            optional_passthrough = []
+
+        # Add moved columns to optional_passthrough
+        for col in moved_to_optional:
+            if col not in optional_passthrough:
+                optional_passthrough.append(col)
+
+        schema_binding["optional_passthrough_columns"] = optional_passthrough
+
+        # Document in unknowns
+        unknowns = contract.get("unknowns", [])
+        if not isinstance(unknowns, list):
+            unknowns = []
+            contract["unknowns"] = unknowns
+
+        unknowns.append({
+            "item": f"artifact_requirements.required_columns contained non-canonical columns: {moved_to_optional}",
+            "impact": "Moved to optional_passthrough_columns to preserve them without enforcement",
+            "mitigation": "These columns will be included in outputs if present in data, but are not required",
+            "requires_verification": True,
+            "auto_corrected": True
+        })
+
+    return contract
+
+
 def _normalize_column_identifier(value: Any) -> str:
     if not value:
         return ""
@@ -2918,7 +3016,10 @@ domain_expert_critique:
             
             # Ensure V4.1 schema completeness
             contract = ensure_v41_schema(contract)
-            
+
+            # Validate artifact_requirements (ensure required_columns ⊆ canonical_columns)
+            contract = validate_artifact_requirements(contract)
+
             # --- SANITIZE RUNBOOKS: Remove hardcoded dialect instructions ---
             def _sanitize_runbook_text(text: str) -> str:
                 """Replace hardcoded dialect instructions with dynamic manifest reference."""

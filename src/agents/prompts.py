@@ -218,8 +218,9 @@ Example fields (do NOT copy literals; derive from inputs):
 * derived_columns_optional_in_data_limited (optional if data_limited_mode)
 * derived_column_failure_policy (fail_contract | data_limited_allowed)
 
-Rule:
+Rules:
 
+* CRITICAL: required_columns MUST be a subset of canonical_columns (or derived_columns if applicable). Do NOT include metadata columns (role="unknown") or columns not in canonical_columns in required_columns. Use optional_passthrough_columns for metadata/ID columns instead.
 * If the objective is supervised prediction/optimization, the target-derived column MUST be in derived_columns_minimum.
 
 12. ALLOWED FEATURE SETS (UNIVERSAL, REQUIRED SECTION)
