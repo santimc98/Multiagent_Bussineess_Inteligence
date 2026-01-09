@@ -233,12 +233,10 @@ Rules:
     "rationale": "<brief>"
     }
 
-    CRITICAL CONSISTENCY RULE:
-    - If derived_columns includes a segmentation column (e.g., customer_segment, cluster_id),
-      AND the strategy uses that segment for modeling/optimization,
-      THEN model_features MUST include that derived column.
-    - Logic: If you create segments to group similar cases, the model must use those segments as features.
-    - Example: derived_columns=["is_success", "customer_segment"] → model_features must include "customer_segment"
+    CONSISTENCY PRINCIPLE:
+    Ensure logical coherence between ALL contract sections. If you declare a derived column is needed for the strategy,
+    ensure corresponding feature_sets allow its use. Reason through dependencies: if step A creates X for use in step B,
+    then B's allowed features must include X.
 
 13. DESIGN GATES
     QA and Reviewer gates MUST reference contract fields, not literals. Examples of references:
