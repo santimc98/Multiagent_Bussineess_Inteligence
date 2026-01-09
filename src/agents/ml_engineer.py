@@ -365,14 +365,17 @@ class MLEngineerAgent:
 
         ML BEST PRACTICES CHECKLIST (Quality Assurance):
         [ ] NAN HYGIENE: Before .fit(), you MUST check for NaNs in X and impute (SimpleImputer) or drop them. Scikit-learn models crash on NaNs.
-        [ ] INPUT SOURCE: Explicitly load from 'data.csv' (or $data_path). Do not assume other files exist.
+        [ ] INPUT SOURCE: Load data from the EXACT path provided as $data_path. Do NOT hardcode arbitrary filenames.
         [ ] VARIABLE DEFINITION: Define all metric variables (e.g., auc, f1, precision) locally before trying to save them to metrics.json.
         [ ] CASTING SAFEGUARDS: When converting columns, handle non-numeric values gracefully (coerce).
 
         HARD CONSTRAINTS (VIOLATION = FAILURE)
         1) OUTPUT VALID PYTHON CODE ONLY (no markdown, no code fences, no JSON-only plans).
         2) If RUNTIME_ERROR_CONTEXT is present in the audit, fix root cause and regenerate the FULL script.
-        3) ALWAYS read input data from 'data.csv' (or provided $data_path). DO NOT try to read 'data/cleaned_data.csv' or other artifacts as input (unless created within the script). The sandbox injects data at the root.
+        3) CRITICAL - INPUT PATH: You MUST read data from the EXACT path '$data_path' provided in the context.
+           - CORRECT: INPUT_FILE = '$data_path' then df = pd.read_csv(INPUT_FILE, ...)
+           - WRONG: Using hardcoded paths like 'data.csv', 'input.csv', 'data/input_data.csv', etc.
+           - The $data_path variable will be substituted with the actual path (e.g., 'data/cleaned_data.csv').
         4) Do NOT invent column names. Use only columns from the contract/canonical list and the loaded dataset.
         5) Do NOT mutate the input dataframe in-place. Use df_in for the raw load. If you need derived columns, create df_work = df_in.copy() and assign ONLY columns explicitly declared as derived in the Execution Contract (data_requirements with source='derived' or spec_extraction.derived_columns). If a required input column is missing, raise ValueError (no dummy values).
         6) NEVER create DataFrames from literals (pd.DataFrame({}), from_dict, or lists/tuples). No np.random/random/faker.
@@ -418,7 +421,8 @@ class MLEngineerAgent:
         - NO NETWORK/FS OPS: Do NOT use requests/subprocess/os.system and do not access filesystem outside declared input/output paths.
         - No network/shell: no requests, subprocess, os.system.
         - No filesystem discovery: do NOT use os.listdir, os.walk, glob.
-        - Read only '$data_path'. Save outputs only to ./data and plots to ./static/plots.
+        - INPUT FILE: Read ONLY from the path specified in '$data_path' (this will be the actual cleaned data path).
+        - OUTPUT FILES: Save all outputs to ./data directory and plots to ./static/plots.
 
         FORBIDDEN PATTERNS & CORRECT ALTERNATIVES:
         Problem: The sandbox blocks direct DataFrame column creation for safety.
