@@ -2996,90 +2996,119 @@ domain_expert_critique:
 """
         full_prompt = SENIOR_PLANNER_PROMPT + "\n\nINPUTS:\n" + user_input
         self.last_prompt = full_prompt
-        
-        try:
-            response = self.client.generate_content(full_prompt)
-            content = response.text
-            self.last_response = content
 
-            # Check for truncated response (common Gemini issue)
-            if len(content) < 500 or not content.strip().endswith("}"):
-                print(f"WARNING: Execution Planner response appears truncated (len={len(content)})")
-                print(f"Last 100 chars: ...{content[-100:]}")
-                return _fallback("Truncated LLM Response")
+        # Retry logic: up to 3 attempts for transient API issues (truncation, rate limits)
+        max_retries = 3
+        import time
 
-            # Clean markdown
-            content = content.replace("```json", "").replace("```", "").strip()
-            # Handle potential preamble text if model is chatty (though V4.1 says JSON only)
-            if "{" in content:
-                content = content[content.find("{"):content.rfind("}")+1]
+        for attempt in range(max_retries):
+            try:
+                response = self.client.generate_content(full_prompt)
+                content = response.text
+                self.last_response = content
 
-            contract = json.loads(content)
+                # Check for truncated response (common Gemini issue)
+                if len(content) < 500 or not content.strip().endswith("}"):
+                    if attempt < max_retries - 1:
+                        print(f"WARNING: Truncated response (len={len(content)}). Retry {attempt+1}/{max_retries}...")
+                        print(f"Last 100 chars: ...{content[-100:]}")
+                        time.sleep(2)  # Brief delay before retry
+                        continue
+                    else:
+                        print(f"ERROR: Response still truncated after {max_retries} attempts")
+                        return _fallback("Truncated LLM Response after retries")
 
-            # Validate structure
-            if not isinstance(contract, dict):
-                # Fallback if output is not a dict
-                print("WARNING: Execution Planner returned non-dict")
-                return _fallback("Non-dict Response")
+                # Clean markdown
+                content = content.replace("```json", "").replace("```", "").strip()
+                # Handle potential preamble text if model is chatty (though V4.1 says JSON only)
+                if "{" in content:
+                    content = content[content.find("{"):content.rfind("}")+1]
 
-            # Ensure V4.1 schema completeness
-            contract = ensure_v41_schema(contract)
+                contract = json.loads(content)
 
-            # Validate artifact_requirements (ensure required_columns ⊆ canonical_columns)
-            contract = validate_artifact_requirements(contract)
+                # Validate structure
+                if not isinstance(contract, dict):
+                    if attempt < max_retries - 1:
+                        print(f"WARNING: Non-dict response. Retry {attempt+1}/{max_retries}...")
+                        time.sleep(2)
+                        continue
+                    else:
+                        print("ERROR: Non-dict response after retries")
+                        return _fallback("Non-dict Response after retries")
 
-            # --- SANITIZE RUNBOOKS: Remove hardcoded dialect instructions ---
-            def _sanitize_runbook_text(text: str) -> str:
-                """Replace hardcoded dialect instructions with dynamic manifest reference."""
-                if not isinstance(text, str):
+                # Ensure V4.1 schema completeness
+                contract = ensure_v41_schema(contract)
+
+                # Validate artifact_requirements (ensure required_columns ⊆ canonical_columns)
+                contract = validate_artifact_requirements(contract)
+
+                # --- SANITIZE RUNBOOKS: Remove hardcoded dialect instructions ---
+                def _sanitize_runbook_text(text: str) -> str:
+                    """Replace hardcoded dialect instructions with dynamic manifest reference."""
+                    if not isinstance(text, str):
+                        return text
+                    import re
+                    # Replace patterns like "sep=';'" or "decimal=','" with dynamic reference
+                    patterns = [
+                        (r"sep\s*=\s*['\"]?[;,\\t]['\"]?", "sep from cleaning_manifest.json"),
+                        (r"decimal\s*=\s*['\"]?[.,]['\"]?", "decimal from cleaning_manifest.json"),
+                        (r"Load.*CSV.*using.*sep.*=.*[;,]", "Load CSV using dialect from data/cleaning_manifest.json"),
+                    ]
+                    for pattern, replacement in patterns:
+                        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
                     return text
-                import re
-                # Replace patterns like "sep=';'" or "decimal=','" with dynamic reference
-                patterns = [
-                    (r"sep\s*=\s*['\"]?[;,\\t]['\"]?", "sep from cleaning_manifest.json"),
-                    (r"decimal\s*=\s*['\"]?[.,]['\"]?", "decimal from cleaning_manifest.json"),
-                    (r"Load.*CSV.*using.*sep.*=.*[;,]", "Load CSV using dialect from data/cleaning_manifest.json"),
-                ]
-                for pattern, replacement in patterns:
-                    text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-                return text
 
-            def _sanitize_runbook(runbook: Any) -> Any:
-                """Recursively sanitize runbook dict or string."""
-                if isinstance(runbook, str):
-                    return _sanitize_runbook_text(runbook)
-                if isinstance(runbook, dict):
-                    return {k: _sanitize_runbook(v) for k, v in runbook.items()}
-                if isinstance(runbook, list):
-                    return [_sanitize_runbook(item) for item in runbook]
-                return runbook
+                def _sanitize_runbook(runbook: Any) -> Any:
+                    """Recursively sanitize runbook dict or string."""
+                    if isinstance(runbook, str):
+                        return _sanitize_runbook_text(runbook)
+                    if isinstance(runbook, dict):
+                        return {k: _sanitize_runbook(v) for k, v in runbook.items()}
+                    if isinstance(runbook, list):
+                        return [_sanitize_runbook(item) for item in runbook]
+                    return runbook
 
-            # Sanitize V4.1 runbooks
-            if contract.get("data_engineer_runbook"):
-                contract["data_engineer_runbook"] = _sanitize_runbook(contract["data_engineer_runbook"])
-            if contract.get("ml_engineer_runbook"):
-                contract["ml_engineer_runbook"] = _sanitize_runbook(contract["ml_engineer_runbook"])
+                # Sanitize V4.1 runbooks
+                if contract.get("data_engineer_runbook"):
+                    contract["data_engineer_runbook"] = _sanitize_runbook(contract["data_engineer_runbook"])
+                if contract.get("ml_engineer_runbook"):
+                    contract["ml_engineer_runbook"] = _sanitize_runbook(contract["ml_engineer_runbook"])
 
-            # --- SHIM: Backward compatibility for role_runbooks (V4.1 -> legacy) ---
-            # V4.1 uses flat keys: data_engineer_runbook, ml_engineer_runbook
-            # Legacy agents may read: role_runbooks.data_engineer, role_runbooks.ml_engineer
-            if "role_runbooks" not in contract or not isinstance(contract.get("role_runbooks"), dict):
-                contract["role_runbooks"] = {}
-            if contract.get("data_engineer_runbook"):
-                contract["role_runbooks"]["data_engineer"] = contract["data_engineer_runbook"]
-            if contract.get("ml_engineer_runbook"):
-                contract["role_runbooks"]["ml_engineer"] = contract["ml_engineer_runbook"]
+                # --- SHIM: Backward compatibility for role_runbooks (V4.1 -> legacy) ---
+                # V4.1 uses flat keys: data_engineer_runbook, ml_engineer_runbook
+                # Legacy agents may read: role_runbooks.data_engineer, role_runbooks.ml_engineer
+                if "role_runbooks" not in contract or not isinstance(contract.get("role_runbooks"), dict):
+                    contract["role_runbooks"] = {}
+                if contract.get("data_engineer_runbook"):
+                    contract["role_runbooks"]["data_engineer"] = contract["data_engineer_runbook"]
+                if contract.get("ml_engineer_runbook"):
+                    contract["role_runbooks"]["ml_engineer"] = contract["ml_engineer_runbook"]
 
-            return contract
+                # Success! Return contract
+                if attempt > 0:
+                    print(f"SUCCESS: Execution Planner succeeded on attempt {attempt+1}")
+                return contract
 
-        except json.JSONDecodeError as e:
-            print(f"ERROR: Execution Planner JSON parse failed: {e}")
-            print(f"Response length: {len(self.last_response) if self.last_response else 0}")
-            print(f"Response preview: {self.last_response[:200] if self.last_response else 'None'}...")
-            return _fallback("JSON Parse Error")
-        except Exception as e:
-            print(f"ERROR: Execution Planner unexpected error: {type(e).__name__}: {str(e)}")
-            return _fallback(f"Unexpected Error: {type(e).__name__}")
+            except json.JSONDecodeError as e:
+                if attempt < max_retries - 1:
+                    print(f"ERROR: JSON parse failed. Retry {attempt+1}/{max_retries}...")
+                    print(f"Error: {e}")
+                    print(f"Response preview: {self.last_response[:200] if self.last_response else 'None'}...")
+                    time.sleep(2)
+                    continue
+                else:
+                    print(f"ERROR: JSON parse failed after {max_retries} attempts: {e}")
+                    print(f"Response length: {len(self.last_response) if self.last_response else 0}")
+                    print(f"Response preview: {self.last_response[:200] if self.last_response else 'None'}...")
+                    return _fallback("JSON Parse Error after retries")
+
+            except Exception as e:
+                # Unexpected errors: don't retry (likely code bugs, not transient API issues)
+                print(f"ERROR: Execution Planner unexpected error: {type(e).__name__}: {str(e)}")
+                return _fallback(f"Unexpected Error: {type(e).__name__}")
+
+        # Fallback if loop completes without returning (shouldn't happen)
+        return _fallback("Max retries exceeded")
 
     def generate_evaluation_spec(
         self,
