@@ -335,6 +335,34 @@ class MLEngineerAgent:
             issues.append(f"required_outputs_missing: {missing_outputs}")
         return issues
 
+    def _fix_data_path_in_code(self, code: str, correct_path: str) -> str:
+        """
+        Post-processing safety check: If LLM generated code with incorrect INPUT_FILE path,
+        inject the correct one. This is NOT hardcoding business logic - it's infrastructure.
+
+        Common wrong paths: 'input.csv', 'data.csv', 'data/input_data.csv', 'data/data.csv'
+        Correct path: provided by system (usually 'data/cleaned_data.csv')
+        """
+        import re
+
+        # Pattern: INPUT_FILE = 'some_wrong_path.csv' or INPUT_PATH = '...' or DATA_PATH = '...'
+        wrong_patterns = [
+            r"(INPUT_FILE|INPUT_PATH|DATA_FILE|DATA_PATH)\s*=\s*['\"](?!data/cleaned_data\.csv)[^'\"]+\.csv['\"]",
+        ]
+
+        for pattern in wrong_patterns:
+            if re.search(pattern, code):
+                # Replace with correct path
+                code = re.sub(
+                    pattern,
+                    f"\\1 = '{correct_path}'",
+                    code
+                )
+                print(f"SAFETY_FIX: Injected correct data_path='{correct_path}' into generated code")
+                break
+
+        return code
+
     def generate_code(
         self,
         strategy: Dict[str, Any],
@@ -943,6 +971,9 @@ class MLEngineerAgent:
                 completed = self._clean_code(completed)
                 if is_syntax_valid(completed):
                     code = completed
+
+            # Post-processing: Inject correct data_path if LLM used wrong path
+            code = self._fix_data_path_in_code(code, data_path)
             return code
 
         except Exception as e:
