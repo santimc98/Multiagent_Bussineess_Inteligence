@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional, TypedDict
 
 from src.utils.contract_v41 import (
@@ -31,6 +32,7 @@ class MLView(TypedDict, total=False):
     decision_columns: List[str]
     outcome_columns: List[str]
     audit_only_columns: List[str]
+    identifier_columns: List[str]
     allowed_feature_sets: Dict[str, Any]
     forbidden_features: List[str]
     required_outputs: List[str]
@@ -73,6 +75,23 @@ _PRESERVE_KEYS = {
     "gates",
 }
 
+_IDENTIFIER_TOKENS = {
+    "id",
+    "uuid",
+    "guid",
+    "key",
+    "codigo",
+    "code",
+    "cod",
+    "identifier",
+    "reference",
+    "ref",
+    "account",
+    "entity",
+}
+_SHORT_IDENTIFIER_TOKENS = {"id", "cod", "ref", "key"}
+_LONG_IDENTIFIER_TOKENS = sorted(_IDENTIFIER_TOKENS - _SHORT_IDENTIFIER_TOKENS)
+
 
 def _coerce_list(value: Any) -> List[Any]:
     if isinstance(value, list):
@@ -96,6 +115,27 @@ def _first_value(*values: Any) -> Any:
             continue
         return value
     return None
+
+
+def is_identifier_column(col_name: str) -> bool:
+    if not col_name:
+        return False
+    raw = str(col_name)
+    lowered = raw.lower()
+    tokens = [t for t in re.split(r"[^0-9a-zA-Z]+", lowered) if t]
+    camel_tokens = [t.lower() for t in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\\d+", raw) if t]
+    if any(token in _IDENTIFIER_TOKENS for token in (tokens + camel_tokens)):
+        return True
+    normalized = re.sub(r"[ _]+", "", lowered)
+    for token in _LONG_IDENTIFIER_TOKENS:
+        if normalized.endswith(token):
+            return True
+    short_pattern = r"(?:^|[ _\\-])(" + "|".join(sorted(_SHORT_IDENTIFIER_TOKENS)) + r")$"
+    if re.search(short_pattern, lowered):
+        return True
+    if re.search(r"[A-Za-z0-9]+(?:Id|ID)$", raw):
+        return True
+    return False
 
 
 def _resolve_required_outputs(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> List[str]:
@@ -440,10 +480,65 @@ def build_ml_view(
     if not isinstance(canonical_columns, list):
         canonical_columns = get_canonical_columns(contract_full)
     canonical_columns = [str(c) for c in canonical_columns if c]
-    column_roles = _resolve_column_roles(contract_min, contract_full)
+    roles_min = get_column_roles(contract_min)
+    roles_full = get_column_roles(contract_full)
+    allowed_sets_min = contract_min.get("allowed_feature_sets")
+    if not isinstance(allowed_sets_min, dict):
+        allowed_sets_min = {}
+    forbidden_min = _resolve_forbidden_features(allowed_sets_min)
+    role_sets_min = _extract_roles(roles_min)
+    pre_decision_min = _coerce_list(roles_min.get("pre_decision"))
+    decision_min = _coerce_list(roles_min.get("decision"))
+    outcome_min = _coerce_list(roles_min.get("outcome"))
+    canonical_set = set(canonical_columns)
+    lax_roles = False
+    if not roles_min:
+        lax_roles = True
+    elif not role_sets_min.get("audit_only") and not forbidden_min and not decision_min and not outcome_min:
+        if canonical_set:
+            overlap = len(set(pre_decision_min) & canonical_set)
+            coverage = overlap / max(1, len(canonical_set))
+            if coverage >= 0.9:
+                lax_roles = True
+        else:
+            lax_roles = True
+    use_full_roles = bool(roles_full) and lax_roles
+    column_roles = roles_full if use_full_roles else roles_min
+    if not column_roles:
+        column_roles = roles_full or roles_min
     role_sets = _extract_roles(column_roles)
+    audit_only_cols = [str(c) for c in role_sets.get("audit_only", []) if c]
+    decision_cols = [str(c) for c in role_sets.get("decision", []) if c]
+    outcome_cols = [str(c) for c in role_sets.get("outcome", []) if c]
+    pre_decision_cols = _coerce_list(column_roles.get("pre_decision"))
+    if not pre_decision_cols:
+        assigned = set(decision_cols + outcome_cols + audit_only_cols)
+        pre_decision_cols = [c for c in canonical_columns if c and c not in assigned]
     allowed_sets = _resolve_allowed_feature_sets(contract_min, contract_full)
+    if use_full_roles:
+        allowed_sets = {
+            "segmentation_features": list(pre_decision_cols),
+            "model_features": list(dict.fromkeys(pre_decision_cols + decision_cols)),
+            "forbidden_features": list(dict.fromkeys(outcome_cols + audit_only_cols)),
+        }
+    if not isinstance(allowed_sets, dict):
+        allowed_sets = {}
+    model_features = _coerce_list(allowed_sets.get("model_features"))
+    segmentation_features = _coerce_list(allowed_sets.get("segmentation_features"))
+    audit_only_features = _coerce_list(allowed_sets.get("audit_only_features"))
+    if audit_only_features:
+        audit_only_cols = list(dict.fromkeys(audit_only_cols + [str(c) for c in audit_only_features if c]))
     forbidden = _resolve_forbidden_features(allowed_sets)
+    forbidden = list(dict.fromkeys([str(c) for c in forbidden if c] + outcome_cols + audit_only_cols))
+    identifier_cols = [c for c in canonical_columns if is_identifier_column(c)]
+    forbidden = sorted(dict.fromkeys(forbidden + [str(c) for c in identifier_cols if c]))
+    forbidden_set = set(forbidden)
+    model_features = [str(c) for c in model_features if c and c not in forbidden_set]
+    segmentation_features = [str(c) for c in segmentation_features if c and c not in forbidden_set]
+    allowed_sets = dict(allowed_sets)
+    allowed_sets["model_features"] = model_features
+    allowed_sets["segmentation_features"] = segmentation_features
+    allowed_sets["forbidden_features"] = forbidden
     validation = _resolve_validation_requirements(contract_min, contract_full)
     case_rules = _resolve_case_rules(contract_full)
 
@@ -452,9 +547,10 @@ def build_ml_view(
         "objective_type": objective_type,
         "canonical_columns": canonical_columns,
         "column_roles": column_roles,
-        "decision_columns": [str(c) for c in role_sets.get("decision", []) if c],
-        "outcome_columns": [str(c) for c in role_sets.get("outcome", []) if c],
-        "audit_only_columns": [str(c) for c in role_sets.get("audit_only", []) if c],
+        "decision_columns": decision_cols,
+        "outcome_columns": outcome_cols,
+        "audit_only_columns": audit_only_cols,
+        "identifier_columns": identifier_cols,
         "allowed_feature_sets": allowed_sets,
         "forbidden_features": forbidden,
         "required_outputs": required_outputs,

@@ -41,6 +41,71 @@ def test_ml_view_includes_required_fields():
     assert ml_view.get("objective_type")
 
 
+def test_ml_view_inherits_roles_when_min_lax():
+    contract_min = {
+        "canonical_columns": ["feature_a", "target", "audit_col", "entity_id"],
+        "column_roles": {
+            "pre_decision": ["feature_a", "target", "audit_col", "entity_id"]
+        },
+        "allowed_feature_sets": {
+            "model_features": ["feature_a", "target", "audit_col", "entity_id"],
+            "segmentation_features": ["feature_a", "entity_id"],
+            "forbidden_features": [],
+        },
+    }
+    contract_full = {
+        "canonical_columns": ["feature_a", "target", "audit_col", "entity_id"],
+        "column_roles": {
+            "pre_decision": ["feature_a", "entity_id"],
+            "outcome": ["target"],
+            "post_decision_audit_only": ["audit_col"],
+        },
+    }
+    ml_view = build_ml_view(contract_full, contract_min, [])
+    forbidden = set(ml_view.get("forbidden_features") or [])
+    assert "audit_col" in forbidden
+    assert "target" in forbidden
+    assert "audit_col" not in (ml_view.get("allowed_feature_sets", {}).get("model_features") or [])
+    assert "target" not in (ml_view.get("allowed_feature_sets", {}).get("model_features") or [])
+
+
+def test_ml_view_excludes_identifier_columns():
+    contract_min = {
+        "canonical_columns": ["EntityId", "feature_a"],
+        "column_roles": {
+            "pre_decision": ["EntityId", "feature_a"]
+        },
+        "allowed_feature_sets": {
+            "model_features": ["EntityId", "feature_a"],
+            "segmentation_features": ["EntityId", "feature_a"],
+            "forbidden_features": [],
+        },
+    }
+    ml_view = build_ml_view({}, contract_min, [])
+    assert "EntityId" in (ml_view.get("identifier_columns") or [])
+    assert "EntityId" not in (ml_view.get("allowed_feature_sets", {}).get("model_features") or [])
+
+
+def test_ml_view_preserves_forbidden_features_from_min():
+    contract_min = {
+        "canonical_columns": ["feature_a", "audit_col", "EntityId"],
+        "column_roles": {
+            "pre_decision": ["feature_a", "audit_col", "EntityId"],
+            "post_decision_audit_only": ["audit_col"],
+        },
+        "allowed_feature_sets": {
+            "model_features": ["feature_a", "audit_col", "EntityId"],
+            "segmentation_features": ["feature_a", "EntityId"],
+            "forbidden_features": ["audit_col"],
+        },
+    }
+    ml_view = build_ml_view({}, contract_min, [])
+    forbidden = set(ml_view.get("forbidden_features") or [])
+    assert forbidden == {"audit_col", "EntityId"}
+    assert "feature_a" in (ml_view.get("allowed_feature_sets", {}).get("model_features") or [])
+    assert "audit_col" not in (ml_view.get("allowed_feature_sets", {}).get("model_features") or [])
+
+
 def test_reviewer_view_contains_gates_and_outputs():
     contract_full = _load_fixture("contract_full_small.json")
     contract_min = _load_fixture("contract_min_small.json")
