@@ -81,3 +81,31 @@ def test_unknown_column_roles_not_enforced():
     issues, _ = run_integrity_audit(df, contract)
     missing = [issue for issue in issues if issue.get("type") == "MISSING_COLUMN"]
     assert not missing, "Unknown column_roles should not enforce requirements"
+
+
+def test_optional_passthrough_missing_is_warning_only():
+    df = pd.DataFrame({"A": [1, 2], "B": [3, 4]})
+    contract = {
+        "artifact_requirements": {
+            "clean_dataset": {"required_columns": ["A", "B"]},
+            "schema_binding": {"optional_passthrough_columns": ["C"]},
+        }
+    }
+    issues, _ = run_integrity_audit(df, contract)
+    warnings = [i for i in issues if i.get("severity") == "warning"]
+    critical = [i for i in issues if i.get("severity") == "critical"]
+    assert any(i.get("type") == "OPTIONAL_COLUMN_MISSING" for i in warnings)
+    assert len(critical) == 0
+
+
+def test_missing_required_is_critical():
+    df = pd.DataFrame({"A": [1, 2]})
+    contract = {
+        "artifact_requirements": {
+            "clean_dataset": {"required_columns": ["A", "B"]},
+            "schema_binding": {"optional_passthrough_columns": ["C"]},
+        }
+    }
+    issues, _ = run_integrity_audit(df, contract)
+    critical = [i for i in issues if i.get("severity") == "critical"]
+    assert any(i.get("type") == "MISSING_COLUMN" for i in critical)

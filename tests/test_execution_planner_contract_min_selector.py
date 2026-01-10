@@ -76,3 +76,28 @@ def test_execution_planner_invalid_json_fallback_contract_min() -> None:
     assert agent.last_contract_min["canonical_columns"]
     assert agent.last_contract_min["artifact_requirements"]
     assert json.dumps(agent.last_contract_min)
+
+
+def test_contract_min_inherits_roles_from_full() -> None:
+    inventory = ["A", "B", "C", "D", "E"]
+    strategy = {"required_columns": ["A", "B", "C", "D"]}
+    full_contract = {
+        "business_objective": "Test objective",
+        "column_roles": {
+            "pre_decision": ["A"],
+            "decision": ["B"],
+            "outcome": ["C"],
+            "post_decision_audit_only": ["D"],
+        },
+    }
+    relevant = ["A", "B", "C", "D"]
+    contract_min = build_contract_min(full_contract, strategy, inventory, relevant)
+    roles = contract_min.get("column_roles", {})
+    assert roles.get("pre_decision") == ["A"]
+    assert roles.get("decision") == ["B"]
+    assert roles.get("outcome") == ["C"]
+    assert roles.get("post_decision_audit_only") == ["D"]
+    allowed = contract_min.get("allowed_feature_sets", {})
+    assert allowed.get("segmentation_features") == ["A"]
+    assert allowed.get("model_features") == ["A", "B"]
+    assert set(allowed.get("forbidden_features") or []) == {"C", "D"}

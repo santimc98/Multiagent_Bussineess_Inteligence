@@ -15,6 +15,7 @@ from src.utils.contract_v41 import (
     get_column_roles,
     get_validation_requirements,
     get_preprocessing_requirements,
+    get_artifact_requirements,
 )
 
 
@@ -83,33 +84,53 @@ def _build_requirements_from_v41(contract: Dict[str, Any]) -> List[Dict[str, Any
     """
     requirements: List[Dict[str, Any]] = []
     seen: set[str] = set()
-    
-    # From canonical_columns
-    canonical = get_canonical_columns(contract)
-    for col in canonical:
+
+    def _coerce_list(value: Any) -> List[str]:
+        if not value:
+            return []
+        if isinstance(value, list):
+            return [str(item) for item in value if item]
+        if isinstance(value, str):
+            return [value]
+        return []
+
+    def _resolve_required_columns(contract_obj: Dict[str, Any]) -> List[str]:
+        artifacts = get_artifact_requirements(contract_obj)
+        clean_dataset = artifacts.get("clean_dataset") if isinstance(artifacts, dict) else None
+        required_cols = _coerce_list(clean_dataset.get("required_columns")) if isinstance(clean_dataset, dict) else []
+        if required_cols:
+            return required_cols
+        canonical_cols = get_canonical_columns(contract_obj)
+        if canonical_cols:
+            return canonical_cols
+        strategy = {}
+        for key in ("strategy", "strategy_spec", "selected_strategy"):
+            candidate = contract_obj.get(key)
+            if isinstance(candidate, dict):
+                strategy = candidate
+                break
+        return _coerce_list(strategy.get("required_columns"))
+
+    # Required columns for clean_dataset (no audit-only/unknown enforcement)
+    required_columns = _resolve_required_columns(contract)
+    for col in required_columns:
         if col not in seen:
             seen.add(col)
-            requirements.append({
-                "name": col,
-                "canonical_name": col,
-                "source": "input",
-            })
-    
-    # From column_roles - add role info for binding roles only
-    binding_roles = {"pre_decision", "decision", "outcome", "post_decision_audit_only"}
-    roles = {r: cols for r, cols in get_column_roles(contract).items() if r in binding_roles}
-    # column_roles.unknown is inventory metadata; it should NOT enforce requirements or trigger missing-column errors.
-    for role, columns in roles.items():
-        for col in columns:
-            if col not in seen:
-                seen.add(col)
-                requirements.append({
+            requirements.append(
+                {
                     "name": col,
                     "canonical_name": col,
-                    "role": role,
-                })
-            else:
-                # Update existing with role
+                    "source": "clean_dataset_required",
+                }
+            )
+
+    # Add role info for columns already required (do not enforce new requirements)
+    roles = get_column_roles(contract)
+    for role, columns in roles.items():
+        if role == "unknown":
+            continue
+        for col in _coerce_list(columns):
+            if col in seen:
                 for req in requirements:
                     if req.get("canonical_name") == col or req.get("name") == col:
                         req["role"] = role
@@ -122,16 +143,8 @@ def _build_requirements_from_v41(contract: Dict[str, Any]) -> List[Dict[str, Any
         for item in column_validations:
             if isinstance(item, dict):
                 col = item.get("column") or item.get("name")
-                if col and col not in seen:
-                    seen.add(col)
-                    requirements.append({
-                        "name": col,
-                        "canonical_name": col,
-                        "expected_range": item.get("expected_range"),
-                        "allowed_null_frac": item.get("allowed_null_frac"),
-                    })
-                elif col:
-                    # Update existing
+                if col and col in seen:
+                    # Update existing only; do not add new requirements
                     for req in requirements:
                         if req.get("canonical_name") == col or req.get("name") == col:
                             if item.get("expected_range"):
@@ -168,6 +181,11 @@ def run_integrity_audit(df: pd.DataFrame, contract: Dict[str, Any] | None = None
     # V4.1: Build requirements from V4.1 keys
     requirements = _build_requirements_from_v41(contract)
     validations = contract.get("validations", []) or []
+    artifacts = get_artifact_requirements(contract)
+    schema_binding = artifacts.get("schema_binding") if isinstance(artifacts, dict) else {}
+    optional_cols = schema_binding.get("optional_passthrough_columns", []) if isinstance(schema_binding, dict) else []
+    if not isinstance(optional_cols, list):
+        optional_cols = []
 
     stats: Dict[str, Dict[str, Any]] = {}
     issues: List[Dict[str, Any]] = []
@@ -202,6 +220,20 @@ def run_integrity_audit(df: pd.DataFrame, contract: Dict[str, Any] | None = None
                     "severity": "critical",
                     "column": missing_label,
                     "detail": "Column required by contract not found in cleaned dataset." + detail_suffix,
+                }
+            )
+
+    # Optional passthrough columns missing => warning only
+    for opt_col in [str(col) for col in optional_cols if col]:
+        actual, _is_exact = _find_column(df, opt_col)
+        if not actual:
+            issues.append(
+                {
+                    "type": "OPTIONAL_COLUMN_MISSING",
+                    "code": "OPTIONAL_COLUMN_MISSING",
+                    "severity": "warning",
+                    "column": opt_col,
+                    "detail": "Optional passthrough column not found in cleaned dataset.",
                 }
             )
 
