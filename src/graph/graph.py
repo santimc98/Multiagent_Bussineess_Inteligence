@@ -1129,7 +1129,19 @@ def _resolve_required_outputs(contract: Dict[str, Any]) -> List[str]:
     if isinstance(artifact_reqs, dict):
         req_files = artifact_reqs.get("required_files")
         if isinstance(req_files, list) and req_files:
-            return [_normalize_output_path(str(p)) for p in req_files if p]
+            resolved: List[str] = []
+            for entry in req_files:
+                if not entry:
+                    continue
+                if isinstance(entry, dict):
+                    path = entry.get("path") or entry.get("output") or entry.get("artifact")
+                else:
+                    path = entry
+                path = str(path) if path else ""
+                if path:
+                    resolved.append(_normalize_output_path(path))
+            if resolved:
+                return resolved
     
     # Fallback: minimal required outputs for a valid ML run
     return ["data/scored_rows.csv", "data/metrics.json", "data/alignment_check.json"]
@@ -1266,7 +1278,18 @@ def _build_contract_min(contract: Dict[str, Any], evaluation_spec: Dict[str, Any
         derived_cols = fep.get("derived_columns", [])
     if not derived_cols:
         derived_cols = contract.get("derived_columns", [])
-    
+
+    column_roles = contract.get("column_roles", {})
+    decision_variables = contract.get("decision_variables")
+    if not isinstance(decision_variables, list) or not decision_variables:
+        if isinstance(column_roles, dict):
+            inferred = [
+                str(col)
+                for col, role in column_roles.items()
+                if col and str(role).strip().lower() == "decision"
+            ]
+            decision_variables = inferred
+
     return {
         "contract_version": contract.get("contract_version"),
         "strategy_title": contract.get("strategy_title"),
@@ -1276,6 +1299,8 @@ def _build_contract_min(contract: Dict[str, Any], evaluation_spec: Dict[str, Any
         "data_requirements": contract.get("data_requirements", []) or [],
         "alignment_requirements": alignment,
         "canonical_columns": contract.get("canonical_columns", []) or [],
+        "column_roles": column_roles if isinstance(column_roles, dict) else {},
+        "decision_variables": decision_variables if isinstance(decision_variables, list) else [],
         "derived_columns": derived_cols if isinstance(derived_cols, list) else [],
         "feature_availability": contract.get("feature_availability", []) or [],
         "availability_summary": contract.get("availability_summary", ""),
@@ -2510,6 +2535,17 @@ def _detect_synthetic_data(code: str) -> bool:
     def _is_random_call(call_node: ast.Call) -> bool:
         name = _call_name(call_node).lower()
         if name.startswith("np.random.") or name.startswith("numpy.random."):
+            # Resampling indices for bootstrap/CV is NOT synthetic data generation.
+            allowed_suffixes = (
+                ".choice",
+                ".randint",
+                ".permutation",
+                ".shuffle",
+                ".default_rng",
+                ".seed",
+            )
+            if any(name.endswith(suffix) for suffix in allowed_suffixes):
+                return False
             return True
         if name.startswith("random.") or name == "random":
             return True
@@ -7950,9 +7986,8 @@ def execute_code(state: AgentState) -> AgentState:
 
     outputs_valid = not bool(artifact_issues or stale_outputs or content_issues or error_in_output)
     if not outputs_valid:
-        _purge_execution_outputs(required_outputs, expected_outputs)
-        plots_local = []
-        fallback_plots_local = []
+        # Preserve produced outputs for auditing and contract validation.
+        # Outputs are purged at the start of the next execution attempt (and at run start) to prevent contamination.
         has_partial_visuals = False
     if run_id:
         update_sandbox_attempt(

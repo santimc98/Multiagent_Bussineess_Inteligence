@@ -458,20 +458,37 @@ def get_required_outputs(contract: Dict[str, Any]) -> List[str]:
         return []
     
     outputs = []
+
+    def _extract_path(item: Any) -> str:
+        if not item:
+            return ""
+        if isinstance(item, dict):
+            path = item.get("path") or item.get("output") or item.get("artifact")
+            return str(path) if path else ""
+        return str(item)
     
     # From artifact_requirements
     artifacts = get_artifact_requirements(contract)
     required_files = artifacts.get("required_files")
     if isinstance(required_files, list):
-        outputs.extend([str(f) for f in required_files if f])
+        for entry in required_files:
+            path = _extract_path(entry)
+            if path:
+                outputs.append(path)
     required_plots = artifacts.get("required_plots")
     if isinstance(required_plots, list):
-        outputs.extend([str(p) for p in required_plots if p])
+        for entry in required_plots:
+            path = _extract_path(entry)
+            if path:
+                outputs.append(path)
     
     # From top-level required_outputs
     top_level = contract.get("required_outputs")
     if isinstance(top_level, list):
-        outputs.extend([str(o) for o in top_level if o])
+        for entry in top_level:
+            path = _extract_path(entry)
+            if path:
+                outputs.append(path)
     
     # Normalize and deduplicate
     seen = set()

@@ -2736,6 +2736,18 @@ class ExecutionPlannerAgent:
                         req["decision_variable"] = True
                         decision_vars.append(name)
 
+            # V4.1 fallback: derive decision variables from column_roles map when data_requirements is absent.
+            if not decision_vars:
+                col_roles = contract.get("column_roles")
+                if isinstance(col_roles, dict):
+                    inferred = [
+                        str(col)
+                        for col, role in col_roles.items()
+                        if col and str(role).strip().lower() == "decision"
+                    ]
+                    if inferred:
+                        decision_vars = inferred
+
             if decision_vars:
                 unique_vars: List[str] = []
                 seen = set()
@@ -2746,6 +2758,20 @@ class ExecutionPlannerAgent:
                     seen.add(key)
                     unique_vars.append(item)
                 contract["decision_variables"] = unique_vars
+
+                # Ensure allowed_feature_sets rationale is consistent with decision-variable usage.
+                allowed_feature_sets = contract.get("allowed_feature_sets")
+                if isinstance(allowed_feature_sets, dict):
+                    seg_features = allowed_feature_sets.get("segmentation_features") or []
+                    model_features = allowed_feature_sets.get("model_features") or []
+                    uses_decision = any(var in model_features for var in unique_vars)
+                    if uses_decision:
+                        allowed_feature_sets["rationale"] = (
+                            "Segmentation must use only pre-decision variables. Modeling may include pre-decision "
+                            "variables plus decision variables (controlled by the business) for optimization/elasticity. "
+                            "Outcome/post-outcome and audit-only features must not be used for training."
+                        )
+                        contract["allowed_feature_sets"] = allowed_feature_sets
 
                 feature_availability = contract.get("feature_availability")
                 if not isinstance(feature_availability, list):

@@ -103,6 +103,8 @@ class MLEngineerAgent:
             "business_alignment",
             "feature_semantics",
             "business_sanity_checks",
+            "column_roles",
+            "decision_variables",
             "feature_availability",
             "availability_summary",
             "required_dependencies",
@@ -276,7 +278,7 @@ class MLEngineerAgent:
             
         rules_block = "\n".join(
             [
-                "- No synthetic/placeholder data. Load only the provided dataset.",
+                "- No synthetic feature/row generation. Load only the provided dataset. Bootstrap resampling of existing rows is allowed when required by the contract.",
                 "- Do not mutate df_in; use df_work = df_in.copy() and only assign contract-declared derived columns.",
                 "- Baseline model is required.",
                 "- Include SimpleImputer in preprocessing when NaNs may exist.",
@@ -438,8 +440,9 @@ class MLEngineerAgent:
              The file WILL exist. If it doesn't, let pd.read_csv() raise FileNotFoundError. NO synthetic fallbacks.
         5) Do NOT invent column names. Use only columns from the contract/canonical list and the loaded dataset.
         6) Do NOT mutate the input dataframe in-place. Use df_in for the raw load. If you need derived columns, create df_work = df_in.copy() and assign ONLY columns explicitly declared as derived in the Execution Contract (data_requirements with source='derived' or spec_extraction.derived_columns). If a required input column is missing, raise ValueError (no dummy values).
-        7) NEVER create DataFrames from literals (pd.DataFrame({}), from_dict, or lists/tuples). No np.random/random/faker.
-           ABSOLUTE PROHIBITION: NO synthetic data generation under ANY circumstance (not even as "demonstration" or "example").
+        7) NEVER fabricate synthetic rows/features (pd.DataFrame({}) from literals, faker, sklearn.datasets.make_*, etc.).
+           - Bootstrap/CV resampling of the OBSERVED rows is allowed (and expected when validation_requirements asks for bootstrap).
+           - Randomness is permitted ONLY for resampling indices; do not generate new feature values from distributions.
         8) scored_rows.csv may include canonical columns plus contract-approved derived outputs (target/prediction/probability/segment/optimal values) ONLY if explicitly declared in data_requirements or spec_extraction. Any other derived columns must go to a separate artifact file.
         9) Start the script with a short comment block labeled PLAN describing: (1) dialect loading from cleaning_manifest.json, (2) detected columns, (3) row_id construction, (4) scored_rows columns, and (5) where extra derived artifacts go.
         10) Define CONTRACT_COLUMNS from the Execution Contract (prefer data_requirements source=input; else canonical_columns) and validate they exist in df_in; raise ValueError listing missing columns.
