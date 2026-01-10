@@ -208,7 +208,7 @@ class BusinessTranslatorAgent:
         genai.configure(api_key=self.api_key)
         self.model = genai.GenerativeModel(
             model_name="gemini-3-flash-preview",
-            generation_config={"temperature": 0.7},
+            generation_config={"temperature": 0.2},  # Low temp for evidence-based executive reports
         )
         self.last_prompt = None
         self.last_response = None
@@ -678,21 +678,24 @@ class BusinessTranslatorAgent:
         
         # Execution Results
         execution_results = state.get('execution_output', 'No execution results available.')
-        
+
         USER_MESSAGE_TEMPLATE = """
         Generate the Executive Report.
-        
+
         *** EXECUTION FINDINGS (RESULTS & METRICS) ***
         $execution_results
-        
-        *** FULL CONTEXT (STATE) ***
-        $final_state_str
+
+        *** INSTRUCTIONS ***
+        Use ONLY the structured context provided in the system prompt above.
+        Do NOT invent numbers or claims not supported by the artifacts.
+        For optimization/pricing problems, YOU MUST include specific optimal values per segment.
+        For leakage audits, STATE THE CORRELATION VALUE explicitly (e.g., 0.9786).
+        Cite source artifact names for all metrics (e.g., "Fuente: metrics.json").
         """
-        
+
         user_message = render_prompt(
             USER_MESSAGE_TEMPLATE,
-            execution_results=execution_results,
-            final_state_str=str(state)
+            execution_results=execution_results
         )
 
         full_prompt = system_prompt + "\n\n" + user_message
