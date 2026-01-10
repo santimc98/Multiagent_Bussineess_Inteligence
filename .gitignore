@@ -74,6 +74,8 @@ data/qa_static_facts.json
 data/strategy_spec.json
 data/contract_min.json
 
+# Contract views (generated)
+data/contracts/
 # local artifacts
 /data/case_alignment_report.json
 /tatic/
@@ -87,4 +89,3 @@ data/produced_artifact_index.json
 # Run bundles
 run_*.zip
 runs/archive/run_*.zip
-
