@@ -113,17 +113,20 @@ REASONING FRAMEWORK (produce the full contract in one pass)
 * data_sufficiency (adequate | limited | insufficient)
 
 3. COLUMN ROLES CLASSIFICATION
-   Classify EACH column in column_inventory into:
+   Only classify RELEVANT_COLUMNS (provided). Do NOT enumerate or classify the rest of column_inventory.
+   If unsure about non-relevant columns, omit them; do NOT create massive unknown lists.
+
+For each RELEVANT column, assign one role:
 
 * pre_decision
 * decision
 * outcome
 * post_decision_audit_only
-* unknown
+* unknown (only if the column is relevant but semantics remain unclear)
 
 Rationale is REQUIRED per column when ambiguous.
 
-   CRITICAL: Do not lazily default to "unknown". If a column is named in the strategy, objective, or critique, you MUST assign a role (pre_decision, outcome, decision). Use "unknown" ONLY for truly irrelevant metadata.
+   CRITICAL: Do not lazily default to "unknown". If a column is named in the strategy, objective, or critique, you MUST assign a role (pre_decision, outcome, decision).
 
 4. PREPROCESSING REQUIREMENTS (Declarative)
    For each column with nulls or quality issues:

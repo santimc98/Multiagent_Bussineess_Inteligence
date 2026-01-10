@@ -112,8 +112,9 @@ def get_outcome_columns(contract: Dict[str, Any]) -> List[str]:
     Return the list of outcome column names.
     
     Priority:
-      1. column_roles["outcome"] if exists
-      2. objective_analysis if contains target-related info
+      1. contract["outcome_columns"] if provided
+      2. column_roles["outcome"] if exists
+      3. objective_analysis if contains target-related info
       3. Empty list if nothing found
     
     Returns:
@@ -121,6 +122,12 @@ def get_outcome_columns(contract: Dict[str, Any]) -> List[str]:
     """
     if not isinstance(contract, dict):
         return []
+
+    explicit = contract.get("outcome_columns")
+    if isinstance(explicit, list) and explicit:
+        return [str(v) for v in explicit if v and str(v).lower() != "unknown"]
+    if isinstance(explicit, str) and explicit.lower() != "unknown":
+        return [explicit]
     
     # First: try column_roles["outcome"]
     roles = get_column_roles(contract)
@@ -152,6 +159,12 @@ def get_decision_columns(contract: Dict[str, Any]) -> List[str]:
     """
     if not isinstance(contract, dict):
         return []
+
+    explicit = contract.get("decision_columns")
+    if isinstance(explicit, list) and explicit:
+        return [str(v) for v in explicit if v and str(v).lower() != "unknown"]
+    if isinstance(explicit, str) and explicit.lower() != "unknown":
+        return [explicit]
     
     # Use column_roles["decision"]
     roles = get_column_roles(contract)

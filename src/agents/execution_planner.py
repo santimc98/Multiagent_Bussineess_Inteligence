@@ -1,7 +1,7 @@
 import json
 import os
 import ast
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 from string import Template
 import re
 import difflib
@@ -14,6 +14,7 @@ from src.utils.contract_validation import (
     DEFAULT_DATA_ENGINEER_RUNBOOK,
     DEFAULT_ML_ENGINEER_RUNBOOK,
 )
+from src.utils.run_bundle import get_run_dir
 
 load_dotenv()
 
@@ -250,6 +251,349 @@ def _create_v41_skeleton(
     }
 
 
+def _tokenize_name(value: str) -> str:
+    return re.sub(r"[^0-9a-zA-Z]+", " ", str(value).lower()).strip()
+
+
+def _coerce_list(value: Any) -> List[str]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if item]
+    if isinstance(value, str):
+        return [value]
+    return []
+
+
+def select_relevant_columns(
+    strategy: Dict[str, Any] | None,
+    business_objective: str,
+    domain_expert_critique: str,
+    column_inventory: List[str] | None,
+    data_profile_summary: str | None = None,
+) -> Dict[str, Any]:
+    """
+    Deterministically select a compact set of relevant columns for planning.
+    """
+    inventory = [str(col) for col in (column_inventory or []) if col is not None]
+    inventory_set = set(inventory)
+    inventory_norm_map: Dict[str, str] = {}
+    for col in inventory:
+        norm = _normalize_column_identifier(col)
+        if norm and norm not in inventory_norm_map:
+            inventory_norm_map[norm] = col
+
+    def _resolve_inventory(name: str) -> Optional[str]:
+        if not name:
+            return None
+        if name in inventory_set:
+            return name
+        norm = _normalize_column_identifier(name)
+        return inventory_norm_map.get(norm)
+
+    sources: Dict[str, List[str]] = {
+        "strategy_required_columns": [],
+        "strategy_decision_columns": [],
+        "strategy_outcome_columns": [],
+        "strategy_audit_only_columns": [],
+        "text_mentions": [],
+        "heuristic": [],
+    }
+
+    def _add_unique(target: List[str], col: str) -> None:
+        if not col or col in target:
+            return
+        target.append(col)
+
+    def _add_source(col: Optional[str], key: str, collector: List[str]) -> None:
+        if not col:
+            return
+        _add_unique(collector, col)
+        _add_unique(sources[key], col)
+
+    strategy_dict = strategy if isinstance(strategy, dict) else {}
+    required_cols_raw = _coerce_list(strategy_dict.get("required_columns"))
+    decision_cols_raw = _coerce_list(
+        strategy_dict.get("decision_columns")
+        or strategy_dict.get("decision_variables")
+        or strategy_dict.get("decision_column")
+    )
+    outcome_cols_raw = _coerce_list(
+        strategy_dict.get("outcome_columns")
+        or strategy_dict.get("target_column")
+        or strategy_dict.get("target_columns")
+        or strategy_dict.get("outcome_column")
+    )
+    audit_only_raw = _coerce_list(strategy_dict.get("audit_only_columns"))
+
+    required_cols: List[str] = []
+    decision_cols: List[str] = []
+    outcome_cols: List[str] = []
+    audit_only_cols: List[str] = []
+
+    for col in required_cols_raw:
+        _add_source(_resolve_inventory(col), "strategy_required_columns", required_cols)
+    for col in decision_cols_raw:
+        _add_source(_resolve_inventory(col), "strategy_decision_columns", decision_cols)
+    for col in outcome_cols_raw:
+        _add_source(_resolve_inventory(col), "strategy_outcome_columns", outcome_cols)
+    for col in audit_only_raw:
+        _add_source(_resolve_inventory(col), "strategy_audit_only_columns", audit_only_cols)
+
+    text_matches: List[str] = []
+    text_blob = "\n".join([business_objective or "", domain_expert_critique or ""])
+    if text_blob:
+        quote_chars = "\"'`" + "\u2018\u2019\u201c\u201d"
+        pattern = f"[{re.escape(quote_chars)}](.+?)[{re.escape(quote_chars)}]"
+        for match in re.findall(pattern, text_blob):
+            candidate = match.strip()
+            if candidate in inventory_set:
+                _add_source(candidate, "text_mentions", text_matches)
+
+    heuristic_cols: List[str] = []
+    if len(set(required_cols + decision_cols + outcome_cols + audit_only_cols + text_matches)) < 4:
+        patterns = [
+            (re.compile(r"\b(target|label|outcome|success|converted)\b"), "target_like"),
+            (re.compile(r"\b(price|amount|offer|quote|cost)\b"), "decision_like"),
+            (re.compile(r"\b(id|uuid|key)\b"), "id_like"),
+            (re.compile(r"\b(date|time|timestamp)\b"), "time_like"),
+        ]
+        for col in inventory:
+            tokenized = _tokenize_name(col)
+            if not tokenized:
+                continue
+            for regex, _label in patterns:
+                if regex.search(tokenized):
+                    _add_source(col, "heuristic", heuristic_cols)
+                    break
+
+    ordered: List[str] = []
+    for col in required_cols:
+        _add_unique(ordered, col)
+    for col in outcome_cols + decision_cols:
+        _add_unique(ordered, col)
+    for col in audit_only_cols + text_matches + heuristic_cols:
+        _add_unique(ordered, col)
+
+    max_columns = 30
+    if len(ordered) > max_columns and len(required_cols) < max_columns:
+        ordered = ordered[:max_columns]
+        ordered = list(dict.fromkeys(ordered))
+
+    omitted_policy = (
+        "Ignored by default unless promoted by strategy/explicit mention; available via column_inventory."
+    )
+
+    return {
+        "relevant_columns": [col for col in ordered if col in inventory_set],
+        "relevant_sources": sources,
+        "omitted_columns_policy": omitted_policy,
+    }
+
+
+def build_contract_min(
+    full_contract_or_partial: Dict[str, Any] | None,
+    strategy: Dict[str, Any] | None,
+    column_inventory: List[str] | None,
+    relevant_columns: List[str] | None,
+) -> Dict[str, Any]:
+    """
+    Build a compact contract_min that aligns agents on relevant columns and gates.
+    """
+    contract = full_contract_or_partial if isinstance(full_contract_or_partial, dict) else {}
+    strategy_dict = strategy if isinstance(strategy, dict) else {}
+    inventory = [str(col) for col in (column_inventory or []) if col is not None]
+    inventory_norms = {_normalize_column_identifier(col): col for col in inventory}
+
+    canonical_columns: List[str] = []
+    for col in (relevant_columns or []):
+        if not col:
+            continue
+        if col in inventory:
+            canonical_columns.append(col)
+            continue
+        norm = _normalize_column_identifier(col)
+        resolved = inventory_norms.get(norm)
+        if resolved:
+            canonical_columns.append(resolved)
+
+    if not canonical_columns:
+        for col in _coerce_list(strategy_dict.get("required_columns")):
+            norm = _normalize_column_identifier(col)
+            resolved = inventory_norms.get(norm)
+            if resolved:
+                canonical_columns.append(resolved)
+    canonical_columns = list(dict.fromkeys(canonical_columns))
+
+    def _filter_to_canonical(cols: List[str]) -> List[str]:
+        canon_set = set(canonical_columns)
+        return [col for col in cols if col in canon_set]
+
+    outcome_candidates = []
+    decision_candidates = []
+    audit_candidates = []
+
+    outcome_candidates.extend(_coerce_list(strategy_dict.get("outcome_columns")))
+    outcome_candidates.extend(_coerce_list(strategy_dict.get("target_column")))
+    outcome_candidates.extend(_coerce_list(strategy_dict.get("target_columns")))
+    outcome_candidates.extend(_coerce_list(contract.get("outcome_columns")))
+    decision_candidates.extend(_coerce_list(strategy_dict.get("decision_columns")))
+    decision_candidates.extend(_coerce_list(strategy_dict.get("decision_variables")))
+    decision_candidates.extend(_coerce_list(contract.get("decision_columns")))
+    decision_candidates.extend(_coerce_list(contract.get("decision_variables")))
+    audit_candidates.extend(_coerce_list(strategy_dict.get("audit_only_columns")))
+
+    roles = contract.get("column_roles", {}) if isinstance(contract.get("column_roles"), dict) else {}
+    if roles:
+        outcome_candidates.extend(_coerce_list(roles.get("outcome")))
+        decision_candidates.extend(_coerce_list(roles.get("decision")))
+        audit_candidates.extend(_coerce_list(roles.get("post_decision_audit_only")))
+
+    outcome_cols = _filter_to_canonical([col for col in outcome_candidates if col])
+    decision_cols = _filter_to_canonical([col for col in decision_candidates if col])
+    audit_only_cols = _filter_to_canonical([col for col in audit_candidates if col])
+
+    token_patterns = {
+        "target_like": re.compile(r"\b(target|label|outcome|success|converted)\b"),
+        "decision_like": re.compile(r"\b(price|amount|offer|quote|cost)\b"),
+        "audit_like": re.compile(r"\b(prob|score|prediction|model)\b"),
+        "id_like": re.compile(r"\b(id|uuid|key)\b"),
+        "time_like": re.compile(r"\b(date|time|timestamp)\b"),
+    }
+
+    identifiers: List[str] = []
+    time_columns: List[str] = []
+    for col in canonical_columns:
+        tokenized = _tokenize_name(col)
+        if token_patterns["id_like"].search(tokenized):
+            identifiers.append(col)
+        if token_patterns["time_like"].search(tokenized):
+            time_columns.append(col)
+        if not outcome_cols and token_patterns["target_like"].search(tokenized):
+            outcome_cols.append(col)
+        if not decision_cols and token_patterns["decision_like"].search(tokenized):
+            decision_cols.append(col)
+        if token_patterns["audit_like"].search(tokenized):
+            audit_only_cols.append(col)
+
+    outcome_cols = list(dict.fromkeys(outcome_cols))
+    decision_cols = list(dict.fromkeys(decision_cols))
+    audit_only_cols = list(dict.fromkeys(audit_only_cols))
+    identifiers = list(dict.fromkeys(identifiers))
+    time_columns = list(dict.fromkeys(time_columns))
+
+    assigned = set(outcome_cols + decision_cols + audit_only_cols + identifiers + time_columns)
+    pre_decision = [col for col in canonical_columns if col not in assigned]
+
+    column_roles: Dict[str, List[str]] = {
+        "pre_decision": pre_decision,
+        "decision": decision_cols,
+        "outcome": outcome_cols,
+        "post_decision_audit_only": audit_only_cols,
+        "unknown": [],
+    }
+    if identifiers:
+        column_roles["identifiers"] = identifiers
+    if time_columns:
+        column_roles["time_columns"] = time_columns
+
+    segmentation_features = list(pre_decision)
+    model_features = list(pre_decision)
+    if decision_cols:
+        for col in decision_cols:
+            if col not in model_features:
+                model_features.append(col)
+    forbidden_features = list(dict.fromkeys(outcome_cols + audit_only_cols))
+
+    required_outputs = [
+        "data/cleaned_data.csv",
+        "data/scored_rows.csv",
+        "data/metrics.json",
+        "data/alignment_check.json",
+    ]
+
+    artifact_requirements = {
+        "clean_dataset": {
+            "required_columns": canonical_columns,
+            "output_path": "data/cleaned_data.csv",
+        },
+        "metrics": {"required": True, "path": "data/metrics.json"},
+        "alignment_check": {"required": True, "path": "data/alignment_check.json"},
+        "plots": {"optional": True, "expected": ["*.png"]},
+        "required_files": list(required_outputs),
+        "file_schemas": {},
+        "schema_binding": {
+            "required_columns": canonical_columns,
+            "optional_passthrough_columns": [],
+        },
+    }
+
+    data_engineer_runbook = "\n".join(
+        [
+            "Produce data/cleaned_data.csv using canonical_columns only.",
+            "Preserve column names; do not invent or rename columns.",
+            "Load using output_dialect from cleaning_manifest.json when available.",
+            "Parse numeric/date fields conservatively; document conversions.",
+            "If a canonical column is missing, report and stop (no fabrication).",
+            "Do not derive targets or train models.",
+            "Write cleaning_manifest.json with input/output dialect details.",
+        ]
+    )
+    ml_engineer_runbook = "\n".join(
+        [
+            "Use allowed_feature_sets for modeling/segmentation.",
+            "Never use forbidden_features in training or optimization.",
+            "Produce data/scored_rows.csv, data/metrics.json, data/alignment_check.json.",
+            "Respect output_dialect from cleaning_manifest.json.",
+            "Document leakage checks and any data_limited_mode fallback.",
+        ]
+    )
+
+    business_objective = (
+        contract.get("business_objective")
+        or strategy_dict.get("business_objective")
+        or ""
+    )
+    if business_objective and len(business_objective) > 2000:
+        business_objective = business_objective[:2000]
+
+    omitted_columns_policy = contract.get("omitted_columns_policy") or (
+        "Ignored by default unless promoted by strategy/explicit mention; available via column_inventory."
+    )
+
+    return {
+        "contract_version": contract.get("contract_version", 2),
+        "strategy_title": contract.get("strategy_title") or strategy_dict.get("title", ""),
+        "business_objective": business_objective,
+        "canonical_columns": canonical_columns,
+        "outcome_columns": outcome_cols,
+        "decision_columns": decision_cols,
+        "column_roles": column_roles,
+        "allowed_feature_sets": {
+            "segmentation_features": segmentation_features,
+            "model_features": model_features,
+            "forbidden_features": forbidden_features,
+        },
+        "artifact_requirements": artifact_requirements,
+        "required_outputs": required_outputs,
+        "qa_gates": [
+            "no_synthetic_data",
+            "no_column_invention",
+            "artifact_alignment",
+            "integrity_no_critical",
+            "no_leakage_features",
+        ],
+        "reviewer_gates": [
+            "strategy_followed",
+            "metrics_present",
+            "interpretability_ok",
+        ],
+        "data_engineer_runbook": data_engineer_runbook,
+        "ml_engineer_runbook": ml_engineer_runbook,
+        "omitted_columns_policy": omitted_columns_policy,
+    }
+
+
 def ensure_v41_schema(contract: Dict[str, Any], strict: bool = False) -> Dict[str, Any]:
     """
     Validates and fills missing V4.1 schema keys.
@@ -365,16 +709,26 @@ def validate_artifact_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
         schema_binding = {}
         artifact_requirements["schema_binding"] = schema_binding
 
+    clean_dataset = artifact_requirements.get("clean_dataset")
+    if not isinstance(clean_dataset, dict):
+        clean_dataset = None
+
     required_columns = schema_binding.get("required_columns")
     if not isinstance(required_columns, list) or not required_columns:
-        # Fallback to canonical_columns if available, else strategy-level required_columns (legacy)
-        fallback_columns = canonical_columns or contract.get("required_columns") or []
-        if isinstance(fallback_columns, list) and fallback_columns:
-            schema_binding["required_columns"] = [str(col) for col in fallback_columns if col]
+        if clean_dataset and isinstance(clean_dataset.get("required_columns"), list):
+            schema_binding["required_columns"] = [
+                str(col) for col in clean_dataset.get("required_columns") if col
+            ]
             required_columns = schema_binding["required_columns"]
         else:
-            schema_binding["required_columns"] = []
-            required_columns = []
+            # Fallback to canonical_columns if available, else strategy-level required_columns (legacy)
+            fallback_columns = canonical_columns or contract.get("required_columns") or []
+            if isinstance(fallback_columns, list) and fallback_columns:
+                schema_binding["required_columns"] = [str(col) for col in fallback_columns if col]
+                required_columns = schema_binding["required_columns"]
+            else:
+                schema_binding["required_columns"] = []
+                required_columns = []
 
     # Validate required_columns
     valid_required = []
@@ -398,6 +752,8 @@ def validate_artifact_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
     # Update schema_binding
     if moved_to_optional:
         schema_binding["required_columns"] = valid_required
+        if clean_dataset is not None:
+            clean_dataset["required_columns"] = list(valid_required)
 
         # Add to optional_passthrough_columns
         optional_passthrough = schema_binding.get("optional_passthrough_columns", [])
@@ -661,7 +1017,8 @@ class ExecutionPlannerAgent:
         column_inventory: list[str] | None = None,
         output_dialect: Dict[str, str] | None = None,
         env_constraints: Dict[str, Any] | None = None,
-        domain_expert_critique: str = ""
+        domain_expert_critique: str = "",
+        run_id: str | None = None
     ) -> Dict[str, Any]:
         def _norm(name: str) -> str:
             return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
@@ -3020,12 +3377,7 @@ class ExecutionPlannerAgent:
                 data_summary=str(d_sum)
             )
 
-        if not self.client:
-            return _fallback()
 
-        strategy_json = json.dumps(strategy, indent=2)
-        column_inventory_json = json.dumps(column_inventory or [])
-        
         # Ensure data_summary is a string
         data_summary_str = ""
         if isinstance(data_summary, dict):
@@ -3033,7 +3385,112 @@ class ExecutionPlannerAgent:
         else:
             data_summary_str = str(data_summary)
 
-        # Construct Input
+        relevant_payload = select_relevant_columns(
+            strategy=strategy,
+            business_objective=business_objective,
+            domain_expert_critique=domain_expert_critique,
+            column_inventory=column_inventory or [],
+            data_profile_summary=data_summary_str,
+        )
+        relevant_columns = relevant_payload.get("relevant_columns", [])
+        relevant_sources = relevant_payload.get("relevant_sources", {})
+        omitted_columns_policy = relevant_payload.get("omitted_columns_policy", "")
+
+        planner_dir = None
+        if run_id:
+            run_dir = get_run_dir(run_id)
+            if run_dir:
+                planner_dir = os.path.join(run_dir, "agents", "execution_planner")
+                os.makedirs(planner_dir, exist_ok=True)
+
+        planner_diag: List[Dict[str, Any]] = []
+        self.last_planner_diag = planner_diag
+        self.last_contract_min = None
+
+        def _write_text(path: str, content: str) -> None:
+            try:
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(content or "")
+            except Exception:
+                pass
+
+        def _write_json(path: str, payload: Any) -> None:
+            try:
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, indent=2, ensure_ascii=True)
+            except Exception:
+                pass
+
+        def _persist_attempt(prompt_name: str, response_name: str, prompt_text: str, response_text: str | None) -> None:
+            if not planner_dir:
+                return
+            if prompt_text is not None:
+                _write_text(os.path.join(planner_dir, prompt_name), prompt_text)
+            if response_text is not None:
+                _write_text(os.path.join(planner_dir, response_name), response_text)
+
+        def _persist_contracts(full_contract: Dict[str, Any] | None, contract_min: Dict[str, Any] | None) -> None:
+            if not planner_dir:
+                return
+            if contract_min:
+                _write_json(os.path.join(planner_dir, "contract_min.json"), contract_min)
+            if full_contract:
+                _write_json(os.path.join(planner_dir, "contract_full.json"), full_contract)
+            if planner_diag:
+                _write_json(os.path.join(planner_dir, "planner_diag.json"), {"attempts": planner_diag})
+
+        def _parse_json_response(raw_text: str) -> Tuple[Optional[Any], Optional[Exception]]:
+            if not raw_text:
+                return None, ValueError("Empty response text")
+            cleaned = raw_text.replace("```json", "").replace("```", "").strip()
+            try:
+                return json.loads(cleaned), None
+            except json.JSONDecodeError as first_err:
+                start = cleaned.find("{")
+                end = cleaned.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    snippet = cleaned[start:end + 1]
+                    try:
+                        return json.loads(snippet), None
+                    except Exception as second_err:
+                        return None, second_err
+                return None, first_err
+            except Exception as err:
+                return None, err
+
+        def _normalize_usage_metadata(raw_usage: Any) -> Optional[Dict[str, Any]]:
+            if raw_usage is None:
+                return None
+            if isinstance(raw_usage, dict):
+                return raw_usage
+            if hasattr(raw_usage, "to_dict"):
+                try:
+                    return raw_usage.to_dict()
+                except Exception:
+                    pass
+            usage_payload = {}
+            for key in ("prompt_token_count", "candidates_token_count", "total_token_count"):
+                try:
+                    value = getattr(raw_usage, key)
+                except Exception:
+                    value = None
+                if value is not None:
+                    usage_payload[key] = value
+            return usage_payload or {"value": str(raw_usage)}
+
+        if not self.client:
+            contract = _fallback()
+            contract_min = build_contract_min(contract, strategy, column_inventory, relevant_columns)
+            self.last_contract_min = contract_min
+            _persist_contracts(contract, contract_min)
+            return contract
+
+        strategy_json = json.dumps(strategy, indent=2)
+        column_inventory_count = len(column_inventory or [])
+        column_inventory_sample = (column_inventory or [])[:25]
+        inventory_truncated = column_inventory_count > 50
+        column_inventory_payload = column_inventory_sample if inventory_truncated else (column_inventory or [])
+
         user_input = f"""
 strategy:
 {strategy_json}
@@ -3041,8 +3498,26 @@ strategy:
 business_objective:
 {business_objective}
 
+relevant_columns:
+{json.dumps(relevant_columns, indent=2)}
+
+relevant_sources:
+{json.dumps(relevant_sources, indent=2)}
+
+omitted_columns_policy:
+{omitted_columns_policy}
+
+column_inventory_count:
+{column_inventory_count}
+
+column_inventory_sample:
+{json.dumps(column_inventory_sample, indent=2)}
+
+column_inventory_truncated:
+{json.dumps(inventory_truncated)}
+
 column_inventory:
-{column_inventory_json}
+{json.dumps(column_inventory_payload, indent=2)}
 
 data_profile_summary:
 {data_summary_str}
@@ -3056,121 +3531,174 @@ env_constraints:
 domain_expert_critique:
 {domain_expert_critique or "None"}
 """
+
         full_prompt = SENIOR_PLANNER_PROMPT + "\n\nINPUTS:\n" + user_input
-        self.last_prompt = full_prompt
+        repair_keys = [
+            "contract_version",
+            "strategy_title",
+            "business_objective",
+            "canonical_columns",
+            "outcome_columns",
+            "decision_columns",
+            "column_roles",
+            "allowed_feature_sets",
+            "artifact_requirements",
+            "required_outputs",
+            "qa_gates",
+            "reviewer_gates",
+            "data_engineer_runbook",
+            "ml_engineer_runbook",
+            "omitted_columns_policy",
+        ]
+        repair_prompt = (
+            "Return ONLY valid JSON with EXACT keys: "
+            + json.dumps(repair_keys)
+            + ". Do not include any other keys or commentary.\n"
+            + "Use ONLY RELEVANT_COLUMNS for canonical_columns and column_roles.\n"
+            + "RELEVANT_COLUMNS: "
+            + json.dumps(relevant_columns)
+            + "\n"
+            + "STRATEGY_TITLE: "
+            + json.dumps(strategy.get("title", "") if isinstance(strategy, dict) else "")
+            + "\n"
+            + "BUSINESS_OBJECTIVE: "
+            + json.dumps(business_objective[:500] if business_objective else "")
+        )
 
-        # Retry logic: up to 3 attempts for transient API issues (truncation, rate limits)
-        max_retries = 3
-        import time
+        attempt_prompts = [
+            ("prompt_attempt_1.txt", "response_attempt_1.txt", full_prompt),
+            ("prompt_attempt_2_repair.txt", "response_attempt_2.txt", repair_prompt),
+        ]
 
-        for attempt in range(max_retries):
+        contract: Dict[str, Any] | None = None
+        llm_success = False
+
+        for attempt_index, (prompt_name, response_name, prompt_text) in enumerate(attempt_prompts, start=1):
+            self.last_prompt = prompt_text
+            response_text = ""
+            response = None
+            parse_error: Optional[Exception] = None
+            finish_reason = None
+            usage_metadata = None
+
             try:
-                response = self.client.generate_content(full_prompt)
-                content = response.text
-                self.last_response = content
+                response = self.client.generate_content(prompt_text)
+                response_text = getattr(response, "text", "") or ""
+                self.last_response = response_text
+            except Exception as err:
+                parse_error = err
 
-                # Check for truncated response (common Gemini issue)
-                if len(content) < 500 or not content.strip().endswith("}"):
-                    if attempt < max_retries - 1:
-                        print(f"WARNING: Truncated response (len={len(content)}). Retry {attempt+1}/{max_retries}...")
-                        print(f"Last 100 chars: ...{content[-100:]}")
-                        time.sleep(2)  # Brief delay before retry
-                        continue
+            if response is not None:
+                try:
+                    candidates = getattr(response, "candidates", None)
+                    if candidates:
+                        finish_reason = getattr(candidates[0], "finish_reason", None)
+                except Exception:
+                    finish_reason = None
+                usage_metadata = _normalize_usage_metadata(getattr(response, "usage_metadata", None))
+
+            _persist_attempt(prompt_name, response_name, prompt_text, response_text)
+
+            parsed, parse_exc = _parse_json_response(response_text) if response_text else (None, parse_error)
+            if parse_exc:
+                parse_error = parse_exc
+
+            had_json_parse_error = parsed is None or not isinstance(parsed, dict)
+            if parsed is not None and not isinstance(parsed, dict):
+                parse_error = ValueError("Parsed JSON is not an object")
+
+            planner_diag.append(
+                {
+                    "model_name": self.model_name,
+                    "attempt_index": attempt_index,
+                    "prompt_char_len": len(prompt_text or ""),
+                    "response_char_len": len(response_text or ""),
+                    "finish_reason": str(finish_reason) if finish_reason is not None else None,
+                    "usage_metadata": usage_metadata,
+                    "had_json_parse_error": bool(had_json_parse_error),
+                    "parse_error_type": type(parse_error).__name__ if parse_error else None,
+                    "parse_error_message": str(parse_error) if parse_error else None,
+                }
+            )
+
+            if parsed is None or not isinstance(parsed, dict):
+                print(f"WARNING: Planner parse failed on attempt {attempt_index}.")
+                continue
+
+            contract = parsed
+            llm_success = True
+            break
+
+        if contract is None:
+            contract = _fallback("JSON Parse Error after retries")
+
+        contract = ensure_v41_schema(contract)
+
+        if column_inventory and not contract.get("available_columns"):
+            contract["available_columns"] = column_inventory
+
+        if relevant_columns:
+            relevant_set = set(relevant_columns)
+            canonical_cols = contract.get("canonical_columns")
+            if isinstance(canonical_cols, list) and canonical_cols:
+                contract["canonical_columns"] = [c for c in canonical_cols if c in relevant_set]
+            else:
+                contract["canonical_columns"] = list(relevant_columns)
+            column_roles = contract.get("column_roles")
+            if isinstance(column_roles, dict):
+                filtered_roles = {}
+                for role, cols in column_roles.items():
+                    if isinstance(cols, list):
+                        filtered_roles[role] = [c for c in cols if c in relevant_set]
                     else:
-                        print(f"ERROR: Response still truncated after {max_retries} attempts")
-                        return _fallback("Truncated LLM Response after retries")
+                        filtered_roles[role] = cols
+                contract["column_roles"] = filtered_roles
+            contract["omitted_columns_policy"] = omitted_columns_policy
 
-                # Clean markdown
-                content = content.replace("```json", "").replace("```", "").strip()
-                # Handle potential preamble text if model is chatty (though V4.1 says JSON only)
-                if "{" in content:
-                    content = content[content.find("{"):content.rfind("}")+1]
+        contract = validate_artifact_requirements(contract)
 
-                contract = json.loads(content)
+        def _sanitize_runbook_text(text: str) -> str:
+            """Replace hardcoded dialect instructions with dynamic manifest reference."""
+            if not isinstance(text, str):
+                return text
+            import re
+            patterns = [
+                (r'sep\s*=\s*[\'"]?[;,\t][\'"]?', "sep from cleaning_manifest.json"),
+                (r'decimal\s*=\s*[\'"]?[.,][\'"]?', "decimal from cleaning_manifest.json"),
+                (r"Load.*CSV.*using.*sep.*=.*[;,]", "Load CSV using dialect from data/cleaning_manifest.json"),
+            ]
+            for pattern, replacement in patterns:
+                text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+            return text
 
-                # Validate structure
-                if not isinstance(contract, dict):
-                    if attempt < max_retries - 1:
-                        print(f"WARNING: Non-dict response. Retry {attempt+1}/{max_retries}...")
-                        time.sleep(2)
-                        continue
-                    else:
-                        print("ERROR: Non-dict response after retries")
-                        return _fallback("Non-dict Response after retries")
+        def _sanitize_runbook(runbook: Any) -> Any:
+            if isinstance(runbook, str):
+                return _sanitize_runbook_text(runbook)
+            if isinstance(runbook, dict):
+                return {k: _sanitize_runbook(v) for k, v in runbook.items()}
+            if isinstance(runbook, list):
+                return [_sanitize_runbook(item) for item in runbook]
+            return runbook
 
-                # Ensure V4.1 schema completeness
-                contract = ensure_v41_schema(contract)
+        if contract.get("data_engineer_runbook"):
+            contract["data_engineer_runbook"] = _sanitize_runbook(contract["data_engineer_runbook"])
+        if contract.get("ml_engineer_runbook"):
+            contract["ml_engineer_runbook"] = _sanitize_runbook(contract["ml_engineer_runbook"])
 
-                # Validate artifact_requirements (ensure required_columns ⊆ canonical_columns)
-                contract = validate_artifact_requirements(contract)
+        if "role_runbooks" not in contract or not isinstance(contract.get("role_runbooks"), dict):
+            contract["role_runbooks"] = {}
+        if contract.get("data_engineer_runbook"):
+            contract["role_runbooks"]["data_engineer"] = contract["data_engineer_runbook"]
+        if contract.get("ml_engineer_runbook"):
+            contract["role_runbooks"]["ml_engineer"] = contract["ml_engineer_runbook"]
 
-                # --- SANITIZE RUNBOOKS: Remove hardcoded dialect instructions ---
-                def _sanitize_runbook_text(text: str) -> str:
-                    """Replace hardcoded dialect instructions with dynamic manifest reference."""
-                    if not isinstance(text, str):
-                        return text
-                    import re
-                    # Replace patterns like "sep=';'" or "decimal=','" with dynamic reference
-                    patterns = [
-                        (r"sep\s*=\s*['\"]?[;,\\t]['\"]?", "sep from cleaning_manifest.json"),
-                        (r"decimal\s*=\s*['\"]?[.,]['\"]?", "decimal from cleaning_manifest.json"),
-                        (r"Load.*CSV.*using.*sep.*=.*[;,]", "Load CSV using dialect from data/cleaning_manifest.json"),
-                    ]
-                    for pattern, replacement in patterns:
-                        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-                    return text
+        contract_min = build_contract_min(contract, strategy, column_inventory, relevant_columns)
+        self.last_contract_min = contract_min
+        _persist_contracts(contract, contract_min)
 
-                def _sanitize_runbook(runbook: Any) -> Any:
-                    """Recursively sanitize runbook dict or string."""
-                    if isinstance(runbook, str):
-                        return _sanitize_runbook_text(runbook)
-                    if isinstance(runbook, dict):
-                        return {k: _sanitize_runbook(v) for k, v in runbook.items()}
-                    if isinstance(runbook, list):
-                        return [_sanitize_runbook(item) for item in runbook]
-                    return runbook
-
-                # Sanitize V4.1 runbooks
-                if contract.get("data_engineer_runbook"):
-                    contract["data_engineer_runbook"] = _sanitize_runbook(contract["data_engineer_runbook"])
-                if contract.get("ml_engineer_runbook"):
-                    contract["ml_engineer_runbook"] = _sanitize_runbook(contract["ml_engineer_runbook"])
-
-                # --- SHIM: Backward compatibility for role_runbooks (V4.1 -> legacy) ---
-                # V4.1 uses flat keys: data_engineer_runbook, ml_engineer_runbook
-                # Legacy agents may read: role_runbooks.data_engineer, role_runbooks.ml_engineer
-                if "role_runbooks" not in contract or not isinstance(contract.get("role_runbooks"), dict):
-                    contract["role_runbooks"] = {}
-                if contract.get("data_engineer_runbook"):
-                    contract["role_runbooks"]["data_engineer"] = contract["data_engineer_runbook"]
-                if contract.get("ml_engineer_runbook"):
-                    contract["role_runbooks"]["ml_engineer"] = contract["ml_engineer_runbook"]
-
-                # Success! Return contract
-                if attempt > 0:
-                    print(f"SUCCESS: Execution Planner succeeded on attempt {attempt+1}")
-                return contract
-
-            except json.JSONDecodeError as e:
-                if attempt < max_retries - 1:
-                    print(f"ERROR: JSON parse failed. Retry {attempt+1}/{max_retries}...")
-                    print(f"Error: {e}")
-                    print(f"Response preview: {self.last_response[:200] if self.last_response else 'None'}...")
-                    time.sleep(2)
-                    continue
-                else:
-                    print(f"ERROR: JSON parse failed after {max_retries} attempts: {e}")
-                    print(f"Response length: {len(self.last_response) if self.last_response else 0}")
-                    print(f"Response preview: {self.last_response[:200] if self.last_response else 'None'}...")
-                    return _fallback("JSON Parse Error after retries")
-
-            except Exception as e:
-                # Unexpected errors: don't retry (likely code bugs, not transient API issues)
-                print(f"ERROR: Execution Planner unexpected error: {type(e).__name__}: {str(e)}")
-                return _fallback(f"Unexpected Error: {type(e).__name__}")
-
-        # Fallback if loop completes without returning (shouldn't happen)
-        return _fallback("Max retries exceeded")
+        if llm_success and planner_diag:
+            print(f"SUCCESS: Execution Planner succeeded on attempt {planner_diag[-1]['attempt_index']}")
+        return contract
 
     def generate_evaluation_spec(
         self,

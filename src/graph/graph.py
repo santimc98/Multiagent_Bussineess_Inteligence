@@ -5054,7 +5054,8 @@ def run_execution_planner(state: AgentState) -> AgentState:
             column_inventory=column_inventory,
             output_dialect=output_dialect,
             env_constraints=env_constraints,
-            domain_expert_critique=domain_expert_critique
+            domain_expert_critique=domain_expert_critique,
+            run_id=run_id,
         )
     except Exception as e:
         print(f"Warning: execution planner failed ({e}); using fallback contract.")
@@ -5099,6 +5100,18 @@ def run_execution_planner(state: AgentState) -> AgentState:
     if evaluation_spec:
         contract["evaluation_spec"] = evaluation_spec
     contract = _ensure_scored_rows_output(contract, evaluation_spec if evaluation_spec else None)
+    contract_min = getattr(execution_planner, "last_contract_min", None)
+    if not contract_min and isinstance(contract, dict):
+        try:
+            from src.agents.execution_planner import build_contract_min
+            contract_min = build_contract_min(
+                contract,
+                strategy,
+                column_inventory,
+                contract.get("canonical_columns", []) if isinstance(contract, dict) else [],
+            )
+        except Exception:
+            contract_min = None
     try:
         os.makedirs("data", exist_ok=True)
         with open("data/execution_contract.json", "w", encoding="utf-8") as f:
@@ -5109,6 +5122,9 @@ def run_execution_planner(state: AgentState) -> AgentState:
         if evaluation_spec:
             with open("data/evaluation_spec.json", "w", encoding="utf-8") as f_spec:
                 json.dump(evaluation_spec, f_spec, indent=2, ensure_ascii=False)
+        if contract_min:
+            with open("data/contract_min.json", "w", encoding="utf-8") as f_min:
+                json.dump(contract_min, f_min, indent=2, ensure_ascii=False)
     except Exception as save_err:
         print(f"Warning: failed to persist execution_contract.json: {save_err}")
     if run_id:
@@ -5147,7 +5163,11 @@ def run_execution_planner(state: AgentState) -> AgentState:
             "execution_planner",
             prompt=getattr(execution_planner, "last_prompt", None),
             response=getattr(execution_planner, "last_response", None) or result,
-            context={"strategy": strategy, "business_objective": business_objective},
+            context={
+                "strategy": strategy,
+                "business_objective": business_objective,
+                "planner_diag": getattr(execution_planner, "last_planner_diag", None),
+            },
         )
     return result
 
@@ -6666,13 +6686,15 @@ def run_engineer(state: AgentState) -> AgentState:
     evaluation_spec = state.get("evaluation_spec") or (execution_contract or {}).get("evaluation_spec") or {}
     if isinstance(execution_contract, dict) and evaluation_spec and not execution_contract.get("evaluation_spec"):
         execution_contract["evaluation_spec"] = evaluation_spec
-    contract_min = _build_contract_min(execution_contract, evaluation_spec)
-    try:
-        os.makedirs("data", exist_ok=True)
-        with open("data/contract_min.json", "w", encoding="utf-8") as f_min:
-            json.dump(contract_min, f_min, indent=2, ensure_ascii=False)
-    except Exception:
-        pass
+    contract_min = _load_json_safe("data/contract_min.json")
+    if not isinstance(contract_min, dict) or not contract_min:
+        contract_min = _build_contract_min(execution_contract, evaluation_spec)
+        try:
+            os.makedirs("data", exist_ok=True)
+            with open("data/contract_min.json", "w", encoding="utf-8") as f_min:
+                json.dump(contract_min, f_min, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
     if not execution_contract:
         data_audit_context = _merge_de_audit_override(
             data_audit_context,
