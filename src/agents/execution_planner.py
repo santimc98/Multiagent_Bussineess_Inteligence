@@ -726,8 +726,15 @@ def validate_artifact_requirements(contract: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(clean_dataset, dict):
         clean_dataset = None
 
-    required_columns = schema_binding.get("required_columns")
-    if not isinstance(required_columns, list) or not required_columns:
+    if "required_columns" in schema_binding:
+        required_columns = schema_binding.get("required_columns")
+        if not isinstance(required_columns, list):
+            # Preserve invalid type: do not mutate contract
+            return contract
+    else:
+        required_columns = []
+
+    if not required_columns:
         if clean_dataset and isinstance(clean_dataset.get("required_columns"), list):
             schema_binding["required_columns"] = [
                 str(col) for col in clean_dataset.get("required_columns") if col

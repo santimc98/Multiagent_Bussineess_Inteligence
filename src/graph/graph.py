@@ -5576,18 +5576,25 @@ def run_data_engineer(state: AgentState) -> AgentState:
         print(f"Warning: failed to persist data_engineer_context.json: {ctx_err}")
 
     # Generate cleaning script (targeting REMOTE path)
-    code = data_engineer.generate_cleaning_script(
-        data_engineer_audit_override,
-        selected,
-        input_path="data/raw.csv", # Remote Sandbox Path
-        business_objective=de_objective,
-        csv_encoding=csv_encoding,
-        csv_sep=csv_sep,
-        csv_decimal=csv_decimal,
-        execution_contract=de_contract_min,
-        contract_min=de_contract_min,
-        de_view=de_view,
-    )
+    import inspect
+
+    kwargs = {
+        "data_audit": data_engineer_audit_override,
+        "strategy": selected,
+        "input_path": "data/raw.csv",  # Remote Sandbox Path
+        "business_objective": de_objective,
+        "csv_encoding": csv_encoding,
+        "csv_sep": csv_sep,
+        "csv_decimal": csv_decimal,
+    }
+    sig = inspect.signature(data_engineer.generate_cleaning_script)
+    if "execution_contract" in sig.parameters:
+        kwargs["execution_contract"] = de_contract_min
+    if "contract_min" in sig.parameters:
+        kwargs["contract_min"] = de_contract_min
+    if "de_view" in sig.parameters:
+        kwargs["de_view"] = de_view
+    code = data_engineer.generate_cleaning_script(**kwargs)
     try:
         os.makedirs("artifacts", exist_ok=True)
         with open(os.path.join("artifacts", "data_engineer_last.py"), "w", encoding="utf-8") as f_art:
@@ -5735,7 +5742,11 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 "snippets": snippets,
                 "auto_fixes_applied": auto_fixes,
             }
-            payload = "ENVIRONMENT_FEEDBACK (Please Adjust Code):\n" + json.dumps(context_payload, indent=2, ensure_ascii=False)
+            payload = (
+                "STATIC_SCAN_VIOLATIONS:\n"
+                "ENVIRONMENT_FEEDBACK (Please Adjust Code):\n"
+                + json.dumps(context_payload, indent=2, ensure_ascii=False)
+            )
             new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
             if run_id:
                 log_run_event(run_id, "static_scan_retry", {"attempt": attempt_id, "violations": violations})
@@ -8624,11 +8635,11 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 case_history.append(float(violations))
         except Exception:
             pass
-        try:
-            os.makedirs("data", exist_ok=True)
-            dump_json("data/case_alignment_report.json", case_report)
-        except Exception as err:
-            print(f"Warning: failed to persist case_alignment_report.json: {err}")
+    try:
+        os.makedirs("data", exist_ok=True)
+        dump_json("data/case_alignment_report.json", case_report)
+    except Exception as err:
+        print(f"Warning: failed to persist case_alignment_report.json: {err}")
 
     # Detect stale metrics file across iterations (diagnostic for ML)
     metrics_report = _load_json_safe("data/metrics.json")

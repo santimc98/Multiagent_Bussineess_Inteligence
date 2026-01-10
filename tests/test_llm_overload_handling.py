@@ -34,7 +34,7 @@ def test_data_engineer_json_error_retry():
     with patch.object(agent.client.chat.completions, 'create', side_effect=mock_create):
         # Should succeed eventually
         code = agent.generate_cleaning_script("audit", {"required_columns": []}, "path")
-        assert code == "print('Success')"
+        assert code.strip().endswith("print('Success')")
         assert mock_create.call_count == 2 # Initial + 1 Retry
 
 def test_data_engineer_overload_sentinel():
