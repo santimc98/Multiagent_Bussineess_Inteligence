@@ -444,14 +444,19 @@ def build_contract_min(
     audit_candidates.extend(_coerce_list(strategy_dict.get("audit_only_columns")))
 
     roles = contract.get("column_roles", {}) if isinstance(contract.get("column_roles"), dict) else {}
+    role_pre = _filter_to_canonical(_coerce_list(roles.get("pre_decision"))) if roles else []
+    role_decision = _filter_to_canonical(_coerce_list(roles.get("decision"))) if roles else []
+    role_outcome = _filter_to_canonical(_coerce_list(roles.get("outcome"))) if roles else []
+    role_audit = _filter_to_canonical(_coerce_list(roles.get("post_decision_audit_only"))) if roles else []
+
     if roles:
         outcome_candidates.extend(_coerce_list(roles.get("outcome")))
         decision_candidates.extend(_coerce_list(roles.get("decision")))
         audit_candidates.extend(_coerce_list(roles.get("post_decision_audit_only")))
 
-    outcome_cols = _filter_to_canonical([col for col in outcome_candidates if col])
-    decision_cols = _filter_to_canonical([col for col in decision_candidates if col])
-    audit_only_cols = _filter_to_canonical([col for col in audit_candidates if col])
+    outcome_cols = role_outcome or _filter_to_canonical([col for col in outcome_candidates if col])
+    decision_cols = role_decision or _filter_to_canonical([col for col in decision_candidates if col])
+    audit_only_cols = role_audit or _filter_to_canonical([col for col in audit_candidates if col])
 
     token_patterns = {
         "target_like": re.compile(r"\b(target|label|outcome|success|converted)\b"),
@@ -483,7 +488,10 @@ def build_contract_min(
     time_columns = list(dict.fromkeys(time_columns))
 
     assigned = set(outcome_cols + decision_cols + audit_only_cols + identifiers + time_columns)
-    pre_decision = [col for col in canonical_columns if col not in assigned]
+    if role_pre:
+        pre_decision = role_pre
+    else:
+        pre_decision = [col for col in canonical_columns if col not in assigned]
 
     column_roles: Dict[str, List[str]] = {
         "pre_decision": pre_decision,

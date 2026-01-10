@@ -1,6 +1,9 @@
 import os
 import json
-from typing import Any, Dict, List
+import csv
+import re
+from statistics import median
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -98,11 +101,12 @@ class ResultsAdvisorAgent:
         predictions_summary = self._summarize_csv(predictions_artifacts[0]) if predictions_artifacts else {}
         error_payload = self._safe_load_json(error_artifacts[0]) if error_artifacts else {}
         importances_payload = self._safe_load_json(importances_artifacts[0]) if importances_artifacts else {}
+        alignment_payload = self._safe_load_json("data/alignment_check.json") or {}
 
-        metrics_summary = self._extract_numeric_metrics(metrics_payload)
+        metrics_summary = self._extract_metrics_summary(metrics_payload)
         if not metrics_summary and isinstance(metrics_payload, dict):
             nested = metrics_payload.get("metrics")
-            metrics_summary = self._extract_numeric_metrics(nested)
+            metrics_summary = self._extract_metrics_summary(nested)
         risks = []
         recommendations = []
         summary_lines: List[str] = []
@@ -111,7 +115,9 @@ class ResultsAdvisorAgent:
             risks.append("Metrics artifact missing or empty; evaluation confidence is limited.")
             recommendations.append("Generate a metrics artifact aligned to the objective type.")
         if predictions_summary:
-            summary_lines.append(f"Predictions preview includes {predictions_summary.get('row_count', 0)} rows.")
+            summary_lines.append(
+                f"Predictions preview includes {predictions_summary.get('row_count', 0)} rows."
+            )
         if error_payload:
             summary_lines.append("Error analysis artifact available; review failure patterns.")
         if importances_payload:
@@ -141,12 +147,18 @@ class ResultsAdvisorAgent:
         for path in (metrics_artifacts + predictions_artifacts + error_artifacts + importances_artifacts):
             artifacts_used.append(path)
 
+        segment_pricing_summary = self._build_segment_pricing_summary(predictions_artifacts[0]) if predictions_artifacts else []
+        leakage_audit = self._extract_leakage_audit(alignment_payload)
+
         insights = {
             "schema_version": "1",
             "objective_type": objective_type,
             "artifacts_used": artifacts_used,
             "metrics_summary": metrics_summary,
             "predictions_summary": predictions_summary,
+            "overall_scored_rows_row_count": predictions_summary.get("row_count") if isinstance(predictions_summary, dict) else None,
+            "segment_pricing_summary": segment_pricing_summary,
+            "leakage_audit": leakage_audit,
             "risks": risks,
             "recommendations": recommendations,
             "summary_lines": summary_lines,
@@ -173,27 +185,107 @@ class ResultsAdvisorAgent:
         except Exception:
             return {}
 
-    def _summarize_csv(self, path: str, max_rows: int = 200) -> Dict[str, Any]:
-        if not path:
+    def _load_output_dialect(self, manifest_path: str = "data/cleaning_manifest.json") -> Dict[str, Any]:
+        manifest = self._safe_load_json(manifest_path)
+        if not isinstance(manifest, dict):
             return {}
+        dialect = manifest.get("output_dialect") or manifest.get("dialect") or {}
+        if not isinstance(dialect, dict):
+            return {}
+        sep = dialect.get("sep") or dialect.get("delimiter")
+        decimal = dialect.get("decimal")
+        encoding = dialect.get("encoding")
+        cleaned = {}
+        if sep:
+            cleaned["sep"] = str(sep)
+        if decimal:
+            cleaned["decimal"] = str(decimal)
+        if encoding:
+            cleaned["encoding"] = str(encoding)
+        return cleaned
+
+    def _sniff_csv_dialect(self, path: str) -> Dict[str, Any]:
         try:
-            import csv
-            with open(path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                rows = []
-                for _, row in zip(range(max_rows), reader):
-                    rows.append(row)
-            columns = reader.fieldnames or []
-            numeric_cols = self._numeric_columns(rows, columns)
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                lines = []
+                for _ in range(5):
+                    line = f.readline()
+                    if not line:
+                        break
+                    lines.append(line)
+        except Exception:
+            return {"sep": ",", "decimal": ".", "encoding": "utf-8"}
+
+        sample_text = "".join(lines)
+        header = lines[0] if lines else ""
+        sep = ";" if header.count(";") > header.count(",") else ","
+        comma_decimals = len(re.findall(r"\d+,\d+", sample_text))
+        dot_decimals = len(re.findall(r"\d+\.\d+", sample_text))
+        decimal = "," if comma_decimals > dot_decimals else "."
+        return {"sep": sep, "decimal": decimal, "encoding": "utf-8"}
+
+    def _coerce_number(self, raw: Any, decimal: str) -> Optional[float]:
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        if not text:
+            return None
+        text = text.replace(" ", "")
+        if decimal == ",":
+            if text.count(",") == 1 and text.count(".") >= 1:
+                text = text.replace(".", "")
+            text = text.replace(",", ".")
+        try:
+            return float(text)
+        except Exception:
+            return None
+
+    def _read_csv_summary(self, path: str, dialect: Dict[str, Any], max_rows: int) -> Dict[str, Any]:
+        sep = dialect.get("sep") or ","
+        decimal = dialect.get("decimal") or "."
+        encoding = dialect.get("encoding") or "utf-8"
+        rows: List[Dict[str, Any]] = []
+        row_count_total = 0
+        try:
+            with open(path, "r", encoding=str(encoding), errors="replace") as f:
+                reader = csv.DictReader(f, delimiter=str(sep))
+                columns = reader.fieldnames or []
+                for row in reader:
+                    row_count_total += 1
+                    if len(rows) < max_rows:
+                        rows.append(row)
+            numeric_cols = self._numeric_columns(rows, columns, decimal)
             return {
-                "row_count": len(rows),
+                "row_count": row_count_total,
+                "row_count_total": row_count_total,
+                "row_count_sampled": len(rows),
                 "columns": columns,
                 "numeric_columns": numeric_cols,
+                "examples": rows[: min(5, len(rows))],
+                "dialect_used": {"sep": sep, "decimal": decimal, "encoding": encoding},
             }
         except Exception:
             return {}
 
-    def _numeric_columns(self, rows: List[Dict[str, Any]], columns: List[str]) -> List[str]:
+    def _summarize_csv(self, path: str, max_rows: int = 200) -> Dict[str, Any]:
+        if not path:
+            return {}
+        manifest_dialect = self._load_output_dialect()
+        dialect = manifest_dialect or self._sniff_csv_dialect(path)
+        summary = self._read_csv_summary(path, dialect, max_rows)
+        columns = summary.get("columns", [])
+        if (
+            isinstance(columns, list)
+            and len(columns) == 1
+            and isinstance(columns[0], str)
+            and ";" in columns[0]
+        ):
+            sniffed = self._sniff_csv_dialect(path)
+            if sniffed.get("sep") != dialect.get("sep"):
+                summary = self._read_csv_summary(path, sniffed, max_rows)
+        return summary
+
+    def _numeric_columns(self, rows: List[Dict[str, Any]], columns: List[str], decimal: str) -> List[str]:
         numeric_cols: List[str] = []
         for col in columns:
             values = []
@@ -201,28 +293,219 @@ class ResultsAdvisorAgent:
                 raw = row.get(col)
                 if raw in (None, ""):
                     continue
-                try:
-                    values.append(float(str(raw).replace(",", ".")))
-                except Exception:
-                    values.append(None)
+                values.append(self._coerce_number(raw, decimal))
             non_null = [v for v in values if v is not None]
             if non_null and len(non_null) >= max(1, len(values) // 3):
                 numeric_cols.append(col)
         return numeric_cols
 
-    def _extract_numeric_metrics(self, metrics: Dict[str, Any], max_items: int = 10) -> List[Dict[str, Any]]:
+    def _extract_metrics_summary(self, metrics: Dict[str, Any], max_items: int = 8) -> List[Dict[str, Any]]:
         if not isinstance(metrics, dict):
             return []
         items: List[Dict[str, Any]] = []
+        model_perf = metrics.get("model_performance") if isinstance(metrics.get("model_performance"), dict) else {}
+        seg_stats = metrics.get("segmentation_stats") if isinstance(metrics.get("segmentation_stats"), dict) else {}
+        priority_keys = [
+            "accuracy",
+            "roc_auc",
+            "precision",
+            "f1",
+            "rmse",
+            "mae",
+            "r2",
+            "silhouette_score",
+            "training_samples",
+        ]
+        for key in priority_keys:
+            if key in model_perf:
+                num = self._coerce_number(model_perf.get(key), ".")
+                if num is not None:
+                    items.append({"metric": f"model_performance.{key}", "value": num})
+        seg_keys = ["n_segments", "min_segment_size", "median_segment_size"]
+        for key in seg_keys:
+            if key in seg_stats:
+                num = self._coerce_number(seg_stats.get(key), ".")
+                if num is not None:
+                    items.append({"metric": f"segmentation_stats.{key}", "value": num})
+        if len(items) >= max_items:
+            return items[:max_items]
         for key, value in metrics.items():
-            try:
-                num = float(value)
-            except Exception:
+            if isinstance(value, dict):
                 continue
-            items.append({"metric": str(key), "value": num})
-            if len(items) >= max_items:
-                break
+            num = self._coerce_number(value, ".")
+            if num is not None:
+                items.append({"metric": str(key), "value": num})
+                if len(items) >= max_items:
+                    break
         return items
+
+    def _pick_column(self, columns: List[str], candidates: List[str]) -> Optional[str]:
+        lower_map = {col.lower(): col for col in columns}
+        for cand in candidates:
+            if cand in lower_map:
+                return lower_map[cand]
+        for col in columns:
+            col_lower = col.lower()
+            for cand in candidates:
+                if cand in col_lower:
+                    return col
+        return None
+
+    def _build_segment_pricing_summary(self, path: str) -> List[Dict[str, Any]]:
+        if not path:
+            return []
+        base_dialect = self._load_output_dialect()
+        dialect = base_dialect or self._sniff_csv_dialect(path)
+        for _ in range(2):
+            sep = dialect.get("sep") or ","
+            decimal = dialect.get("decimal") or "."
+            encoding = dialect.get("encoding") or "utf-8"
+            try:
+                with open(path, "r", encoding=str(encoding), errors="replace") as f:
+                    reader = csv.DictReader(f, delimiter=str(sep))
+                    columns = reader.fieldnames or []
+                    if not columns:
+                        return []
+                    if len(columns) == 1 and ";" in columns[0] and dialect.get("sep") != ";":
+                        dialect = self._sniff_csv_dialect(path)
+                        continue
+
+                    segment_col = self._pick_column(columns, ["client_segment", "segment", "cluster", "group"])
+                    price_col = self._pick_column(
+                        columns,
+                        [
+                            "recommended_price",
+                            "optimal_price",
+                            "optimal_price_recommendation",
+                            "price_recommendation",
+                            "recommended_price_value",
+                        ],
+                    )
+                    prob_col = self._pick_column(
+                        columns,
+                        [
+                            "predicted_success_prob",
+                            "predicted_probability",
+                            "success_prob",
+                            "probability",
+                        ],
+                    )
+                    expected_rev_col = self._pick_column(
+                        columns,
+                        [
+                            "expected_revenue",
+                            "expected_value",
+                            "expected_rev",
+                            "expected_profit",
+                        ],
+                    )
+
+                    if not segment_col:
+                        return []
+
+                    buckets: Dict[str, Dict[str, List[float] | int]] = {}
+                    for row in reader:
+                        seg_raw = row.get(segment_col)
+                        if seg_raw is None or seg_raw == "":
+                            continue
+                        seg_key = str(seg_raw).strip()
+                        if seg_key not in buckets:
+                            buckets[seg_key] = {
+                                "count": 0,
+                                "prices": [],
+                                "probs": [],
+                                "revenues": [],
+                            }
+                        bucket = buckets[seg_key]
+                        bucket["count"] = int(bucket["count"]) + 1
+                        if price_col:
+                            price_val = self._coerce_number(row.get(price_col), decimal)
+                            if price_val is not None:
+                                bucket["prices"].append(price_val)
+                        if prob_col:
+                            prob_val = self._coerce_number(row.get(prob_col), decimal)
+                            if prob_val is not None:
+                                bucket["probs"].append(prob_val)
+                        if expected_rev_col:
+                            rev_val = self._coerce_number(row.get(expected_rev_col), decimal)
+                            if rev_val is not None:
+                                bucket["revenues"].append(rev_val)
+
+                    summary = []
+                    for segment, bucket in buckets.items():
+                        prices = bucket["prices"]
+                        probs = bucket["probs"]
+                        revenues = bucket["revenues"]
+                        optimal_price = float(median(prices)) if prices else None
+                        mean_prob = float(sum(probs) / len(probs)) if probs else None
+                        mean_rev = float(sum(revenues) / len(revenues)) if revenues else None
+                        summary.append(
+                            {
+                                "segment": segment,
+                                "n": int(bucket["count"]),
+                                "optimal_price": optimal_price,
+                                "mean_prob": mean_prob,
+                                "mean_expected_revenue": mean_rev,
+                            }
+                        )
+                    return summary
+            except Exception:
+                return []
+        return []
+
+    def _extract_leakage_audit(self, alignment_payload: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(alignment_payload, dict):
+            return None
+
+        def _normalize(candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            if not isinstance(candidate, dict):
+                return None
+            feature = candidate.get("feature") or candidate.get("column") or candidate.get("field")
+            target = candidate.get("target") or candidate.get("label") or candidate.get("outcome")
+            corr = (
+                candidate.get("correlation_coefficient")
+                or candidate.get("correlation")
+                or candidate.get("corr")
+                or candidate.get("spearman")
+                or candidate.get("pearson")
+            )
+            threshold = candidate.get("threshold") or candidate.get("corr_threshold")
+            action = candidate.get("action_taken") or candidate.get("action") or candidate.get("action_if_exceeds")
+            if corr is None and feature is None and target is None:
+                return None
+            return {
+                "feature": feature,
+                "target": target,
+                "correlation": corr,
+                "threshold": threshold,
+                "action_taken": action,
+            }
+
+        for key in ("leakage_audit", "leakage", "leakage_check"):
+            candidate = alignment_payload.get(key)
+            if isinstance(candidate, dict):
+                normalized = _normalize(candidate)
+                if normalized:
+                    return normalized
+
+        requirements = alignment_payload.get("requirements")
+        if isinstance(requirements, list):
+            for req in requirements:
+                if not isinstance(req, dict):
+                    continue
+                name = str(req.get("name") or req.get("id") or "")
+                if "leak" not in name.lower():
+                    continue
+                evidence = req.get("evidence")
+                if isinstance(evidence, dict):
+                    normalized = _normalize(evidence)
+                    if normalized:
+                        return normalized
+                normalized = _normalize(req)
+                if normalized:
+                    return normalized
+
+        return None
 
     def _normalize_artifact_index(self, entries: List[Any]) -> List[Dict[str, Any]]:
         normalized: List[Dict[str, Any]] = []

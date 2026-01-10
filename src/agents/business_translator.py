@@ -639,6 +639,13 @@ class BusinessTranslatorAgent:
         If Alignment Check is WARN or FAIL, explicitly state the limitation and whether it is data-limited
         or method-choice, and reflect it in Risks & Limitations.
 
+        SELF-CHECK (REQUIRED, FINAL LINES):
+        - If insights.segment_pricing_summary exists and is non-empty, print 3-6 lines with segment -> optimal_price.
+        - If missing/empty, write exactly: "No disponible (falta segment_pricing_summary en insights.json)".
+        - If insights.leakage_audit.correlation exists, print the correlation value and cite alignment_check.json.
+        - If missing, write exactly: "No disponible (alignment_check no incluye correlación)".
+        Do NOT invent values.
+
         OUTPUT: Markdown format (NO TABLES).
         """)
         
