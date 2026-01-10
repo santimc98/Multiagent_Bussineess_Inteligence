@@ -407,21 +407,43 @@ class MLEngineerAgent:
         HARD CONSTRAINTS (VIOLATION = FAILURE)
         1) OUTPUT VALID PYTHON CODE ONLY (no markdown, no code fences, no JSON-only plans).
         2) If RUNTIME_ERROR_CONTEXT is present in the audit, fix root cause and regenerate the FULL script.
-        3) CRITICAL - INPUT PATH: You MUST read data from the EXACT path '$data_path' provided in the context.
-           - CORRECT: INPUT_FILE = '$data_path' then df = pd.read_csv(INPUT_FILE, ...)
+        3) CRITICAL - DIALECT LOADING (DO THIS FIRST): Before loading ANY data, you MUST load the output_dialect from cleaning_manifest.json.
+           - MANDATORY FIRST STEP: Define a load_dialect() function that reads 'data/cleaning_manifest.json' and extracts output_dialect {sep, decimal, encoding}.
+           - CORRECT pattern:
+             ```python
+             def load_dialect():
+                 manifest_path = 'data/cleaning_manifest.json'
+                 if os.path.exists(manifest_path):
+                     with open(manifest_path, 'r') as f:
+                         manifest = json.load(f)
+                     dialect = manifest.get('output_dialect', {})
+                     return (
+                         dialect.get('sep', ';'),
+                         dialect.get('decimal', ','),
+                         dialect.get('encoding', 'utf-8')
+                     )
+                 return ';', ',', 'utf-8'
+
+             sep, decimal, encoding = load_dialect()
+             ```
+           - Then use these values in ALL pd.read_csv() and .to_csv() calls.
+           - DO NOT hardcode sep=',', decimal='.', or any other dialect values. ALWAYS read from manifest first.
+           - Fallback ONLY if manifest doesn't exist: use the defaults shown above.
+        4) CRITICAL - INPUT PATH: You MUST read data from the EXACT path '$data_path' provided in the context.
+           - CORRECT: INPUT_FILE = '$data_path' then df = pd.read_csv(INPUT_FILE, sep=sep, decimal=decimal, encoding=encoding, ...)
            - WRONG: Using hardcoded paths like 'data.csv', 'input.csv', 'raw_data.csv', 'data/input_data.csv', etc.
+           - WRONG: pd.read_csv(INPUT_FILE) without dialect parameters
            - The $data_path variable will be substituted with the actual path (e.g., 'data/cleaned_data.csv').
            - ABSOLUTE PROHIBITION: Do NOT implement fallback logic like "if not os.path.exists(filepath): generate dummy data".
              The file WILL exist. If it doesn't, let pd.read_csv() raise FileNotFoundError. NO synthetic fallbacks.
-        4) Do NOT invent column names. Use only columns from the contract/canonical list and the loaded dataset.
-        5) Do NOT mutate the input dataframe in-place. Use df_in for the raw load. If you need derived columns, create df_work = df_in.copy() and assign ONLY columns explicitly declared as derived in the Execution Contract (data_requirements with source='derived' or spec_extraction.derived_columns). If a required input column is missing, raise ValueError (no dummy values).
-        6) NEVER create DataFrames from literals (pd.DataFrame({}), from_dict, or lists/tuples). No np.random/random/faker.
+        5) Do NOT invent column names. Use only columns from the contract/canonical list and the loaded dataset.
+        6) Do NOT mutate the input dataframe in-place. Use df_in for the raw load. If you need derived columns, create df_work = df_in.copy() and assign ONLY columns explicitly declared as derived in the Execution Contract (data_requirements with source='derived' or spec_extraction.derived_columns). If a required input column is missing, raise ValueError (no dummy values).
+        7) NEVER create DataFrames from literals (pd.DataFrame({}), from_dict, or lists/tuples). No np.random/random/faker.
            ABSOLUTE PROHIBITION: NO synthetic data generation under ANY circumstance (not even as "demonstration" or "example").
-        7) scored_rows.csv may include canonical columns plus contract-approved derived outputs (target/prediction/probability/segment/optimal values) ONLY if explicitly declared in data_requirements or spec_extraction. Any other derived columns must go to a separate artifact file.
-        8) Start the script with a short comment block labeled PLAN describing: detected columns, row_id construction, scored_rows columns, and where extra derived artifacts go.
-        9) Define CONTRACT_COLUMNS from the Execution Contract (prefer data_requirements source=input; else canonical_columns) and validate they exist in df_in; raise ValueError listing missing columns.
-        10) LEAKAGE ZERO-TOLERANCE: Check 'allowed_feature_sets' in the contract. Any column listed as 'audit_only_features' or 'forbidden_for_modeling' MUST be excluded from X (features). Use them ONLY for audit/metrics calculation. Violation = REJECTION.
-        11) OUTPUT DIALECT OBEDIENCE: When using .to_csv(), YOU MUST explicitly use the separators provided in 'output_dialect' (sep, decimal, encoding). DO NOT rely on defaults. Example: df.to_csv(path, sep=output_dialect['sep'], decimal=output_dialect['decimal'], index=False).
+        8) scored_rows.csv may include canonical columns plus contract-approved derived outputs (target/prediction/probability/segment/optimal values) ONLY if explicitly declared in data_requirements or spec_extraction. Any other derived columns must go to a separate artifact file.
+        9) Start the script with a short comment block labeled PLAN describing: (1) dialect loading from cleaning_manifest.json, (2) detected columns, (3) row_id construction, (4) scored_rows columns, and (5) where extra derived artifacts go.
+        10) Define CONTRACT_COLUMNS from the Execution Contract (prefer data_requirements source=input; else canonical_columns) and validate they exist in df_in; raise ValueError listing missing columns.
+        11) LEAKAGE ZERO-TOLERANCE: Check 'allowed_feature_sets' in the contract. Any column listed as 'audit_only_features' or 'forbidden_for_modeling' MUST be excluded from X (features). Use them ONLY for audit/metrics calculation. Violation = REJECTION.
         
         UNIVERSAL FEATURE USAGE RULE (CONTRACT-DRIVEN):
         - Each phase (segmentation/modeling/optimization) MUST use ONLY features allowed by the contract.
@@ -539,25 +561,38 @@ class MLEngineerAgent:
           ✅ OK: Outcome ~ [F1, F2]; then model effect of decision_variable within segments.
           ❌ FAIL: features = [F1, F2, decision_variable].
 
-        DIALECT CONTRACT (MANDATORY - DO NOT SKIP)
-        - ALWAYS read 'data/cleaning_manifest.json' first to get output_dialect (sep, encoding, decimal).
-        - Use: dialect = json.load(open('data/cleaning_manifest.json')).get('output_dialect', {})
-        - Apply: pd.read_csv('data/cleaned_data.csv', sep=dialect.get('sep', ','), decimal=dialect.get('decimal', '.'), encoding=dialect.get('encoding', 'utf-8'))
-        - Fallback ONLY if manifest doesn't exist: Enc='$csv_encoding', Sep='$csv_sep', Decimal='$csv_decimal'.
-        - DO NOT hardcode sep=';' or decimal=',' - these vary per dataset!
-        - After loading:
+        SENIOR WORKFLOW (do this, not a checklist)
+        Step 0) LOAD DIALECT FIRST (MANDATORY):
+        - BEFORE any data loading, define load_dialect() function and call it to get (sep, decimal, encoding).
+        - Pattern (copy this exactly):
+          def load_dialect():
+              manifest_path = 'data/cleaning_manifest.json'
+              if os.path.exists(manifest_path):
+                  with open(manifest_path, 'r') as f:
+                      manifest = json.load(f)
+                  dialect = manifest.get('output_dialect', {})
+                  return (
+                      dialect.get('sep', ';'),
+                      dialect.get('decimal', ','),
+                      dialect.get('encoding', 'utf-8')
+                  )
+              return ';', ',', 'utf-8'
+
+          sep, decimal, encoding = load_dialect()
+          print(f"Loading data with dialect: sep='{sep}', decimal='{decimal}', encoding='{encoding}'")
+        - Use these values in ALL pd.read_csv() and .to_csv() calls throughout the script.
+        - After loading data:
           - If df is empty: raise ValueError including the dialect used.
           - If df has 1 column and the column name contains ',', ';', or '\\t' AND length>20: raise ValueError("Delimiter/Dialect mismatch: ...") including the dialect used.
-        - Do NOT attempt to split columns.
+        - Do NOT attempt to split columns or change dialect mid-script.
 
-        SENIOR WORKFLOW (do this, not a checklist)
-        Step 0) Feasibility gate:
+        Step 1) Feasibility gate:
         - Identify target from contract/spec_extraction. If missing/unmappable -> raise ValueError with a clear message.
         - Build y as a pandas Series and enforce ONE variance guard:
         if y.nunique() <= 1: raise ValueError("CRITICAL: Target variable has no variation.")
         - Never add noise/jitter.
 
-        Step 1) Diagnose the dataset quickly:
+        Step 2) Diagnose the dataset quickly:
         - Determine task type (classification/regression) and key risks:
         missingness, high-cardinality categoricals, suspected IDs, leakage/post-outcome features (use availability + semantics).
         - If the contract marks any columns as post-decision/post-outcome/leakage_risk, never include them as model features; record them in a leakage audit note.
@@ -565,27 +600,27 @@ class MLEngineerAgent:
         - Probability columns (e.g., Probability/prob/score) are audit-only; NEVER use for segmentation or modeling.
           For audit stats, use dropna on the joined sample; do not impute with zeros.
 
-        Step 1.5) Segmentation sanity (required if segmentation is used):
+        Step 2.5) Segmentation sanity (required if segmentation is used):
         - Compute and log: n_rows, n_segments, min/median segment_size.
         - Respect execution_contract.segmentation_constraints (max_segments, min_segment_size, preferred_k_range).
         - If constraints violated, reduce k, or use quantile binning for numerics, top-K + "Other" for categoricals,
           or fallback to a coarser segmentation (never 1-row-per-segment).
         - Do NOT create segment_id by concatenating raw columns if it yields unique IDs per row.
 
-        Step 2) Decide validation correctly:
+        Step 3) Decide validation correctly:
         - If objective_type == "forecasting" or requires_time_series_split=true -> use TimeSeriesSplit or chronological holdout (shuffle=False). Do NOT use random KFold.
         - If the contract/spec indicates group_key OR you infer a grouping vector -> use GroupKFold or GroupShuffleSplit (or CV with groups=...).
         - Else if time_key or time ordering matters -> use a time-based split.
         - Else -> StratifiedKFold (classification) or KFold (regression).
         - Never evaluate on training data.
 
-        Step 3) Implement with pipelines (default):
+        Step 4) Implement with pipelines (default):
         - Use sklearn Pipeline + ColumnTransformer for preprocessing.
         - Numeric: imputer (+ scaler if needed).
         - Categorical: imputer + OneHotEncoder(handle_unknown='ignore', sparse_output=False).
         - Apply a high-cardinality safeguard when needed (e.g., limit top-K categories or hashing) without leakage.
 
-        Step 4) Models (default behavior):
+        Step 5) Models (default behavior):
         - Always include:
         - A baseline (simple, interpretable).
         - A stronger model (more expressive) appropriate for dataset size and task.
@@ -598,7 +633,7 @@ class MLEngineerAgent:
         - CRITICAL: best_model_auc must match the AUC of best_model_name (never mix models).
         - Pattern: if lr_auc > rf_auc: best_name="LR", best_auc=lr_auc (NOT rf_auc).
 
-        Step 5) Contract compliance outputs:
+        Step 6) Contract compliance outputs:
         - Do NOT invent global rules. Use execution_contract to decide:
         - which columns to use (pre-decision vs post-outcome),
         - required artifacts,

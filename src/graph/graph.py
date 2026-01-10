@@ -1778,6 +1778,24 @@ def _expand_required_fixes(required_fixes: List[Any] | None, failed_gates: List[
         "DF_COLUMN_ASSIGNMENT_FORBIDDEN": [
             "Do not assign new columns into df; use Pipeline/ColumnTransformer or write derived columns to separate artifacts.",
         ],
+        "DIALECT_LOADING_MISSING": [
+            "CRITICAL: You MUST load output_dialect from 'data/cleaning_manifest.json' BEFORE loading any CSV data.",
+            "Define a load_dialect() function that reads cleaning_manifest.json and extracts {sep, decimal, encoding}.",
+            "Then use: sep, decimal, encoding = load_dialect() and apply them to ALL pd.read_csv() and .to_csv() calls.",
+            "NEVER hardcode sep=',', decimal='.', or other dialect values. Always read from manifest first.",
+            "Example pattern:",
+            "  def load_dialect():",
+            "      manifest_path = 'data/cleaning_manifest.json'",
+            "      if os.path.exists(manifest_path):",
+            "          with open(manifest_path, 'r') as f:",
+            "              manifest = json.load(f)",
+            "          dialect = manifest.get('output_dialect', {})",
+            "          return dialect.get('sep', ';'), dialect.get('decimal', ','), dialect.get('encoding', 'utf-8')",
+            "      return ';', ',', 'utf-8'",
+            "",
+            "  sep, decimal, encoding = load_dialect()",
+            "  df = pd.read_csv(INPUT_FILE, sep=sep, decimal=decimal, encoding=encoding)",
+        ],
         "IMPUTER_REQUIRED": [
             "Include SimpleImputer in the preprocessing pipeline before modeling.",
         ],
@@ -2325,6 +2343,31 @@ def ml_quality_preflight(
         # If using models that DON'T handle NaN natively and NO imputation/dropna found
         if not (has_imputer or has_nan_robust_model or has_dropna):
             issues.append("IMPUTER_REQUIRED")
+
+    # CRITICAL: Check for dialect loading from cleaning_manifest.json
+    # ML Engineer MUST read output_dialect before loading data
+    has_load_dialect_function = "def load_dialect" in code
+    has_manifest_read = "cleaning_manifest.json" in code and ("json.load" in code or "pd.read_json" in code)
+    has_dialect_extraction = "output_dialect" in code and "manifest" in code_lower
+
+    # Check if pd.read_csv is called with dialect parameters
+    has_read_csv_with_dialect = False
+    if "pd.read_csv" in code or "pandas.read_csv" in code:
+        # Check if sep= and decimal= are used (not just hardcoded defaults)
+        read_csv_calls = code.split("pd.read_csv")
+        for call in read_csv_calls[1:]:  # Skip the first split (before first read_csv)
+            # Look for sep= and decimal= in the next 200 characters
+            snippet = call[:200]
+            has_sep = "sep=" in snippet and "sep=sep" in snippet.replace(" ", "")
+            has_decimal = "decimal=" in snippet and "decimal=decimal" in snippet.replace(" ", "")
+            if has_sep or has_decimal:
+                has_read_csv_with_dialect = True
+                break
+
+    # If data loading exists but no dialect loading, flag it
+    if ("pd.read_csv" in code or "pandas.read_csv" in code):
+        if not (has_load_dialect_function or (has_manifest_read and has_dialect_extraction) or has_read_csv_with_dialect):
+            issues.append("DIALECT_LOADING_MISSING")
 
     if allowed_columns:
         unknown_cols = _detect_unknown_columns(code, allowed_columns, allowed_patterns)
@@ -4171,6 +4214,8 @@ def _suggest_next_actions(
         actions.append("Avoid df column assignments; use Pipeline/ColumnTransformer or separate artifacts.")
     if "UNKNOWN_COLUMNS_REFERENCED" in issues or "unknown_columns" in reasons:
         actions.append("Use only contract/canonical columns; avoid invented names.")
+    if "DIALECT_LOADING_MISSING" in issues:
+        actions.append("CRITICAL: Define load_dialect() function and read output_dialect from 'data/cleaning_manifest.json' before ANY data loading.")
     if "BASELINE_REQUIRED" in issues or "baseline_missing" in reasons:
         actions.append("Add a DummyClassifier/DummyRegressor baseline with metrics.")
     if "IMPUTER_REQUIRED" in issues or "imputer_missing" in reasons:
