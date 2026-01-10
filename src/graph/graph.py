@@ -28,7 +28,7 @@ from src.agents.data_engineer import DataEngineerAgent
 from src.agents.cleaning_reviewer import CleaningReviewerAgent
 from src.agents.reviewer import ReviewerAgent
 from src.agents.qa_reviewer import QAReviewerAgent, collect_static_qa_facts, run_static_qa_checks # New QA Gate
-from src.agents.execution_planner import ExecutionPlannerAgent, build_execution_plan, build_dataset_profile
+from src.agents.execution_planner import ExecutionPlannerAgent, build_execution_plan, build_dataset_profile, build_reporting_policy
 from src.agents.failure_explainer import FailureExplainerAgent
 from src.agents.results_advisor import ResultsAdvisorAgent
 from src.utils.pdf_generator import convert_report_to_pdf
@@ -5083,6 +5083,13 @@ def run_execution_planner(state: AgentState) -> AgentState:
     execution_plan = build_execution_plan(str(objective_type or "unknown"), dataset_profile)
     if isinstance(contract, dict):
         contract["execution_plan"] = execution_plan
+    reporting_policy = {}
+    try:
+        reporting_policy = build_reporting_policy(execution_plan, strategy)
+    except Exception:
+        reporting_policy = {}
+    if isinstance(contract, dict) and reporting_policy:
+        contract["reporting_policy"] = reporting_policy
     evaluation_spec = {}
     try:
         evaluation_spec = execution_planner.generate_evaluation_spec(
@@ -5112,6 +5119,8 @@ def run_execution_planner(state: AgentState) -> AgentState:
             )
         except Exception:
             contract_min = None
+    if isinstance(contract_min, dict) and reporting_policy:
+        contract_min["reporting_policy"] = reporting_policy
     try:
         os.makedirs("data", exist_ok=True)
         with open("data/execution_contract.json", "w", encoding="utf-8") as f:
@@ -8655,6 +8664,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             "review_feedback": feedback,
             "metrics": metrics_report,
             "strategy_spec": strategy_spec,
+            "reporting_policy": contract.get("reporting_policy", {}) if isinstance(contract, dict) else {},
         }
         insights = results_advisor.generate_insights(insights_context)
         if insights:

@@ -9,8 +9,13 @@ load_dotenv()
 from string import Template
 import json
 from typing import Dict, Any, Optional, List
-import csv
 from src.utils.prompting import render_prompt
+from src.utils.csv_dialect import (
+    load_output_dialect,
+    sniff_csv_dialect,
+    read_csv_sample,
+    coerce_number,
+)
 
 
 def _safe_load_json(path: str):
@@ -57,20 +62,20 @@ def _facts_from_insights(insights: Dict[str, Any], max_items: int = 8):
 
 def _safe_load_csv(path: str, max_rows: int = 200):
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            rows = []
-            for _, row in zip(range(max_rows), reader):
-                rows.append(row)
-            return {
-                "columns": reader.fieldnames or [],
-                "rows": rows,
-                "row_count_sampled": len(rows),
-            }
+        dialect = load_output_dialect() or sniff_csv_dialect(path)
+        sample = read_csv_sample(path, dialect, max_rows)
+        if not sample:
+            return None
+        columns = sample.get("columns", [])
+        if isinstance(columns, list) and len(columns) == 1 and ";" in columns[0]:
+            sniffed = sniff_csv_dialect(path)
+            if sniffed.get("sep") != dialect.get("sep"):
+                sample = read_csv_sample(path, sniffed, max_rows)
+        return sample
     except Exception:
         return None
 
-def _summarize_numeric_columns(rows: List[Dict[str, Any]], columns: List[str], max_cols: int = 12):
+def _summarize_numeric_columns(rows: List[Dict[str, Any]], columns: List[str], decimal: str, max_cols: int = 12):
     numeric_summary = {}
     for col in columns:
         values = []
@@ -78,10 +83,9 @@ def _summarize_numeric_columns(rows: List[Dict[str, Any]], columns: List[str], m
             raw = row.get(col)
             if raw is None or raw == "":
                 continue
-            try:
-                values.append(float(str(raw).replace(",", ".")))
-            except Exception:
-                continue
+            num = coerce_number(raw, decimal)
+            if num is not None:
+                values.append(num)
         if values:
             numeric_summary[col] = {
                 "min": min(values),
@@ -93,7 +97,7 @@ def _summarize_numeric_columns(rows: List[Dict[str, Any]], columns: List[str], m
             break
     return numeric_summary
 
-def _pick_top_examples(rows: List[Dict[str, Any]], columns: List[str], value_keys: List[str], label_keys: List[str], max_rows: int = 3):
+def _pick_top_examples(rows: List[Dict[str, Any]], columns: List[str], value_keys: List[str], label_keys: List[str], decimal: str, max_rows: int = 3):
     if not rows or not columns:
         return None
     value_key = None
@@ -107,10 +111,7 @@ def _pick_top_examples(rows: List[Dict[str, Any]], columns: List[str], value_key
         raw = row.get(value_key)
         if raw is None or raw == "":
             return None
-        try:
-            return float(str(raw).replace(",", "."))
-        except Exception:
-            return None
+        return coerce_number(raw, decimal)
     scored = []
     for row in rows:
         val = _coerce_num(row)
@@ -377,8 +378,9 @@ class BusinessTranslatorAgent:
                 return "No case summary artifact."
             columns = case_summary.get("columns", [])
             rows = case_summary.get("rows", [])
-            numeric_summary = _summarize_numeric_columns(rows, columns)
-            examples = _pick_top_examples(rows, columns, value_keys=columns, label_keys=columns)
+            decimal = (case_summary.get("dialect_used") or {}).get("decimal") or "."
+            numeric_summary = _summarize_numeric_columns(rows, columns, decimal)
+            examples = _pick_top_examples(rows, columns, value_keys=columns, label_keys=columns, decimal=decimal)
             return {
                 "row_count_sampled": case_summary.get("row_count_sampled", 0),
                 "columns": columns,
@@ -391,8 +393,9 @@ class BusinessTranslatorAgent:
                 return "No predictions artifact."
             columns = scored_rows.get("columns", [])
             rows = scored_rows.get("rows", [])
-            numeric_summary = _summarize_numeric_columns(rows, columns)
-            examples = _pick_top_examples(rows, columns, value_keys=columns, label_keys=columns)
+            decimal = (scored_rows.get("dialect_used") or {}).get("decimal") or "."
+            numeric_summary = _summarize_numeric_columns(rows, columns, decimal)
+            examples = _pick_top_examples(rows, columns, value_keys=columns, label_keys=columns, decimal=decimal)
             return {
                 "row_count_sampled": scored_rows.get("row_count_sampled", 0),
                 "columns": columns,
@@ -530,6 +533,41 @@ class BusinessTranslatorAgent:
         facts_context = _facts_from_insights(insights) or _build_fact_cards(case_summary_context, scored_rows_context, weights_context, data_adequacy_context)
         artifacts_context = artifact_index if artifact_index else []
         reporting_policy_context = contract.get("reporting_policy", {}) if isinstance(contract, dict) else {}
+        slot_payloads = {}
+        if isinstance(insights, dict):
+            slot_payloads = insights.get("slot_payloads") or {}
+            if not slot_payloads:
+                if insights.get("metrics_summary"):
+                    slot_payloads["model_metrics"] = insights.get("metrics_summary")
+                if insights.get("predictions_summary"):
+                    slot_payloads["predictions_overview"] = insights.get("predictions_summary")
+                if insights.get("segment_pricing_summary"):
+                    slot_payloads["segment_pricing"] = insights.get("segment_pricing_summary")
+                if insights.get("leakage_audit"):
+                    slot_payloads["alignment_risks"] = insights.get("leakage_audit")
+
+        slot_defs = reporting_policy_context.get("slots", []) if isinstance(reporting_policy_context, dict) else []
+        missing_required_slots = []
+        if isinstance(slot_defs, list):
+            for slot in slot_defs:
+                if not isinstance(slot, dict):
+                    continue
+                if slot.get("mode") != "required":
+                    continue
+                slot_id = slot.get("id")
+                insights_key = slot.get("insights_key")
+                payload = slot_payloads.get(slot_id) if slot_id else None
+                if payload is None and insights_key and isinstance(insights, dict):
+                    payload = insights.get(insights_key)
+                if payload:
+                    continue
+                missing_required_slots.append(
+                    {"id": slot_id, "sources": slot.get("sources", []), "insights_key": insights_key}
+                )
+        slot_coverage_context = {
+            "slot_payloads": slot_payloads,
+            "missing_required_slots": missing_required_slots,
+        }
 
         # Define Template
         SYSTEM_PROMPT_TEMPLATE = Template("""
@@ -573,6 +611,8 @@ class BusinessTranslatorAgent:
         - Artifacts Available: $artifacts_context
         - Recommendations Preview: $recommendations_preview_context
         - Reporting Policy: $reporting_policy_context
+        - Slot Payloads: $slot_payloads_context
+        - Slot Coverage: $slot_coverage_context
 
         GUIDANCE:
         - Use Insights as the primary evidence source; only reference other artifacts if they add clear value.
@@ -582,6 +622,11 @@ class BusinessTranslatorAgent:
           If items are empty, explain why using recommendations_preview.reason and mention which artifact was missing.
         - If run_outcome is GO, you may include a short "Recommendations Snapshot" section if recommendations_preview.items exists,
           without the "illustrative" labeling.
+        - Slot-driven reporting:
+          For each slot in reporting_policy.slots:
+            * if mode == "required": include it using evidence (payload or artifact); if missing => write "No disponible" and cite missing sources.
+            * if mode == "conditional" or "optional": include only if payload exists; otherwise omit without inventing.
+          Structure the report using reporting_policy.sections order; do not add sections outside that list.
 
         ERROR CONDITION:
         $error_condition
@@ -639,14 +684,7 @@ class BusinessTranslatorAgent:
         If Alignment Check is WARN or FAIL, explicitly state the limitation and whether it is data-limited
         or method-choice, and reflect it in Risks & Limitations.
 
-        SELF-CHECK (REQUIRED, FINAL LINES):
-        - If insights.segment_pricing_summary exists and is non-empty, print 3-6 lines with segment -> optimal_price.
-        - If missing/empty, write exactly: "No disponible (falta segment_pricing_summary en insights.json)".
-        - If insights.leakage_audit.correlation exists, print the correlation value and cite alignment_check.json.
-        - If missing, write exactly: "No disponible (alignment_check no incluye correlación)".
-        Do NOT invent values.
-
-        OUTPUT: Markdown format (NO TABLES).
+                OUTPUT: Markdown format (NO TABLES).
         """)
         
         error_condition_str = f"CRITICAL ERROR ENCOUNTERED: {error_message}" if error_message else "No critical errors."
@@ -680,7 +718,9 @@ class BusinessTranslatorAgent:
             plot_insights_json=json.dumps(plot_insights, ensure_ascii=False),
             artifacts_context=json.dumps(artifacts_context, ensure_ascii=False),
             recommendations_preview_context=json.dumps(recommendations_preview, ensure_ascii=False),
-            reporting_policy_context=json.dumps(reporting_policy_context, ensure_ascii=False)
+            reporting_policy_context=json.dumps(reporting_policy_context, ensure_ascii=False),
+            slot_payloads_context=json.dumps(slot_payloads, ensure_ascii=False),
+            slot_coverage_context=json.dumps(slot_coverage_context, ensure_ascii=False),
         )
         
         # Execution Results
@@ -695,8 +735,7 @@ class BusinessTranslatorAgent:
         *** INSTRUCTIONS ***
         Use ONLY the structured context provided in the system prompt above.
         Do NOT invent numbers or claims not supported by the artifacts.
-        For optimization/pricing problems, YOU MUST include specific optimal values per segment.
-        For leakage audits, STATE THE CORRELATION VALUE explicitly (e.g., 0.9786).
+        Follow reporting_policy.slots. If a required slot is missing, write "No disponible" and cite missing sources.
         Cite source artifact names for all metrics (e.g., "Fuente: metrics.json").
         """
 

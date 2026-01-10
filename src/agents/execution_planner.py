@@ -569,6 +569,12 @@ def build_contract_min(
         "Ignored by default unless promoted by strategy/explicit mention; available via column_inventory."
     )
 
+    reporting_policy = contract.get("reporting_policy")
+    if not isinstance(reporting_policy, dict) or not reporting_policy:
+        execution_plan = contract.get("execution_plan")
+        if isinstance(execution_plan, dict):
+            reporting_policy = build_reporting_policy(execution_plan, strategy_dict)
+
     return {
         "contract_version": contract.get("contract_version", 2),
         "strategy_title": contract.get("strategy_title") or strategy_dict.get("title", ""),
@@ -599,6 +605,7 @@ def build_contract_min(
         "data_engineer_runbook": data_engineer_runbook,
         "ml_engineer_runbook": ml_engineer_runbook,
         "omitted_columns_policy": omitted_columns_policy,
+        "reporting_policy": reporting_policy or {},
     }
 
 
@@ -981,6 +988,71 @@ def build_execution_plan(objective_type: str, dataset_profile: Dict[str, Any]) -
         "gates": gates,
         "outputs": outputs,
     }
+
+
+def build_reporting_policy(
+    execution_plan: Dict[str, Any] | None,
+    strategy: Dict[str, Any] | None = None,
+    run_context: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    outputs = execution_plan.get("outputs", []) if isinstance(execution_plan, dict) else []
+    output_types = {
+        str(item.get("artifact_type"))
+        for item in outputs
+        if isinstance(item, dict) and item.get("artifact_type")
+    }
+
+    slots: List[Dict[str, Any]] = []
+
+    def _add_slot(slot_id: str, mode: str, insights_key: str, sources: List[str] | None = None) -> None:
+        if not slot_id or any(slot.get("id") == slot_id for slot in slots):
+            return
+        slot = {
+            "id": slot_id,
+            "mode": mode,
+            "insights_key": insights_key,
+            "sources": sources or [],
+        }
+        slots.append(slot)
+
+    if "metrics" in output_types:
+        _add_slot("model_metrics", "required", "metrics_summary", ["data/metrics.json"])
+    if "predictions" in output_types:
+        _add_slot("predictions_overview", "conditional", "predictions_summary", ["data/scored_rows.csv"])
+    if "feature_importances" in output_types:
+        _add_slot("explainability", "optional", "feature_importances_summary", [])
+    if "error_analysis" in output_types:
+        _add_slot("error_analysis", "optional", "error_summary", [])
+    if "forecast" in output_types:
+        _add_slot("forecast_summary", "required", "forecast_summary", [])
+    if "ranking_scores" in output_types:
+        _add_slot("ranking_top", "required", "ranking_summary", [])
+
+    _add_slot("alignment_risks", "conditional", "leakage_audit", ["data/alignment_check.json"])
+    _add_slot("segment_pricing", "conditional", "segment_pricing_summary", ["data/scored_rows.csv"])
+
+    policy = {
+        "audience": "executive",
+        "language": "auto",
+        "sections": [
+            "decision",
+            "objective_approach",
+            "evidence_metrics",
+            "business_impact",
+            "risks_limitations",
+            "next_actions",
+            "visual_insights",
+        ],
+        "slots": slots,
+        "constraints": {"no_markdown_tables": True},
+    }
+
+    policy.setdefault("demonstrative_examples_enabled", True)
+    policy.setdefault("demonstrative_examples_when_outcome_in", ["NO_GO", "GO_WITH_LIMITATIONS"])
+    policy.setdefault("max_examples", 5)
+    policy.setdefault("require_strong_disclaimer", True)
+
+    return policy
 
 
 class ExecutionPlannerAgent:

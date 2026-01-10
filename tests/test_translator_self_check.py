@@ -23,5 +23,5 @@ def test_translator_self_check_instructions_present(tmp_path, monkeypatch):
     report = agent.generate_report(
         {"execution_output": "OK", "business_objective": "Objetivo de prueba"}
     )
-    assert "No disponible (falta segment_pricing_summary en insights.json)" in report
-    assert "No disponible (alignment_check no incluye correlación)" in report
+    assert "Slot Coverage" in report
+    assert "reporting_policy" in report

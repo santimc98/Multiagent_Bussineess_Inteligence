@@ -92,6 +92,10 @@ class ResultsAdvisorAgent:
             ]
         objective_type = context.get("objective_type") or context.get("strategy_spec", {}).get("objective_type") or "unknown"
 
+        reporting_policy = context.get("reporting_policy") if isinstance(context, dict) else {}
+        slot_defs = reporting_policy.get("slots", []) if isinstance(reporting_policy, dict) else []
+        allowed_slots = {slot.get("id") for slot in slot_defs if isinstance(slot, dict) and slot.get("id")}
+
         metrics_artifacts = self._find_artifacts_by_type(artifact_index, "metrics")
         predictions_artifacts = self._find_artifacts_by_type(artifact_index, "predictions")
         error_artifacts = self._find_artifacts_by_type(artifact_index, "error_analysis")
@@ -150,6 +154,18 @@ class ResultsAdvisorAgent:
         segment_pricing_summary = self._build_segment_pricing_summary(predictions_artifacts[0]) if predictions_artifacts else []
         leakage_audit = self._extract_leakage_audit(alignment_payload)
 
+        slot_payloads = {}
+        if metrics_summary:
+            slot_payloads["model_metrics"] = metrics_summary
+        if predictions_summary:
+            slot_payloads["predictions_overview"] = predictions_summary
+        if segment_pricing_summary:
+            slot_payloads["segment_pricing"] = segment_pricing_summary
+        if leakage_audit:
+            slot_payloads["alignment_risks"] = leakage_audit
+        if allowed_slots:
+            slot_payloads = {k: v for k, v in slot_payloads.items() if k in allowed_slots}
+
         insights = {
             "schema_version": "1",
             "objective_type": objective_type,
@@ -159,6 +175,7 @@ class ResultsAdvisorAgent:
             "overall_scored_rows_row_count": predictions_summary.get("row_count") if isinstance(predictions_summary, dict) else None,
             "segment_pricing_summary": segment_pricing_summary,
             "leakage_audit": leakage_audit,
+            "slot_payloads": slot_payloads,
             "risks": risks,
             "recommendations": recommendations,
             "summary_lines": summary_lines,
