@@ -44,6 +44,10 @@ from src.utils.cleaning_validation import (
     detect_destructive_conversions,
     format_issue_report,
 )
+from src.utils.cleaning_guards import (
+    detect_identifier_scientific_notation,
+    is_identifier_like,
+)
 from src.utils.integrity_audit import run_integrity_audit
 from src.utils.output_contract import check_required_outputs
 from src.utils.sandbox_deps import (
@@ -114,6 +118,55 @@ from src.utils.json_sanitize import dump_json
 
 def _norm_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
+
+
+def _is_percent_like(column_name: str, raw_values: List[str]) -> bool:
+    if column_name and "%" in str(column_name):
+        return True
+    for val in raw_values or []:
+        if "%" in str(val):
+            return True
+    return False
+
+
+def _coerce_raw_numeric(value: str) -> float | None:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    raw = raw.replace("%", "")
+    raw = re.sub(r"[^0-9,\\.\\-+()]", "", raw)
+    if not raw:
+        return None
+    neg = False
+    if raw.startswith("(") and raw.endswith(")"):
+        neg = True
+        raw = raw[1:-1]
+    if "," in raw and "." in raw:
+        if raw.rfind(",") > raw.rfind("."):
+            raw = raw.replace(".", "")
+            raw = raw.replace(",", ".")
+        else:
+            raw = raw.replace(",", "")
+    elif "," in raw and "." not in raw:
+        raw = raw.replace(".", "")
+        raw = raw.replace(",", ".")
+    try:
+        val = float(raw)
+    except Exception:
+        return None
+    return -val if neg else val
+
+
+def _median(values: List[float]) -> float | None:
+    if not values:
+        return None
+    sorted_vals = sorted(values)
+    mid = len(sorted_vals) // 2
+    if len(sorted_vals) % 2 == 0:
+        return (sorted_vals[mid - 1] + sorted_vals[mid]) / 2
+    return sorted_vals[mid]
 
 def _truncate_text(text: str, max_len: int = 18000, head_len: int = 10000, tail_len: int = 6000) -> str:
     if not text:
@@ -6563,6 +6616,135 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         derived_rename[match] = req_name
                 if derived_rename:
                     df_mapped = df_mapped.rename(columns=derived_rename)
+
+            # --- ID/SCALE GUARDS (Deterministic) ---
+            id_issues = []
+            scale_issues = []
+            identifier_cols = []
+            roles = get_column_roles(contract) if isinstance(contract, dict) else {}
+            role_ids = roles.get("identifiers") if isinstance(roles, dict) else None
+            if isinstance(role_ids, list):
+                identifier_cols = [c for c in role_ids if c in df_mapped.columns]
+            if not identifier_cols:
+                identifier_cols = [c for c in df_mapped.columns if is_identifier_like(c)]
+
+            guard_columns = list(dict.fromkeys(identifier_cols + required_cols))
+            raw_map = _build_required_raw_map(guard_columns, norm_map)
+            raw_usecols = list(dict.fromkeys(raw_map.values()))
+            raw_sample_df = (
+                sample_raw_columns(csv_path, input_dialect, raw_usecols, nrows=200, dtype=str)
+                if raw_usecols
+                else pd.DataFrame()
+            )
+
+            if identifier_cols and not state.get("de_id_guard_retry_done"):
+                for col in identifier_cols:
+                    if col not in df_mapped.columns:
+                        continue
+                    series = df_mapped[col]
+                    detection = detect_identifier_scientific_notation(series)
+                    if not detection.get("flag"):
+                        continue
+                    raw_col = raw_map.get(col)
+                    raw_examples = []
+                    if raw_col and raw_col in raw_sample_df.columns:
+                        raw_examples = raw_sample_df[raw_col].dropna().astype(str).head(6).tolist()
+                    cleaned_examples = series.dropna().astype(str).head(6).tolist()
+                    id_issues.append(
+                        {
+                            "column": col,
+                            "raw_column": raw_col,
+                            "raw_examples": raw_examples,
+                            "cleaned_examples": cleaned_examples,
+                            "details": detection,
+                        }
+                    )
+
+            if required_cols and not state.get("de_scale_guard_retry_done"):
+                for col in required_cols:
+                    if col not in df_mapped.columns:
+                        continue
+                    if col in identifier_cols:
+                        continue
+                    series = df_mapped[col]
+                    if not pd.api.types.is_numeric_dtype(series):
+                        continue
+                    raw_col = raw_map.get(col)
+                    if not raw_col or raw_col not in raw_sample_df.columns:
+                        continue
+                    raw_strings = raw_sample_df[raw_col].dropna().astype(str).head(200).tolist()
+                    if not raw_strings:
+                        continue
+                    if _is_percent_like(col, raw_strings):
+                        continue
+                    raw_values = [v for v in (_coerce_raw_numeric(v) for v in raw_strings) if v is not None]
+                    if len(raw_values) < 5:
+                        continue
+                    try:
+                        cleaned_max = float(series.max())
+                    except Exception:
+                        continue
+                    if cleaned_max > 1.5:
+                        continue
+                    raw_median = _median(raw_values)
+                    raw_max = max(raw_values) if raw_values else None
+                    raw_high_ratio = (
+                        sum(val > 5 for val in raw_values) / len(raw_values) if raw_values else 0.0
+                    )
+                    if raw_median is None:
+                        continue
+                    if raw_median > 5 or (raw_high_ratio >= 0.6 and raw_max and raw_max > 5):
+                        cleaned_examples = series.dropna().astype(str).head(6).tolist()
+                        scale_issues.append(
+                            {
+                                "column": col,
+                                "raw_column": raw_col,
+                                "raw_examples": raw_strings[:6],
+                                "cleaned_examples": cleaned_examples,
+                                "cleaned_max": cleaned_max,
+                                "raw_median": raw_median,
+                                "raw_max": raw_max,
+                                "raw_high_ratio": raw_high_ratio,
+                            }
+                        )
+
+            if id_issues or scale_issues:
+                payload_lines = []
+                if id_issues:
+                    payload_lines.append("ID_SCI_NOTATION_GUARD:")
+                    payload_lines.append(
+                        "- Identifier-like columns must remain string-like; avoid scientific notation or .0 suffixes."
+                    )
+                    for issue in id_issues:
+                        payload_lines.append(
+                            f"* col={issue.get('column')} raw={issue.get('raw_column')} "
+                            f"raw_examples={issue.get('raw_examples')} cleaned_examples={issue.get('cleaned_examples')} "
+                            f"details={issue.get('details')}"
+                        )
+                if scale_issues:
+                    payload_lines.append("SCALE_SHIFT_GUARD:")
+                    payload_lines.append(
+                        "- Do NOT rescale numeric columns unless percent-like evidence exists (name or raw '%')."
+                    )
+                    for issue in scale_issues:
+                        payload_lines.append(
+                            f"* col={issue.get('column')} raw={issue.get('raw_column')} "
+                            f"raw_examples={issue.get('raw_examples')} cleaned_examples={issue.get('cleaned_examples')} "
+                            f"cleaned_max={issue.get('cleaned_max')} raw_median={issue.get('raw_median')} "
+                            f"raw_max={issue.get('raw_max')} raw_high_ratio={issue.get('raw_high_ratio')}"
+                        )
+                if payload_lines:
+                    new_state = dict(state)
+                    if id_issues:
+                        new_state["de_id_guard_retry_done"] = True
+                    if scale_issues:
+                        new_state["de_scale_guard_retry_done"] = True
+                    base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                    new_state["data_engineer_audit_override"] = _merge_de_audit_override(
+                        base_override, "\n".join(payload_lines)
+                    )
+                    print("ID/SCALE guard: retrying Data Engineer with evidence.")
+                    return run_data_engineer(new_state)
 
             empty_required = _find_empty_required_columns(df_mapped, required_cols)
             if empty_required:

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Any, Dict
 
 from dotenv import load_dotenv
@@ -29,6 +30,78 @@ class CleaningReviewerAgent:
         self.model_name = "mimo-v2-flash"
         self.last_prompt = None
         self.last_response = None
+
+
+def _map_status_value(status: Any) -> str | None:
+    if status is None:
+        return None
+    raw = str(status).strip()
+    if not raw:
+        return None
+    if raw in {"APPROVED", "APPROVE_WITH_WARNINGS", "REJECTED"}:
+        return raw
+    normalized = re.sub(r"[\s\-]+", "_", raw.strip().lower())
+    normalized = re.sub(r"_+", "_", normalized)
+    if normalized in {"approved", "approve"}:
+        return "APPROVED"
+    if normalized in {"rejected", "reject", "failed", "fail"}:
+        return "REJECTED"
+    if "warn" in normalized and "approve" in normalized:
+        return "APPROVE_WITH_WARNINGS"
+    if normalized in {"approved_with_warning", "approved_with_warnings", "approve_with_warning", "approve_with_warnings"}:
+        return "APPROVE_WITH_WARNINGS"
+    return None
+
+
+def normalize_cleaning_reviewer_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(result, dict):
+        return {
+            "status": "REJECTED",
+            "feedback": "Cleaning reviewer returned invalid status.",
+            "failed_checks": [],
+            "required_fixes": [],
+        }
+
+    status_raw = result.get("status")
+    status_exact = str(status_raw).strip() if status_raw is not None else ""
+    mapped = _map_status_value(status_raw)
+    normalized_applied = False
+
+    if status_exact in {"APPROVED", "APPROVE_WITH_WARNINGS", "REJECTED"}:
+        result["status"] = status_exact
+    elif mapped:
+        result["status"] = mapped
+        normalized_applied = True
+    else:
+        result["status"] = "REJECTED"
+
+    for field in ["failed_checks", "required_fixes"]:
+        val = result.get(field, [])
+        if isinstance(val, str):
+            result[field] = [val]
+        elif not isinstance(val, list):
+            result[field] = []
+    if "feedback" not in result:
+        result["feedback"] = ""
+
+    if normalized_applied:
+        if "STATUS_ENUM_NORMALIZED" not in result["failed_checks"]:
+            result["failed_checks"].append("STATUS_ENUM_NORMALIZED")
+
+    if not mapped and status_exact not in {"APPROVED", "APPROVE_WITH_WARNINGS", "REJECTED"}:
+        essential_missing = not result.get("feedback") and not result["failed_checks"] and not result["required_fixes"]
+        if essential_missing:
+            result["feedback"] = "Cleaning reviewer returned invalid status."
+
+    if result.get("required_fixes"):
+        if result.get("status") in {"APPROVED", "APPROVE_WITH_WARNINGS"}:
+            result["status"] = "REJECTED"
+            if result["feedback"]:
+                result["feedback"] = result["feedback"] + " Status corrected due to required fixes."
+            else:
+                result["feedback"] = "Status corrected due to required fixes."
+
+    return result
 
     def review_cleaning(self, context: Dict[str, Any]) -> Dict[str, Any]:
         if not self.client:
@@ -106,24 +179,4 @@ class CleaningReviewerAgent:
                 "required_fixes": ["Ensure the reviewer returns valid JSON."],
             }
 
-        status = result.get("status")
-        if status not in {"APPROVED", "APPROVE_WITH_WARNINGS", "REJECTED"}:
-            result["status"] = "REJECTED"
-            result["feedback"] = "Cleaning reviewer returned invalid status."
-
-        for field in ["failed_checks", "required_fixes"]:
-            val = result.get(field, [])
-            if isinstance(val, str):
-                result[field] = [val]
-            elif not isinstance(val, list):
-                result[field] = []
-        if "feedback" not in result:
-            result["feedback"] = ""
-        if result.get("required_fixes"):
-            if result.get("status") in {"APPROVED", "APPROVE_WITH_WARNINGS"}:
-                result["status"] = "REJECTED"
-                if result["feedback"]:
-                    result["feedback"] = result["feedback"] + " Status corrected due to required fixes."
-                else:
-                    result["feedback"] = "Status corrected due to required fixes."
-        return result
+        return normalize_cleaning_reviewer_result(result)

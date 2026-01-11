@@ -121,6 +121,8 @@ class DataEngineerAgent:
         8. Never call int(series) or float(series). For boolean masks use int(mask.sum()).
            If you fill NaN with a sentinel (e.g., 'Unknown'), log nulls via original_nulls = int(col.isna().sum());
            nulls_before = original_nulls; nulls_after_na = int(cleaned.isna().sum()); filled_nulls = original_nulls.
+        9. SAFE READ: You MUST read input with pd.read_csv(..., dtype=str, low_memory=False) to preserve ID fidelity.
+           If you choose not to use dtype=str, you MUST define dtype/converters for identifier-like columns (id/key/cod/entity).
 
         *** SCOPE OF WORK (NON-NEGOTIABLE) ***
         - Output ONLY: data/cleaned_data.csv and data/cleaning_manifest.json.
@@ -132,7 +134,9 @@ class DataEngineerAgent:
         - Column names starting with a digit (e.g., '1stYearAmount') are NOT valid Python identifiers.
         - NEVER use: df.assign(1stYearAmount=...) - This causes SyntaxError!
         - ALWAYS use: df.assign(**{'1stYearAmount': ...}) or df['1stYearAmount'] = ...
-        - For Probability column: if max > 1 and max <= 100, divide by 100 to normalize to 0-1 range.
+        - DO NOT rescale numeric columns (e.g., divide/multiply by 100) to "normalize ranges" in cleaning.
+          Only parse. Rescaling is allowed ONLY if the column is percent-like with evidence:
+          (name contains '%' OR raw samples contain '%'). "score" does NOT imply percent.
         - For numeric parsing: ALWAYS sanitize symbols first (strip currency/letters; keep digits, sign, separators, parentheses, and %) and handle repeated thousands separators like '23.351.746'.
         
         *** INPUT PARAMETERS ***
@@ -148,7 +152,7 @@ class DataEngineerAgent:
         $data_audit
         
         *** CLEANING OUTPUT REQUIREMENTS ***
-        - CRITICAL: Read input with pd.read_csv(..., sep='$csv_sep', decimal='$csv_decimal', encoding='$csv_encoding'). DO NOT rely on defaults.
+        - CRITICAL: Read input with pd.read_csv(..., sep='$csv_sep', decimal='$csv_decimal', encoding='$csv_encoding', dtype=str, low_memory=False). DO NOT rely on defaults.
         - Save cleaned CSV to data/cleaned_data.csv.
         - Save manifest to data/cleaning_manifest.json (use _safe_dump_json if present; otherwise json.dump(..., default=_json_default)).
         - CRITICAL: Manifest MUST include "output_dialect": {"sep": "...", "decimal": "...", "encoding": "..."} matching the saved file.

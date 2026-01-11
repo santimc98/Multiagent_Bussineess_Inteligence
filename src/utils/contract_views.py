@@ -394,6 +394,34 @@ def _truncate_text(value: str, max_len: int) -> str:
     return value[: max_len - 14] + "...[TRUNCATED]"
 
 
+def _cap_plot_spec(plot_spec: Dict[str, Any] | None, max_caption_chars: int = 400) -> Dict[str, Any] | None:
+    if not isinstance(plot_spec, dict) or not plot_spec:
+        return None
+    capped = dict(plot_spec)
+    max_plots = plot_spec.get("max_plots")
+    max_plots_int: int | None = None
+    if isinstance(max_plots, (int, float)):
+        max_plots_int = int(max_plots)
+    elif isinstance(max_plots, str) and max_plots.strip().isdigit():
+        max_plots_int = int(max_plots.strip())
+    if max_plots_int is not None:
+        capped["max_plots"] = max_plots_int
+    plots = plot_spec.get("plots")
+    if isinstance(plots, list):
+        limit = max_plots_int if max_plots_int is not None and max_plots_int >= 0 else len(plots)
+        trimmed = []
+        for item in plots[:limit]:
+            if not isinstance(item, dict):
+                continue
+            plot = dict(item)
+            caption = plot.get("caption_template")
+            if isinstance(caption, str):
+                plot["caption_template"] = _truncate_text(caption, max_caption_chars)
+            trimmed.append(plot)
+        capped["plots"] = trimmed
+    return capped
+
+
 def _trim_value(
     obj: Any,
     max_str_len: int,
@@ -592,8 +620,9 @@ def build_ml_view(
     if case_rules is not None:
         view["case_rules"] = case_rules
     policy = contract_full.get("reporting_policy")
-    if isinstance(policy, dict) and isinstance(policy.get("plot_spec"), dict):
-        view["plot_spec"] = policy.get("plot_spec")
+    plot_spec = _cap_plot_spec(policy.get("plot_spec") if isinstance(policy, dict) else None)
+    if plot_spec is not None:
+        view["plot_spec"] = plot_spec
     return trim_to_budget(view, 16000)
 
 
@@ -657,8 +686,9 @@ def build_translator_view(
         "limitations": limitations,
         "constraints": {"no_markdown_tables": True, "cite_sources": True},
     }
-    if isinstance(policy, dict) and isinstance(policy.get("plot_spec"), dict):
-        view["plot_spec"] = policy.get("plot_spec")
+    plot_spec = _cap_plot_spec(policy.get("plot_spec") if isinstance(policy, dict) else None)
+    if plot_spec is not None:
+        view["plot_spec"] = plot_spec
     return trim_to_budget(view, 16000)
 
 
