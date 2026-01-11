@@ -131,7 +131,7 @@ if uploaded_file is not None:
         df_preview = load_preview(uploaded_file)
         
         if df_preview is not None:
-            st.dataframe(df_preview.head(), use_container_width=True)
+            st.dataframe(df_preview.head(), width="stretch")
         else:
             st.error("Error al leer CSV: No se pudo detectar el formato automáticamente.")
 
@@ -305,7 +305,7 @@ if st.session_state.get("analysis_complete") and st.session_state.get("analysis_
             if isinstance(preview, str) and preview.strip().startswith('{'):
                  try:
                      from io import StringIO
-                     st.dataframe(pd.read_json(StringIO(preview), orient='split'), use_container_width=True)
+                     st.dataframe(pd.read_json(StringIO(preview), orient='split'), width="stretch")
                  except Exception as e:
                      st.write(f"Cannot render dataframe: {e}")
                      st.write(preview)

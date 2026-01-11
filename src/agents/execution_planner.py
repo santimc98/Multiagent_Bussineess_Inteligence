@@ -509,6 +509,43 @@ def build_contract_min(
                 model_features.append(col)
     forbidden_features = list(dict.fromkeys(outcome_cols + audit_only_cols))
 
+    allowed_sets_full = contract.get("allowed_feature_sets")
+    if not isinstance(allowed_sets_full, dict):
+        allowed_sets_full = {}
+    missing_sets: List[str] = []
+
+    def _full_list(key: str) -> tuple[list[str] | None, bool]:
+        val = allowed_sets_full.get(key)
+        if isinstance(val, list):
+            return [str(c) for c in val if c is not None], True
+        return None, False
+
+    full_model, has_model = _full_list("model_features")
+    full_seg, has_seg = _full_list("segmentation_features")
+    full_forbidden, has_forbidden = _full_list("forbidden_for_modeling")
+    if not has_forbidden:
+        full_forbidden, has_forbidden = _full_list("forbidden_features")
+    full_audit, has_audit = _full_list("audit_only_features")
+
+    if has_model:
+        model_features = full_model
+    else:
+        missing_sets.append("model_features")
+    if has_seg:
+        segmentation_features = full_seg
+    else:
+        missing_sets.append("segmentation_features")
+    if has_forbidden:
+        forbidden_features = full_forbidden
+    else:
+        missing_sets.append("forbidden_for_modeling")
+    if not has_audit:
+        missing_sets.append("audit_only_features")
+
+    audit_only_features = full_audit if has_audit else list(audit_only_cols)
+    if missing_sets:
+        print(f"FALLBACK_FEATURE_SETS: {', '.join(sorted(set(missing_sets)))}")
+
     required_outputs = [
         "data/cleaned_data.csv",
         "data/scored_rows.csv",
@@ -585,6 +622,7 @@ def build_contract_min(
             "segmentation_features": segmentation_features,
             "model_features": model_features,
             "forbidden_features": forbidden_features,
+            "audit_only_features": audit_only_features,
         },
         "artifact_requirements": artifact_requirements,
         "required_outputs": required_outputs,
@@ -666,6 +704,16 @@ def ensure_v41_schema(contract: Dict[str, Any], strict: bool = False) -> Dict[st
     if not isinstance(unknowns, list):
         unknowns = []
         contract["unknowns"] = unknowns
+
+    version = contract.get("contract_version")
+    if version != 2:
+        contract["contract_version"] = 2
+        unknowns.append({
+            "item": "Normalized contract_version to 2",
+            "impact": "Schema validation enforced V4.1 version",
+            "mitigation": "Review LLM output quality",
+            "requires_verification": False
+        })
     
     # Add repair notes to unknowns
     for repair in repairs:

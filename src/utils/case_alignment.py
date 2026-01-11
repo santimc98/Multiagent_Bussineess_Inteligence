@@ -256,8 +256,16 @@ def build_case_alignment_report(
 
     dialect = _load_output_dialect()
 
-    # Try group alignment from scored_rows if available
-    if os.path.exists(scored_rows_path):
+    # Try group alignment from scored_rows if available (prefer explicit case_summary paths)
+    default_case_summary = case_summary_path in {"data/case_summary.csv", os.path.join("data", "case_summary.csv")}
+    data_paths_set = set(data_paths or [])
+    scored_in_paths = scored_rows_path in data_paths_set
+    use_scored_rows = (
+        os.path.exists(scored_rows_path)
+        and (scored_in_paths or not data_paths)
+        and (not case_summary_path or not os.path.exists(case_summary_path) or default_case_summary)
+    )
+    if use_scored_rows:
         try:
             sr = pd.read_csv(
                 scored_rows_path,

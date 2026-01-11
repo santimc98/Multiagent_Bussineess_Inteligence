@@ -1361,6 +1361,49 @@ def _build_contract_min(contract: Dict[str, Any], evaluation_spec: Dict[str, Any
             ]
             decision_variables = inferred
 
+    allowed_sets_full = contract.get("allowed_feature_sets")
+    if not isinstance(allowed_sets_full, dict):
+        allowed_sets_full = {}
+
+    def _as_list(value: Any) -> List[str]:
+        if isinstance(value, list):
+            return [str(item) for item in value if item is not None]
+        return []
+
+    roles = get_column_roles(contract)
+    pre_decision = _as_list(roles.get("pre_decision"))
+    decision = _as_list(roles.get("decision"))
+    outcome = _as_list(roles.get("outcome"))
+    audit_only = _as_list(roles.get("post_decision_audit_only") or roles.get("audit_only"))
+
+    fallback_model = list(dict.fromkeys(pre_decision + decision))
+    fallback_seg = list(pre_decision)
+    fallback_forbidden = list(dict.fromkeys(outcome + audit_only))
+    fallback_audit = list(audit_only)
+
+    missing_sets: List[str] = []
+    model_features = _as_list(allowed_sets_full.get("model_features"))
+    if not model_features and "model_features" not in allowed_sets_full:
+        model_features = fallback_model
+        missing_sets.append("model_features")
+    segmentation_features = _as_list(allowed_sets_full.get("segmentation_features"))
+    if not segmentation_features and "segmentation_features" not in allowed_sets_full:
+        segmentation_features = fallback_seg
+        missing_sets.append("segmentation_features")
+    forbidden_features = _as_list(allowed_sets_full.get("forbidden_for_modeling"))
+    if not forbidden_features and "forbidden_for_modeling" not in allowed_sets_full:
+        if "forbidden_features" in allowed_sets_full:
+            forbidden_features = _as_list(allowed_sets_full.get("forbidden_features"))
+        else:
+            forbidden_features = fallback_forbidden
+            missing_sets.append("forbidden_for_modeling")
+    audit_only_features = _as_list(allowed_sets_full.get("audit_only_features"))
+    if not audit_only_features and "audit_only_features" not in allowed_sets_full:
+        audit_only_features = fallback_audit
+        missing_sets.append("audit_only_features")
+    if missing_sets:
+        print(f"FALLBACK_FEATURE_SETS: {', '.join(sorted(set(missing_sets)))}")
+
     return {
         "contract_version": contract.get("contract_version"),
         "strategy_title": contract.get("strategy_title"),
@@ -1380,7 +1423,12 @@ def _build_contract_min(contract: Dict[str, Any], evaluation_spec: Dict[str, Any
         "artifact_requirements": contract.get("artifact_requirements", {}),
         "qa_gates": eval_spec.get("qa_gates", []) if isinstance(eval_spec, dict) else [],
         "reviewer_gates": eval_spec.get("reviewer_gates", []) if isinstance(eval_spec, dict) else [],
-        "allowed_feature_sets": contract.get("allowed_feature_sets", {}),
+        "allowed_feature_sets": {
+            "segmentation_features": segmentation_features,
+            "model_features": model_features,
+            "forbidden_features": forbidden_features,
+            "audit_only_features": audit_only_features,
+        },
         "leakage_execution_plan": contract.get("leakage_execution_plan", {}),
         "data_limited_mode": contract.get("data_limited_mode", False),
         "ml_engineer_runbook": contract.get("ml_engineer_runbook", {}),

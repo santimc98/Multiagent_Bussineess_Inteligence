@@ -39,6 +39,8 @@ def test_data_engineer_json_error_retry():
 
 def test_data_engineer_overload_sentinel():
     agent = DataEngineerAgent(api_key="fake")
+    agent.fallback_client = None
+    agent.fallback_model_name = None
     
     # Always fails with JSON error
     json_error = '{"error": {"message": "Overloaded"}}'

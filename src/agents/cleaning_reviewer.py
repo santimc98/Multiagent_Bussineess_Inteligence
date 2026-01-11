@@ -119,4 +119,11 @@ class CleaningReviewerAgent:
                 result[field] = []
         if "feedback" not in result:
             result["feedback"] = ""
+        if result.get("required_fixes"):
+            if result.get("status") in {"APPROVED", "APPROVE_WITH_WARNINGS"}:
+                result["status"] = "REJECTED"
+                if result["feedback"]:
+                    result["feedback"] = result["feedback"] + " Status corrected due to required fixes."
+                else:
+                    result["feedback"] = "Status corrected due to required fixes."
         return result

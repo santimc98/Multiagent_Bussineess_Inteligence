@@ -106,6 +106,32 @@ def test_ml_view_preserves_forbidden_features_from_min():
     assert "audit_col" not in (ml_view.get("allowed_feature_sets", {}).get("model_features") or [])
 
 
+def test_ml_view_prefers_full_allowed_feature_sets():
+    contract_full = {
+        "canonical_columns": ["feature_a", "feature_b", "audit_col", "EntityId"],
+        "allowed_feature_sets": {
+            "model_features": ["feature_a", "audit_col", "EntityId"],
+            "segmentation_features": ["feature_b", "EntityId"],
+            "forbidden_for_modeling": ["audit_col"],
+            "audit_only_features": ["audit_col"],
+        },
+    }
+    contract_min = {
+        "canonical_columns": ["feature_a", "feature_b", "audit_col", "EntityId"],
+        "allowed_feature_sets": {
+            "model_features": ["feature_b"],
+            "segmentation_features": ["feature_a"],
+            "forbidden_features": [],
+        },
+    }
+    ml_view = build_ml_view(contract_full, contract_min, [])
+    allowed = ml_view.get("allowed_feature_sets") or {}
+    assert allowed.get("model_features") == ["feature_a"]
+    assert allowed.get("segmentation_features") == ["feature_b"]
+    assert ml_view.get("audit_only_columns") == ["audit_col"]
+    assert "EntityId" in (ml_view.get("identifier_columns") or [])
+
+
 def test_reviewer_view_contains_gates_and_outputs():
     contract_full = _load_fixture("contract_full_small.json")
     contract_min = _load_fixture("contract_min_small.json")

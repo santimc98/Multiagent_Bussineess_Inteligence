@@ -485,6 +485,9 @@ def build_ml_view(
     allowed_sets_min = contract_min.get("allowed_feature_sets")
     if not isinstance(allowed_sets_min, dict):
         allowed_sets_min = {}
+    allowed_sets_full = contract_full.get("allowed_feature_sets")
+    if not isinstance(allowed_sets_full, dict):
+        allowed_sets_full = {}
     forbidden_min = _resolve_forbidden_features(allowed_sets_min)
     role_sets_min = _extract_roles(roles_min)
     pre_decision_min = _coerce_list(roles_min.get("pre_decision"))
@@ -514,31 +517,59 @@ def build_ml_view(
     if not pre_decision_cols:
         assigned = set(decision_cols + outcome_cols + audit_only_cols)
         pre_decision_cols = [c for c in canonical_columns if c and c not in assigned]
-    allowed_sets = _resolve_allowed_feature_sets(contract_min, contract_full)
-    if use_full_roles:
-        allowed_sets = {
-            "segmentation_features": list(pre_decision_cols),
-            "model_features": list(dict.fromkeys(pre_decision_cols + decision_cols)),
-            "forbidden_features": list(dict.fromkeys(outcome_cols + audit_only_cols)),
-        }
-    if not isinstance(allowed_sets, dict):
-        allowed_sets = {}
-    model_features = _coerce_list(allowed_sets.get("model_features"))
-    segmentation_features = _coerce_list(allowed_sets.get("segmentation_features"))
-    audit_only_features = _coerce_list(allowed_sets.get("audit_only_features"))
-    if audit_only_features:
-        audit_only_cols = list(dict.fromkeys(audit_only_cols + [str(c) for c in audit_only_features if c]))
-    forbidden = _resolve_forbidden_features(allowed_sets)
+
+    def _list_or_none(source: Dict[str, Any], key: str) -> List[str] | None:
+        val = source.get(key)
+        if isinstance(val, list):
+            return [str(c) for c in val if c]
+        return None
+
+    full_model = _list_or_none(allowed_sets_full, "model_features")
+    full_seg = _list_or_none(allowed_sets_full, "segmentation_features")
+    full_forbidden = _list_or_none(allowed_sets_full, "forbidden_for_modeling")
+    if full_forbidden is None:
+        full_forbidden = _list_or_none(allowed_sets_full, "forbidden_features")
+    full_audit = _list_or_none(allowed_sets_full, "audit_only_features")
+
+    min_model = _list_or_none(allowed_sets_min, "model_features")
+    min_seg = _list_or_none(allowed_sets_min, "segmentation_features")
+    min_forbidden = _list_or_none(allowed_sets_min, "forbidden_features")
+    if min_forbidden is None:
+        min_forbidden = _list_or_none(allowed_sets_min, "forbidden_for_modeling")
+    min_audit = _list_or_none(allowed_sets_min, "audit_only_features")
+
+    model_features = (
+        full_model
+        if full_model is not None
+        else (min_model if min_model is not None else list(dict.fromkeys(pre_decision_cols + decision_cols)))
+    )
+    segmentation_features = (
+        full_seg
+        if full_seg is not None
+        else (min_seg if min_seg is not None else list(pre_decision_cols))
+    )
+    forbidden = (
+        full_forbidden
+        if full_forbidden is not None
+        else (min_forbidden if min_forbidden is not None else [])
+    )
+    audit_only_features = full_audit if full_audit is not None else min_audit
+    if audit_only_features is not None:
+        audit_only_cols = list(dict.fromkeys([str(c) for c in audit_only_features if c]))
+
     forbidden = list(dict.fromkeys([str(c) for c in forbidden if c] + outcome_cols + audit_only_cols))
     identifier_cols = [c for c in canonical_columns if is_identifier_column(c)]
     forbidden = sorted(dict.fromkeys(forbidden + [str(c) for c in identifier_cols if c]))
     forbidden_set = set(forbidden)
     model_features = [str(c) for c in model_features if c and c not in forbidden_set]
     segmentation_features = [str(c) for c in segmentation_features if c and c not in forbidden_set]
-    allowed_sets = dict(allowed_sets)
-    allowed_sets["model_features"] = model_features
-    allowed_sets["segmentation_features"] = segmentation_features
-    allowed_sets["forbidden_features"] = forbidden
+    allowed_sets = {
+        "segmentation_features": segmentation_features,
+        "model_features": model_features,
+        "forbidden_features": forbidden,
+    }
+    if audit_only_features is not None:
+        allowed_sets["audit_only_features"] = [str(c) for c in audit_only_features if c]
     validation = _resolve_validation_requirements(contract_min, contract_full)
     case_rules = _resolve_case_rules(contract_full)
 

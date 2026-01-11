@@ -257,8 +257,20 @@ class StewardAgent:
             
             # 2. Decimal Detection
             decimal = self._detect_decimal(sample)
-            
-            return {"sep": sep, "decimal": decimal}
+            diagnostics: Dict[str, Any] = {}
+            if sep == decimal:
+                diagnostics["ambiguous_sep_decimal"] = True
+                if sep == ",":
+                    alt_decimal = "."
+                elif sep == ";":
+                    alt_decimal = ","
+                else:
+                    alt_decimal = "," if sep == "." else "."
+                diagnostics["decimal_candidates"] = [decimal, alt_decimal]
+                diagnostics["selected_decimal"] = alt_decimal
+                decimal = alt_decimal
+
+            return {"sep": sep, "decimal": decimal, "diagnostics": diagnostics}
             
         except Exception as e:
             print(f"Steward: Dialect detection failed ({e}). Defaulting to standard.")
@@ -559,6 +571,7 @@ def build_dataset_profile(
             "sep": dialect_info.get("sep"),
             "decimal": dialect_info.get("decimal"),
             "encoding": encoding,
+            "diagnostics": dialect_info.get("diagnostics") or {},
         },
     }
     return profile
