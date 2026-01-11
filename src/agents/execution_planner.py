@@ -14,6 +14,12 @@ from src.utils.contract_validation import (
     DEFAULT_DATA_ENGINEER_RUNBOOK,
     DEFAULT_ML_ENGINEER_RUNBOOK,
 )
+from src.utils.contract_v41 import (
+    get_canonical_columns,
+    get_column_roles,
+    get_derived_column_names,
+    get_required_outputs,
+)
 from src.utils.run_bundle import get_run_dir
 
 load_dotenv()
@@ -609,6 +615,17 @@ def build_contract_min(
         execution_plan = contract.get("execution_plan")
         if isinstance(execution_plan, dict):
             reporting_policy = build_reporting_policy(execution_plan, strategy_dict)
+    plot_spec = reporting_policy.get("plot_spec") if isinstance(reporting_policy, dict) else None
+    if not isinstance(plot_spec, dict) or not plot_spec:
+        plot_spec = build_plot_spec(contract)
+    if isinstance(plot_spec, dict) and plot_spec:
+        if not isinstance(reporting_policy, dict):
+            reporting_policy = {}
+        reporting_policy = dict(reporting_policy)
+        reporting_policy["plot_spec"] = {
+            "enabled": bool(plot_spec.get("enabled", True)),
+            "max_plots": int(plot_spec.get("max_plots", len(plot_spec.get("plots") or []))),
+        }
 
     return {
         "contract_version": contract.get("contract_version", 2),
@@ -1106,6 +1123,272 @@ def build_reporting_policy(
     policy.setdefault("require_strong_disclaimer", True)
 
     return policy
+
+
+def build_plot_spec(contract_full: Dict[str, Any] | None) -> Dict[str, Any]:
+    contract = contract_full if isinstance(contract_full, dict) else {}
+    required_outputs = get_required_outputs(contract)
+    outputs_lower = [str(path).lower() for path in required_outputs if path]
+
+    def _has_output(token: str) -> bool:
+        return any(token in path for path in outputs_lower)
+
+    def _dedupe(values: List[str]) -> List[str]:
+        seen = set()
+        out: List[str] = []
+        for item in values:
+            if not item:
+                continue
+            key = str(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+        return out
+
+    def _sample(values: List[str], limit: int) -> List[str]:
+        return _dedupe([str(v) for v in values if v])[:limit]
+
+    def _safe_column_name(name: str) -> str:
+        if not name:
+            return ""
+        return re.sub(r"[^0-9a-zA-Z]+", "_", str(name)).strip("_").lower()
+
+    def _has_token(name: str, tokens: List[str]) -> bool:
+        if not name:
+            return False
+        normalized = re.sub(r"[^0-9a-zA-Z]+", " ", str(name).lower())
+        return any(tok in normalized.split() for tok in tokens)
+
+    def _infer_objective_type() -> str:
+        eval_spec = contract.get("evaluation_spec") if isinstance(contract, dict) else None
+        if isinstance(eval_spec, dict) and eval_spec.get("objective_type"):
+            return str(eval_spec.get("objective_type"))
+        plan = contract.get("execution_plan") if isinstance(contract, dict) else None
+        if isinstance(plan, dict) and plan.get("objective_type"):
+            return str(plan.get("objective_type"))
+        obj_analysis = contract.get("objective_analysis") if isinstance(contract, dict) else None
+        if isinstance(obj_analysis, dict) and obj_analysis.get("problem_type"):
+            return str(obj_analysis.get("problem_type"))
+        return "unknown"
+
+    objective_type = _infer_objective_type().lower()
+    eval_spec = contract.get("evaluation_spec") if isinstance(contract, dict) else None
+    target_type = str(eval_spec.get("target_type") or "").lower() if isinstance(eval_spec, dict) else ""
+
+    is_ranking = any(tok in objective_type for tok in ["rank", "scor", "priorit"])
+    is_forecast = "forecast" in objective_type
+    is_segmentation = any(tok in objective_type for tok in ["segment", "cluster"])
+    is_classification = any(tok in target_type for tok in ["class", "binary", "multiclass"]) or "classif" in objective_type
+    is_regression = any(tok in target_type for tok in ["regress", "continuous", "numeric"]) or "regress" in objective_type
+
+    canonical_columns = get_canonical_columns(contract)
+    canonical_set = set(canonical_columns)
+
+    def _filter_to_canonical(values: List[str]) -> List[str]:
+        if not canonical_set:
+            return [str(v) for v in values if v]
+        return [str(v) for v in values if v in canonical_set]
+
+    roles = get_column_roles(contract)
+    pre_decision = _filter_to_canonical(_coerce_list(roles.get("pre_decision")))
+    decision_cols = _filter_to_canonical(_coerce_list(roles.get("decision")))
+    outcome_cols = _filter_to_canonical(_coerce_list(roles.get("outcome")))
+    audit_only = _filter_to_canonical(
+        _coerce_list(roles.get("post_decision_audit_only") or roles.get("audit_only"))
+    )
+
+    allowed_sets = contract.get("allowed_feature_sets")
+    if not isinstance(allowed_sets, dict):
+        allowed_sets = {}
+    model_features = _filter_to_canonical(_coerce_list(allowed_sets.get("model_features")))
+    segmentation_features = _filter_to_canonical(_coerce_list(allowed_sets.get("segmentation_features")))
+
+    data_analysis = contract.get("data_analysis") if isinstance(contract, dict) else None
+    type_dist = data_analysis.get("type_distribution") if isinstance(data_analysis, dict) else None
+    numeric_cols = _filter_to_canonical(_coerce_list(type_dist.get("numeric"))) if isinstance(type_dist, dict) else []
+    datetime_cols = _filter_to_canonical(_coerce_list(type_dist.get("datetime"))) if isinstance(type_dist, dict) else []
+    categorical_cols = _filter_to_canonical(_coerce_list(type_dist.get("categorical"))) if isinstance(type_dist, dict) else []
+
+    if not datetime_cols:
+        time_tokens = ["date", "time", "timestamp", "period"]
+        datetime_cols = [col for col in canonical_columns if _has_token(col, time_tokens)]
+
+    derived_columns = get_derived_column_names(contract)
+    score_tokens = ["score", "pred", "prob", "prediction"]
+    pred_name_candidates = [col for col in derived_columns if _has_token(col, score_tokens)]
+
+    pred_candidates: List[str] = ["prediction"]
+    for outcome in outcome_cols[:3]:
+        safe = _safe_column_name(outcome)
+        if safe:
+            pred_candidates.extend([f"pred_{safe}", f"predicted_{safe}", f"pred_prob_{safe}"])
+    pred_candidates.extend(pred_name_candidates)
+    pred_candidates = _sample(pred_candidates, 12)
+
+    segment_tokens = ["segment", "segmentation", "cluster", "cohort", "group", "segmento", "cluster_id"]
+    segment_candidates = [col for col in derived_columns if _has_token(col, segment_tokens)]
+    if not segment_candidates:
+        segment_candidates = [col for col in canonical_columns if _has_token(col, segment_tokens)]
+    segment_candidates = _sample(segment_candidates, 8)
+
+    has_scored_rows = _has_output("scored_rows.csv")
+    has_metrics = _has_output("metrics.json")
+    has_alignment = _has_output("alignment_check.json") or _has_output("case_alignment")
+    has_weights = _has_output("weights.json")
+
+    plots: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    def _add_plot(
+        plot_id: str,
+        title: str,
+        goal: str,
+        plot_type: str,
+        preferred_sources: List[str],
+        required_any: List[str] | None = None,
+        required_all: List[str] | None = None,
+        optional_cols: List[str] | None = None,
+        compute: Dict[str, Any] | None = None,
+        caption_template: str | None = None,
+    ) -> None:
+        if not plot_id or plot_id in seen_ids:
+            return
+        seen_ids.add(plot_id)
+        plot = {
+            "plot_id": plot_id,
+            "title": title,
+            "goal": goal,
+            "type": plot_type,
+            "inputs": {
+                "preferred_sources": preferred_sources,
+                "required_columns_any_of": [required_any] if required_any else [],
+                "required_columns_all_of": required_all or [],
+                "optional_columns": optional_cols or [],
+            },
+            "compute": compute or {},
+            "caption_template": caption_template or "",
+        }
+        plots.append(plot)
+
+    if len(canonical_columns) >= 4:
+        _add_plot(
+            "missingness_overview",
+            "Missingness by column",
+            "Quantify missing data to focus cleaning and feature engineering.",
+            "bar",
+            ["data/cleaned_data.csv"],
+            optional_cols=_sample(canonical_columns, 24),
+            compute={"metric": "missing_fraction", "top_k": 20},
+            caption_template="Top missingness rates across columns (top {top_k}).",
+        )
+
+    if numeric_cols:
+        _add_plot(
+            "numeric_distributions",
+            "Numeric feature distributions",
+            "Show the distribution of key numeric features.",
+            "histogram",
+            ["data/cleaned_data.csv"],
+            required_any=_sample(numeric_cols, 12),
+            optional_cols=_sample(numeric_cols, 12),
+            compute={"x": "AUTO_NUMERIC", "max_columns": min(6, len(numeric_cols))},
+            caption_template="Distributions for selected numeric features.",
+        )
+
+    if datetime_cols and (is_forecast or has_scored_rows):
+        _add_plot(
+            "trend_over_time",
+            "Trend over time",
+            "Highlight temporal trends for the primary target or prediction.",
+            "timeseries",
+            ["data/cleaned_data.csv", "data/scored_rows.csv"],
+            required_any=_sample(datetime_cols, 6),
+            optional_cols=_sample(datetime_cols, 6),
+            compute={"x": "AUTO_TIME", "y": "AUTO_TARGET_OR_NUMERIC"},
+            caption_template="Trend over time using available temporal columns.",
+        )
+
+    if has_scored_rows and pred_candidates:
+        _add_plot(
+            "score_distribution",
+            "Prediction/score distribution",
+            "Summarize the distribution of model outputs.",
+            "histogram",
+            ["data/scored_rows.csv", "data/cleaned_data.csv"],
+            required_any=pred_candidates,
+            compute={"x": "PREDICTION", "bins": 30},
+            caption_template="Distribution of predicted scores.",
+        )
+
+    if has_scored_rows and outcome_cols and (is_classification or is_ranking):
+        _add_plot(
+            "topk_lift",
+            "Top-k outcome lift",
+            "Show outcome rate across score buckets.",
+            "bar",
+            ["data/scored_rows.csv"],
+            required_any=pred_candidates,
+            required_all=[outcome_cols[0]],
+            compute={"x": "PREDICTION", "y": outcome_cols[0], "group_by": "decile", "metric": "mean"},
+            caption_template="Outcome rate by score decile.",
+        )
+
+    if has_scored_rows and outcome_cols and is_regression:
+        _add_plot(
+            "residuals_scatter",
+            "Prediction vs actual",
+            "Assess residuals and bias in regression outputs.",
+            "scatter",
+            ["data/scored_rows.csv"],
+            required_any=pred_candidates,
+            required_all=[outcome_cols[0]],
+            compute={"x": "PREDICTION", "y": outcome_cols[0]},
+            caption_template="Predicted vs actual values.",
+        )
+
+    if has_weights or has_metrics:
+        _add_plot(
+            "feature_weights",
+            "Feature weights/importance",
+            "Highlight the strongest feature contributions or weights.",
+            "bar",
+            ["data/weights.json", "data/metrics.json"],
+            compute={"metric": "weights", "top_k": 20},
+            caption_template="Top contributing features (if weights available).",
+        )
+
+    if has_alignment:
+        _add_plot(
+            "alignment_check_summary",
+            "Alignment check summary",
+            "Visualize alignment requirements or validation outcomes.",
+            "bar",
+            ["data/alignment_check.json"],
+            compute={"metric": "alignment_requirements", "top_k": 12},
+            caption_template="Alignment check results by requirement.",
+        )
+
+    if is_segmentation or segmentation_features or segment_candidates:
+        _add_plot(
+            "segment_sizes",
+            "Segment distribution",
+            "Show sizes or performance by segment where available.",
+            "bar",
+            ["data/scored_rows.csv", "data/cleaned_data.csv"],
+            required_any=segment_candidates,
+            compute={"x": "SEGMENT_COLUMN", "metric": "count", "top_k": 20},
+            caption_template="Segment sizes based on available segment identifiers.",
+        )
+
+    max_plots = 8
+    trimmed_plots = plots[:max_plots]
+
+    return {
+        "enabled": bool(trimmed_plots),
+        "max_plots": max_plots,
+        "plots": trimmed_plots,
+    }
 
 
 class ExecutionPlannerAgent:
@@ -3400,6 +3683,9 @@ class ExecutionPlannerAgent:
                 policy["max_examples"] = 5
             if "require_strong_disclaimer" not in policy:
                 policy["require_strong_disclaimer"] = True
+            plot_spec = policy.get("plot_spec")
+            if not isinstance(plot_spec, dict) or not plot_spec:
+                policy["plot_spec"] = build_plot_spec(contract)
             contract["reporting_policy"] = policy
             return contract
 
@@ -3613,6 +3899,7 @@ class ExecutionPlannerAgent:
 
         if not self.client:
             contract = _fallback()
+            contract = _attach_reporting_policy(contract)
             contract_min = build_contract_min(contract, strategy, column_inventory, relevant_columns)
             self.last_contract_min = contract_min
             _persist_contracts(contract, contract_min)
@@ -3789,6 +4076,7 @@ domain_expert_critique:
             contract["omitted_columns_policy"] = omitted_columns_policy
 
         contract = validate_artifact_requirements(contract)
+        contract = _attach_reporting_policy(contract)
 
         def _sanitize_runbook_text(text: str) -> str:
             """Replace hardcoded dialect instructions with dynamic manifest reference."""

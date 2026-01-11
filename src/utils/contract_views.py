@@ -38,6 +38,7 @@ class MLView(TypedDict, total=False):
     required_outputs: List[str]
     validation_requirements: Dict[str, Any]
     case_rules: Any
+    plot_spec: Dict[str, Any]
 
 
 class ReviewerView(TypedDict, total=False):
@@ -53,6 +54,7 @@ class ReviewerView(TypedDict, total=False):
 class TranslatorView(TypedDict, total=False):
     role: str
     reporting_policy: Dict[str, Any]
+    plot_spec: Dict[str, Any]
     evidence_inventory: List[Dict[str, Any]]
     key_decisions: List[str]
     limitations: List[str]
@@ -589,6 +591,9 @@ def build_ml_view(
     }
     if case_rules is not None:
         view["case_rules"] = case_rules
+    policy = contract_full.get("reporting_policy")
+    if isinstance(policy, dict) and isinstance(policy.get("plot_spec"), dict):
+        view["plot_spec"] = policy.get("plot_spec")
     return trim_to_budget(view, 16000)
 
 
@@ -652,6 +657,8 @@ def build_translator_view(
         "limitations": limitations,
         "constraints": {"no_markdown_tables": True, "cite_sources": True},
     }
+    if isinstance(policy, dict) and isinstance(policy.get("plot_spec"), dict):
+        view["plot_spec"] = policy.get("plot_spec")
     return trim_to_budget(view, 16000)
 
 

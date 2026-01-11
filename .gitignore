@@ -69,6 +69,7 @@ data/artifact_index.json
 data/dataset_profile.json
 data/executive_summary.md
 data/insights.json
+data/plot_insights.json
 data/plan.json
 data/qa_static_facts.json
 data/strategy_spec.json

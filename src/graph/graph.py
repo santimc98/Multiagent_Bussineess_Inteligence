@@ -8297,6 +8297,39 @@ def execute_code(state: AgentState) -> AgentState:
                                 print(f"Downloaded required output: {local_path}")
                     except Exception as dl_err:
                         print(f"Warning: failed to download required output {remote_path}: {dl_err}")
+
+            # Download optional plot insights if present
+            for rel_path in ["data/plot_insights.json"]:
+                if rel_path.startswith("/"):
+                    remote_path = rel_path
+                else:
+                    remote_path = f"{run_root}/{rel_path}"
+                list_cmd = f"sh -lc 'ls -1 {remote_path} 2>/dev/null || true'"
+                lst = sandbox.commands.run(list_cmd)
+                if lst.exit_code != 0:
+                    continue
+                files = [p for p in lst.stdout.strip().split("\n") if p]
+                for remote_opt in files:
+                    if not remote_opt:
+                        continue
+                    try:
+                        proc = sandbox.commands.run(f"base64 -w 0 {remote_opt}")
+                        if proc.exit_code == 0:
+                            b64_content = proc.stdout.strip()
+                            content = base64.b64decode(b64_content)
+                            if remote_opt.startswith(run_root):
+                                local_path = remote_opt[len(run_root):].lstrip("/")
+                            elif remote_opt.startswith("/home/user/"):
+                                local_path = remote_opt[len("/home/user/"):].lstrip("/")
+                            else:
+                                local_path = remote_opt.lstrip("/")
+                            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                            with open(local_path, "wb") as f_local:
+                                f_local.write(content)
+                            downloaded_paths.append(local_path)
+                            print(f"Downloaded optional output: {local_path}")
+                    except Exception as dl_err:
+                        print(f"Warning: failed to download optional output {remote_opt}: {dl_err}")
             list_cmd = f"sh -lc 'cd {run_root} && find . -maxdepth 5 -type f -printf \"%p\\t%s\\n\" 2>/dev/null'"
             outputs_listing = []
             try:
@@ -8497,7 +8530,12 @@ def execute_code(state: AgentState) -> AgentState:
         artifact_paths.extend(oc_report.get("present", []))
     if plots_local:
         artifact_paths.extend(plots_local)
-    for extra_path in ["data/strategy_spec.json", "data/plan.json", "data/evaluation_spec.json"]:
+    for extra_path in [
+        "data/strategy_spec.json",
+        "data/plan.json",
+        "data/evaluation_spec.json",
+        "data/plot_insights.json",
+    ]:
         if os.path.exists(extra_path):
             artifact_paths.append(extra_path)
     # De-duplicate while preserving order

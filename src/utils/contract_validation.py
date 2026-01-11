@@ -126,6 +126,12 @@ DEFAULT_ML_ENGINEER_RUNBOOK: Dict[str, Any] = {
     ],
     "outputs": {
         "required": ["data/cleaned_data.csv"],
-        "optional": ["data/weights.json", "static/plots/*.png", "data/scored_rows.csv", "data/alignment_check.json"],
+        "optional": [
+            "data/weights.json",
+            "static/plots/*.png",
+            "data/scored_rows.csv",
+            "data/alignment_check.json",
+            "data/plot_insights.json",
+        ],
     },
 }

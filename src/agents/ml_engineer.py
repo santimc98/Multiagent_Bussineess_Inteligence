@@ -223,6 +223,7 @@ class MLEngineerAgent:
         feedback_blocks = self._select_feedback_blocks(feedback_history, gate_context, max_blocks=2)
         ml_view = ml_view or {}
         ml_view_json = json.dumps(ml_view, indent=2)
+        plot_spec_json = json.dumps(ml_view.get("plot_spec", {}), indent=2)
         
         # STRUCTURED CRITICAL ERRORS SECTION
         critical_errors: List[str] = []
@@ -295,6 +296,8 @@ class MLEngineerAgent:
                 critical_section,
                 "ML_VIEW_CONTEXT:",
                 ml_view_json,
+                "PLOT_SPEC_CONTEXT:",
+                plot_spec_json,
                 "CONTRACT_MIN_CONTEXT:",
                 json.dumps(contract_min, indent=2),
                 "REQUIRED OUTPUTS:",
@@ -542,6 +545,7 @@ class MLEngineerAgent:
         - Business Objective: "$business_objective"
         - Strategy: $strategy_title ($analysis_type)
         - ML_VIEW_CONTEXT (json): $ml_view_context
+        - PLOT_SPEC_CONTEXT (json): $plot_spec_context
         - CONTRACT_MIN_CONTEXT (json): $contract_min_context
         - Execution Contract (json): $execution_contract_json
         - Deliverables: $deliverables_json
@@ -655,6 +659,18 @@ class MLEngineerAgent:
         - If price sensitivity curves or optimal pricing guide are required, they must NOT be empty.
           If segment-level estimation is too sparse, fallback to global curves or coarser segments; never emit empty artifacts.
 
+        PLOT_SPEC EXECUTION (STRICT, EVIDENCE-BASED)
+        - If PLOT_SPEC_CONTEXT.enabled == true, you MUST generate plots exactly from plot_spec.plots.
+        - For each plot:
+          * Load from preferred_sources in order (use scored_rows first for model outputs if available).
+          * Verify required_columns_any_of / required_columns_all_of; if not satisfied, skip with a clear skip_reason.
+          * Save to /home/user/run/static/plots/{plot_id}.png (sanitize plot_id for filenames).
+        - Use matplotlib only (no seaborn) and set matplotlib.use('Agg') before importing pyplot.
+        - Write data/plot_insights.json as a list of dicts with:
+          plot_id, file, title, goal, status, skip_reason, evidence {sources_used, columns_used, n_rows},
+          key_findings (quantified), caption.
+        - No synthetic data. Do not use np.random for visuals.
+
         REQUIRED ARTIFACT RULES (minimal, contract-driven)
         - Always:
         - os.makedirs('data', exist_ok=True)
@@ -669,7 +685,7 @@ class MLEngineerAgent:
             * Clustering: Silhouette Score, Inertia.
             * Descriptive/Rule-based: Coverage %, Rule Hit Rate.
           - Never leave "model_performance" empty for a modeling task.
-        - Plotting: matplotlib.use('Agg') BEFORE pyplot; save at least one plot IF required deliverables include plots; otherwise skip gracefully.
+        - Plotting: matplotlib.use('Agg') BEFORE pyplot; if PLOT_SPEC_CONTEXT.enabled true, generate plots per plot_spec; otherwise save a plot only when required deliverables include plots.
         - If computing optimal prices or using minimize_scalar, ensure the objective returns float and coerce optimal_price = float(optimal_price) before assignment.
         - scored_rows.csv must include canonical columns plus derived outputs required by the contract
           (e.g., is_success, cluster_id, pred_prob_success, recommended_* and expected_value_at_recommendation).
@@ -722,6 +738,7 @@ class MLEngineerAgent:
         )
         execution_contract_compact = self._compact_execution_contract(execution_contract or {})
         ml_view_json = json.dumps(ml_view, indent=2)
+        plot_spec_json = json.dumps(ml_view.get("plot_spec", {}), indent=2)
         evaluation_spec_json = json.dumps((execution_contract or {}).get("evaluation_spec", {}), indent=2)
         # Safe Rendering for System Prompt
         system_prompt = render_prompt(
@@ -747,6 +764,7 @@ class MLEngineerAgent:
             execution_contract_json=json.dumps(execution_contract_compact, indent=2),
             contract_min_context=json.dumps(execution_contract_compact, indent=2),
             ml_view_context=ml_view_json,
+            plot_spec_context=plot_spec_json,
             evaluation_spec_json=evaluation_spec_json,
             spec_extraction_json=spec_extraction_json,
             ml_engineer_runbook=ml_runbook_json,
