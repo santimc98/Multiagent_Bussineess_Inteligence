@@ -136,7 +136,7 @@ def _coerce_raw_numeric(value: str) -> float | None:
     if not raw:
         return None
     raw = raw.replace("%", "")
-    raw = re.sub(r"[^0-9,\\.\\-+()]", "", raw)
+    raw = re.sub(r"[^0-9,\\.()+-]", "", raw)
     if not raw:
         return None
     neg = False
