@@ -42,6 +42,13 @@
       "params": {}
     }
   ],
+  "cleaning_gates": [
+    {
+      "name": "required_columns_present",
+      "severity": "HARD",
+      "params": {}
+    }
+  ],
   "reporting_policy": {
     "sections": ["Executive Decision"],
     "slots": [

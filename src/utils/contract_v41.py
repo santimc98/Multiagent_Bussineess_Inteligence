@@ -300,6 +300,49 @@ def get_qa_gates(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
     return normalized
 
 
+def get_cleaning_gates(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Return the list of cleaning gate specifications.
+
+    Returns:
+        List of cleaning gate objects.
+    """
+    if not isinstance(contract, dict):
+        return []
+    gates = contract.get("cleaning_gates")
+    if not isinstance(gates, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for gate in gates:
+        if isinstance(gate, dict):
+            name = gate.get("name") or gate.get("id") or gate.get("gate")
+            if not name:
+                continue
+            severity = gate.get("severity")
+            required = gate.get("required")
+            if severity is None and required is not None:
+                severity = "HARD" if bool(required) else "SOFT"
+            severity = str(severity).upper() if severity else "HARD"
+            if severity not in {"HARD", "SOFT"}:
+                severity = "HARD"
+            params = gate.get("params")
+            if not isinstance(params, dict):
+                params = {}
+            key = str(name).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append({"name": str(name), "severity": severity, "params": params})
+        elif isinstance(gate, str):
+            key = gate.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            normalized.append({"name": gate.strip(), "severity": "HARD", "params": {}})
+    return normalized
+
+
 def get_reviewer_gates(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Return the list of reviewer gate specifications.

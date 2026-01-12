@@ -347,6 +347,9 @@ Your output MUST be a valid JSON object with these top-level keys:
 "qa_gates": [
     {"name": "...", "severity": "HARD|SOFT", "params": {...}}
 ],
+"cleaning_gates": [
+    {"name": "...", "severity": "HARD|SOFT", "params": {...}}
+],
 "reviewer_gates": [...],
 "data_engineer_runbook": {...},
 "ml_engineer_runbook": {...},

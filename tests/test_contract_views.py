@@ -3,6 +3,7 @@ from pathlib import Path
 
 from src.utils.contract_views import (
     build_de_view,
+    build_cleaning_view,
     build_ml_view,
     build_qa_view,
     build_reviewer_view,
@@ -40,6 +41,37 @@ def test_ml_view_includes_required_fields():
     assert "forbidden_features" in ml_view
     assert isinstance(ml_view.get("forbidden_features"), list)
     assert ml_view.get("objective_type")
+
+
+def test_ml_view_includes_plot_spec_from_policy():
+    contract_full = {
+        "canonical_columns": ["col_a"],
+        "column_roles": {"pre_decision": ["col_a"]},
+        "allowed_feature_sets": {
+            "model_features": ["col_a"],
+            "segmentation_features": ["col_a"],
+            "forbidden_features": [],
+        },
+        "reporting_policy": {
+            "plot_spec": {
+                "enabled": True,
+                "max_plots": 1,
+                "plots": [{"id": "plot_1", "caption_template": "Example"}],
+            }
+        },
+    }
+    contract_min = {
+        "canonical_columns": ["col_a"],
+        "column_roles": {"pre_decision": ["col_a"]},
+        "allowed_feature_sets": {
+            "model_features": ["col_a"],
+            "segmentation_features": ["col_a"],
+            "forbidden_features": [],
+        },
+    }
+    ml_view = build_ml_view(contract_full, contract_min, [])
+    plot_spec = ml_view.get("plot_spec") or {}
+    assert plot_spec.get("plots")
 
 
 def test_ml_view_inherits_roles_when_min_lax():
@@ -183,6 +215,7 @@ def test_persist_views_writes_files(tmp_path):
     views = {
         "de_view": {"role": "data_engineer"},
         "ml_view": {"role": "ml_engineer"},
+        "cleaning_view": {"role": "cleaning_reviewer"},
         "qa_view": {"role": "qa_reviewer"},
         "reviewer_view": {"role": "reviewer"},
         "translator_view": {"role": "translator"},
@@ -190,5 +223,16 @@ def test_persist_views_writes_files(tmp_path):
     paths = persist_views(views, base_dir=str(tmp_path))
     assert (tmp_path / "contracts" / "views" / "de_view.json").exists()
     assert (tmp_path / "contracts" / "views" / "ml_view.json").exists()
+    assert (tmp_path / "contracts" / "views" / "cleaning_view.json").exists()
     assert (tmp_path / "contracts" / "views" / "qa_view.json").exists()
     assert paths.get("de_view")
+
+
+def test_cleaning_view_contains_gates_and_requirements():
+    contract_full = _load_fixture("contract_full_small.json")
+    contract_min = _load_fixture("contract_min_small.json")
+    artifact_index = _load_fixture("artifact_index_small.json")
+    cleaning_view = build_cleaning_view(contract_full, contract_min, artifact_index)
+    assert cleaning_view.get("required_columns")
+    assert cleaning_view.get("cleaning_gates")
+    assert cleaning_view.get("dialect")

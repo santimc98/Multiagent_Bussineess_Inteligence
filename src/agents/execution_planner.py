@@ -26,6 +26,7 @@ load_dotenv()
 
 
 _QA_SEVERITIES = {"HARD", "SOFT"}
+_CLEANING_SEVERITIES = {"HARD", "SOFT"}
 _RESAMPLING_TOKENS = {
     "bootstrap",
     "resample",
@@ -80,6 +81,82 @@ def _normalize_qa_gates(raw_gates: Any) -> List[Dict[str, Any]]:
         seen.add(key)
         normalized.append(spec)
     return normalized
+
+
+def _normalize_cleaning_gate_spec(item: Any) -> Dict[str, Any] | None:
+    if isinstance(item, dict):
+        name = item.get("name") or item.get("id") or item.get("gate")
+        if not name:
+            return None
+        severity = item.get("severity")
+        required = item.get("required")
+        if severity is None and required is not None:
+            severity = "HARD" if bool(required) else "SOFT"
+        severity = str(severity).upper() if severity else "HARD"
+        if severity not in _CLEANING_SEVERITIES:
+            severity = "HARD"
+        params = item.get("params")
+        if not isinstance(params, dict):
+            params = {}
+        return {"name": str(name), "severity": severity, "params": params}
+    if isinstance(item, str):
+        name = item.strip()
+        if not name:
+            return None
+        return {"name": name, "severity": "HARD", "params": {}}
+    return None
+
+
+def _normalize_cleaning_gates(raw_gates: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw_gates, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw_gates:
+        spec = _normalize_cleaning_gate_spec(item)
+        if not spec:
+            continue
+        key = spec["name"].strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        normalized.append(spec)
+    return normalized
+
+
+def _build_default_cleaning_gates() -> List[Dict[str, Any]]:
+    return [
+        {"name": "required_columns_present", "severity": "HARD", "params": {}},
+        {
+            "name": "id_integrity",
+            "severity": "HARD",
+            "params": {
+                "identifier_name_regex": r"(?i)(^id$|id$|entity|cod|code|key|partida|invoice|account)",
+                "detect_scientific_notation": True,
+            },
+        },
+        {
+            "name": "no_semantic_rescale",
+            "severity": "HARD",
+            "params": {
+                "allow_percent_like_only": True,
+                "percent_like_name_regex": r"(?i)%|pct|percent|plazo",
+            },
+        },
+        {"name": "no_synthetic_data", "severity": "HARD", "params": {}},
+        {
+            "name": "row_count_sanity",
+            "severity": "SOFT",
+            "params": {"max_drop_pct": 5.0, "max_dup_increase_pct": 1.0},
+        },
+    ]
+
+
+def _apply_cleaning_gate_policy(raw_gates: Any) -> List[Dict[str, Any]]:
+    gates = _normalize_cleaning_gates(raw_gates)
+    if not gates:
+        gates = _build_default_cleaning_gates()
+    return gates
 
 
 def _strategy_mentions_resampling(strategy: Dict[str, Any], business_objective: str) -> bool:
@@ -358,6 +435,7 @@ def _create_v41_skeleton(
         },
         
         "qa_gates": _apply_qa_gate_policy([], strategy, business_objective or "", {}),
+        "cleaning_gates": _apply_cleaning_gate_policy([]),
         
         "reviewer_gates": [
             {"id": "methodology_alignment", "required": True, "description": "Methodology aligns with objective"},
@@ -773,6 +851,7 @@ def build_contract_min(
         business_objective or "",
         contract,
     )
+    cleaning_gates = _apply_cleaning_gate_policy(contract.get("cleaning_gates"))
 
     return {
         "contract_version": contract.get("contract_version", 2),
@@ -791,6 +870,7 @@ def build_contract_min(
         "artifact_requirements": artifact_requirements,
         "required_outputs": required_outputs,
         "qa_gates": qa_gates,
+        "cleaning_gates": cleaning_gates,
         "reviewer_gates": [
             "strategy_followed",
             "metrics_present",
@@ -826,7 +906,7 @@ def ensure_v41_schema(contract: Dict[str, Any], strict: bool = False) -> Dict[st
         "validation_requirements", "leakage_execution_plan",
         "optimization_specification", "segmentation_constraints",
         "data_limited_mode", "allowed_feature_sets",
-        "artifact_requirements", "qa_gates", "reviewer_gates",
+        "artifact_requirements", "qa_gates", "cleaning_gates", "reviewer_gates",
         "data_engineer_runbook", "ml_engineer_runbook",
         "available_columns", "canonical_columns", "derived_columns",
         "required_outputs", "iteration_policy", "unknowns",
@@ -848,7 +928,7 @@ def ensure_v41_schema(contract: Dict[str, Any], strict: bool = False) -> Dict[st
             elif key in ("unknowns", "assumptions", "notes_for_engineers", "available_columns", 
                          "canonical_columns", "derived_columns", "required_outputs"):
                 contract[key] = []
-            elif key in ("qa_gates", "reviewer_gates"):
+            elif key in ("qa_gates", "cleaning_gates", "reviewer_gates"):
                 contract[key] = []
             elif key in ("strategy_title", "business_objective"):
                 contract[key] = ""
@@ -4200,6 +4280,7 @@ domain_expert_critique:
             business_objective or "",
             contract,
         )
+        contract["cleaning_gates"] = _apply_cleaning_gate_policy(contract.get("cleaning_gates"))
 
         if column_inventory and not contract.get("available_columns"):
             contract["available_columns"] = column_inventory
@@ -4293,6 +4374,7 @@ domain_expert_critique:
         
         # Extract ONLY from V4.1 fields
         qa_gates = contract.get("qa_gates", [])
+        cleaning_gates = contract.get("cleaning_gates", [])
         reviewer_gates = contract.get("reviewer_gates", [])
         artifact_requirements = contract.get("artifact_requirements", {})
         validation_requirements = contract.get("validation_requirements", {})
@@ -4306,6 +4388,7 @@ domain_expert_critique:
         # Build evaluation spec from V4.1 contract
         spec = {
             "qa_gates": qa_gates if isinstance(qa_gates, list) else [],
+            "cleaning_gates": cleaning_gates if isinstance(cleaning_gates, list) else [],
             "reviewer_gates": reviewer_gates if isinstance(reviewer_gates, list) else [],
             "artifact_requirements": artifact_requirements if isinstance(artifact_requirements, dict) else {},
             "validation_requirements": validation_requirements if isinstance(validation_requirements, dict) else {},
@@ -4324,6 +4407,8 @@ domain_expert_critique:
         unknowns = []
         if not qa_gates:
             unknowns.append("qa_gates missing from contract")
+        if not cleaning_gates:
+            unknowns.append("cleaning_gates missing from contract")
         if not reviewer_gates:
             unknowns.append("reviewer_gates missing from contract")
         if not required_outputs:

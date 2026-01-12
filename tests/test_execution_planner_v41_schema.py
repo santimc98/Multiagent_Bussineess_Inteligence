@@ -26,6 +26,7 @@ def test_fallback_contains_all_v41_keys():
         "optimization_specification", "segmentation_constraints",
         "data_limited_mode", "allowed_feature_sets",
         "artifact_requirements", "qa_gates", "reviewer_gates",
+        "cleaning_gates",
         "data_engineer_runbook", "ml_engineer_runbook",
         "available_columns", "canonical_columns", "derived_columns",
         "required_outputs", "iteration_policy", "unknowns",
@@ -71,6 +72,7 @@ def test_ensure_v41_schema_fills_missing_keys():
     assert "missing_columns_handling" in complete_contract
     assert "execution_constraints" in complete_contract
     assert "qa_gates" in complete_contract
+    assert "cleaning_gates" in complete_contract
     assert "reviewer_gates" in complete_contract
     assert "unknowns" in complete_contract
     
@@ -146,6 +148,7 @@ def test_contract_driven_evaluation_spec():
     contract = {
         "contract_version": 2,
         "qa_gates": [{"name": "test_gate", "severity": "HARD", "params": {}}],
+        "cleaning_gates": [{"name": "required_columns_present", "severity": "HARD", "params": {}}],
         "reviewer_gates": [{"id": "review_gate", "required": True}],
         "artifact_requirements": {"required_files": ["data/test.csv"]},
         "validation_requirements": {"method": "cross_validation"},

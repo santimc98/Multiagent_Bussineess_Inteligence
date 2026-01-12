@@ -28,7 +28,13 @@ from src.agents.data_engineer import DataEngineerAgent
 from src.agents.cleaning_reviewer import CleaningReviewerAgent
 from src.agents.reviewer import ReviewerAgent
 from src.agents.qa_reviewer import QAReviewerAgent, collect_static_qa_facts, run_static_qa_checks # New QA Gate
-from src.agents.execution_planner import ExecutionPlannerAgent, build_execution_plan, build_dataset_profile, build_reporting_policy
+from src.agents.execution_planner import (
+    ExecutionPlannerAgent,
+    build_execution_plan,
+    build_dataset_profile,
+    build_reporting_policy,
+    build_plot_spec,
+)
 from src.agents.failure_explainer import FailureExplainerAgent
 from src.agents.results_advisor import ResultsAdvisorAgent
 from src.utils.pdf_generator import convert_report_to_pdf
@@ -74,6 +80,7 @@ from src.utils.contract_v41 import (
 from src.utils.contract_views import (
     build_de_view,
     build_ml_view,
+    build_cleaning_view,
     build_qa_view,
     build_reviewer_view,
     build_translator_view,
@@ -1184,21 +1191,21 @@ def _resolve_allowed_columns_for_gate(
         deduped.append(col)
     return deduped
 
-def _resolve_allowed_patterns_for_gate(contract: Dict[str, Any]) -> List[str]:
+def _resolve_allowed_patterns_for_gate(contract: Any) -> List[str]:
     patterns: List[str] = []
-    if isinstance(contract, dict):
-        # V4.1 Priority
-        schema = contract.get("artifact_requirements", {}).get("file_schemas")
-        if not isinstance(schema, dict):
-             # Legacy Fallback
-             spec = contract.get("spec_extraction") or {}
-             schema = spec.get("artifact_schemas") or contract.get("artifact_schemas")
-        if isinstance(schema, dict):
-            scored_schema = schema.get("data/scored_rows.csv")
-            if isinstance(scored_schema, dict):
-                allowed_patterns = scored_schema.get("allowed_name_patterns")
-                if isinstance(allowed_patterns, list):
-                    patterns.extend([str(pat) for pat in allowed_patterns if isinstance(pat, str) and pat.strip()])
+    if not isinstance(contract, dict):
+        return patterns
+    schema = contract.get("artifact_requirements", {}).get("file_schemas")
+    if not isinstance(schema, dict):
+        # Legacy Fallback
+        spec = contract.get("spec_extraction") or {}
+        schema = spec.get("artifact_schemas") or contract.get("artifact_schemas")
+    if isinstance(schema, dict):
+        scored_schema = schema.get("data/scored_rows.csv")
+        if isinstance(scored_schema, dict):
+            allowed_patterns = scored_schema.get("allowed_name_patterns")
+            if isinstance(allowed_patterns, list):
+                patterns.extend([str(pat) for pat in allowed_patterns if isinstance(pat, str) and pat.strip()])
     return patterns
 
 def _resolve_contract_columns_for_cleaning(contract: Dict[str, Any], sources: set[str] | None = None) -> List[str]:
@@ -1592,6 +1599,79 @@ def _merge_artifact_index_entries(
     return list(merged.values())
 
 
+def _merge_non_empty_policy(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(base or {})
+    for key, value in (override or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        if isinstance(value, (list, dict)) and len(value) == 0:
+            continue
+        merged[key] = value
+    base_constraints = base.get("constraints") if isinstance(base, dict) else {}
+    override_constraints = override.get("constraints") if isinstance(override, dict) else {}
+    if isinstance(base_constraints, dict) or isinstance(override_constraints, dict):
+        merged["constraints"] = {
+            **(base_constraints if isinstance(base_constraints, dict) else {}),
+            **(override_constraints if isinstance(override_constraints, dict) else {}),
+        }
+    if isinstance(override, dict) and isinstance(override.get("plot_spec"), dict) and override.get("plot_spec"):
+        merged["plot_spec"] = override["plot_spec"]
+    return merged
+
+
+def _ensure_plot_spec_in_policy(policy: Dict[str, Any], contract: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(policy, dict):
+        policy = {}
+    plot_spec = policy.get("plot_spec")
+    needs_plot_spec = True
+    if isinstance(plot_spec, dict):
+        enabled = plot_spec.get("enabled", True)
+        plots = plot_spec.get("plots")
+        if enabled is False:
+            needs_plot_spec = False
+        elif isinstance(plots, list) and plots:
+            needs_plot_spec = False
+    if needs_plot_spec:
+        policy = dict(policy)
+        policy["plot_spec"] = build_plot_spec(contract)
+    return policy
+
+
+def _compact_reporting_policy(policy: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(policy, dict):
+        return {}
+    plot_spec = policy.get("plot_spec")
+    if not isinstance(plot_spec, dict) or not plot_spec:
+        return {}
+    plots = plot_spec.get("plots") if isinstance(plot_spec.get("plots"), list) else []
+    max_plots = plot_spec.get("max_plots")
+    if isinstance(max_plots, (int, float)):
+        max_plots_val = int(max_plots)
+    elif isinstance(max_plots, str) and max_plots.strip().isdigit():
+        max_plots_val = int(max_plots.strip())
+    else:
+        max_plots_val = len(plots)
+    return {
+        "plot_spec": {
+            "enabled": bool(plot_spec.get("enabled", True)),
+            "max_plots": max_plots_val,
+        }
+    }
+
+
+def _maybe_set_contract_min_policy(contract_min: Dict[str, Any] | None, policy: Dict[str, Any]) -> None:
+    if not isinstance(contract_min, dict):
+        return
+    existing = contract_min.get("reporting_policy")
+    if isinstance(existing, dict) and existing:
+        return
+    compact = _compact_reporting_policy(policy)
+    if compact:
+        contract_min["reporting_policy"] = compact
+
+
 def _build_contract_views(
     state: Dict[str, Any],
     contract: Dict[str, Any],
@@ -1612,6 +1692,7 @@ def _build_contract_views(
         artifact_index = _build_artifact_index(required_outputs, deliverables)
     de_view = build_de_view(contract, contract_min or {}, artifact_index)
     ml_view = build_ml_view(contract, contract_min or {}, artifact_index)
+    cleaning_view = build_cleaning_view(contract, contract_min or {}, artifact_index)
     qa_view = build_qa_view(contract, contract_min or {}, artifact_index)
     reviewer_view = build_reviewer_view(contract, contract_min or {}, artifact_index)
     translator_view = build_translator_view(contract, contract_min or {}, artifact_index)
@@ -1619,6 +1700,7 @@ def _build_contract_views(
     views = {
         "de_view": de_view,
         "ml_view": ml_view,
+        "cleaning_view": cleaning_view,
         "qa_view": qa_view,
         "reviewer_view": reviewer_view,
         "translator_view": translator_view,
@@ -1635,6 +1717,7 @@ def _build_contract_views(
         "artifact_index": artifact_index,
         "de_view": de_view,
         "ml_view": ml_view,
+        "cleaning_view": cleaning_view,
         "qa_view": qa_view,
         "reviewer_view": reviewer_view,
         "translator_view": translator_view,
@@ -5471,8 +5554,15 @@ def run_execution_planner(state: AgentState) -> AgentState:
         reporting_policy = build_reporting_policy(execution_plan, strategy)
     except Exception:
         reporting_policy = {}
-    if isinstance(contract, dict) and reporting_policy:
-        contract["reporting_policy"] = reporting_policy
+    existing_policy = contract.get("reporting_policy") if isinstance(contract, dict) else {}
+    merged_policy = _merge_non_empty_policy(
+        reporting_policy if isinstance(reporting_policy, dict) else {},
+        existing_policy if isinstance(existing_policy, dict) else {},
+    )
+    if isinstance(contract, dict):
+        merged_policy = _ensure_plot_spec_in_policy(merged_policy, contract)
+        if merged_policy:
+            contract["reporting_policy"] = merged_policy
     evaluation_spec = {}
     try:
         evaluation_spec = execution_planner.generate_evaluation_spec(
@@ -5502,8 +5592,7 @@ def run_execution_planner(state: AgentState) -> AgentState:
             )
         except Exception:
             contract_min = None
-    if isinstance(contract_min, dict) and reporting_policy:
-        contract_min["reporting_policy"] = reporting_policy
+    _maybe_set_contract_min_policy(contract_min, merged_policy if isinstance(merged_policy, dict) else {})
     try:
         os.makedirs("data", exist_ok=True)
         dump_json("data/execution_contract.json", contract)
@@ -5529,13 +5618,16 @@ def run_execution_planner(state: AgentState) -> AgentState:
         try:
             de_len = len(json.dumps(view_payload["contract_views"].get("de_view", {}), ensure_ascii=True))
             ml_len = len(json.dumps(view_payload["contract_views"].get("ml_view", {}), ensure_ascii=True))
+            cleaning_len = len(json.dumps(view_payload["contract_views"].get("cleaning_view", {}), ensure_ascii=True))
             qa_len = len(json.dumps(view_payload["contract_views"].get("qa_view", {}), ensure_ascii=True))
             print(f"Using DE_VIEW_CONTEXT length={de_len}")
             print(f"Using ML_VIEW_CONTEXT length={ml_len}")
+            print(f"Using CLEANING_VIEW_CONTEXT length={cleaning_len}")
             print(f"Using QA_VIEW_CONTEXT length={qa_len}")
             if run_id:
                 log_run_event(run_id, "de_view_context", {"length": de_len})
                 log_run_event(run_id, "ml_view_context", {"length": ml_len})
+                log_run_event(run_id, "cleaning_view_context", {"length": cleaning_len})
                 log_run_event(run_id, "qa_view_context", {"length": qa_len})
         except Exception:
             pass
@@ -5748,6 +5840,21 @@ def run_data_engineer(state: AgentState) -> AgentState:
         if run_id:
             log_run_event(run_id, "data_engineer_code_fence_strip", {"attempt": attempt_id})
         stripped = extract_code_block(raw_response)
+        if not stripped or not stripped.strip():
+            msg = "CRITICAL: Data Engineer returned only fenced/empty code."
+            print(msg)
+            if run_id:
+                log_run_event(run_id, "pipeline_aborted_reason", {"reason": "data_engineer_code_fence_empty"})
+            oc_report = _persist_output_contract_report(state, reason="data_engineer_code_fence_empty")
+            return {
+                "cleaning_code": "",
+                "cleaned_data_preview": "Error: Empty Code After Fence Strip",
+                "error_message": msg,
+                "output_contract_report": oc_report,
+                "pipeline_aborted_reason": "data_engineer_code_fence_empty",
+                "data_engineer_failed": True,
+                "budget_counters": counters,
+            }
         if stripped and stripped in code:
             prefix = code.split(stripped, 1)[0]
             code = prefix + stripped
@@ -6823,134 +6930,20 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         "error_message": "CRITICAL: Required input columns are empty after cleaning.\n" + payload,
                     }
 
-            # --- CLEANING REVIEWER (LLM) ---
+            # --- CLEANING REVIEWER (contract-driven) ---
             if cleaning_reviewer:
                 try:
-                    manifest_obj = load_json(local_manifest_path)
-                    conversions = manifest_obj.get("conversions", []) if isinstance(manifest_obj, dict) else []
-                    type_checks = manifest_obj.get("type_checks", []) if isinstance(manifest_obj, dict) else []
-                    leakage_check = manifest_obj.get("leakage_check", {}) if isinstance(manifest_obj, dict) else {}
-                    steward_summary = _load_json_safe("data/steward_summary.json")
-
-                    cleaned_stats = {}
-                    cleaned_samples = {}
-                    cleaned_value_counts = {}
-                    cleaned_range_stats = {}
-                    cleaned_preview_rows = []
-                    review_columns = list(dict.fromkeys(required_cols + list(contract_derived_cols or [])))
-                    for col in review_columns:
-                        if col not in df_mapped.columns:
-                            continue
-                        series = df_mapped[col]
-                        if series.dtype == object:
-                            stripped = series.astype(str).str.strip()
-                            null_like = series.isna() | (stripped == "")
-                        else:
-                            null_like = series.isna()
-                        cleaned_stats[col] = {
-                            "dtype": str(series.dtype),
-                            "null_frac": float(null_like.mean()) if len(series) else 0.0,
-                            "non_null_count": int((~null_like).sum()),
-                            "unique_count": int(series.nunique(dropna=True)),
-                        }
-                        if pd.api.types.is_numeric_dtype(series):
-                            try:
-                                cleaned_range_stats[col] = {
-                                    "min": float(series.min()),
-                                    "max": float(series.max()),
-                                }
-                            except Exception:
-                                cleaned_range_stats[col] = {}
-                        try:
-                            cleaned_samples[col] = series.dropna().astype(str).head(6).tolist()
-                        except Exception:
-                            cleaned_samples[col] = []
-                        try:
-                            vc = series.dropna().astype(str).value_counts().head(6)
-                            cleaned_value_counts[col] = {str(k): int(v) for k, v in vc.items()}
-                        except Exception:
-                            cleaned_value_counts[col] = {}
-                    try:
-                        preview_df = df_mapped[review_columns].head(6).copy()
-                        cleaned_preview_rows = preview_df.astype(str).to_dict(orient="records")
-                    except Exception:
-                        cleaned_preview_rows = []
-
-                    raw_samples = {}
-                    raw_pattern_stats = {}
-                    raw_value_counts = {}
-                    raw_null_stats = {}
-                    raw_vs_clean_null_delta = {}
-                    try:
-                        sample_df = sample_raw_columns(csv_path, input_dialect, required_cols, nrows=200, dtype=str)
-                        if not sample_df.empty:
-                            for col in sample_df.columns:
-                                raw_series = sample_df[col].dropna().astype(str)
-                                raw_samples[col] = raw_series.head(6).tolist()
-                                try:
-                                    raw_str = sample_df[col].astype(str).str.strip()
-                                    null_like = sample_df[col].isna() | raw_str.eq("") | raw_str.str.lower().isin(["nan", "null", "none"])
-                                    raw_null_stats[col] = {
-                                        "null_frac": float(null_like.mean()) if len(sample_df) else 0.0,
-                                        "sample_rows": int(len(sample_df)),
-                                    }
-                                    if col in cleaned_stats:
-                                        raw_vs_clean_null_delta[col] = float(cleaned_stats[col]["null_frac"] - raw_null_stats[col]["null_frac"])
-                                except Exception:
-                                    raw_null_stats[col] = {}
-                                if not raw_series.empty:
-                                    total = len(raw_series)
-                                    try:
-                                        vc = raw_series.value_counts().head(6)
-                                        raw_value_counts[col] = {str(k): int(v) for k, v in vc.items()}
-                                    except Exception:
-                                        raw_value_counts[col] = {}
-                                    raw_pattern_stats[col] = {
-                                        "numeric_like_ratio": float(sum(any(ch.isdigit() for ch in val) for val in raw_series) / total),
-                                        "dot_ratio": float(sum("." in val for val in raw_series) / total),
-                                        "comma_ratio": float(sum("," in val for val in raw_series) / total),
-                                        "percent_ratio": float(sum("%" in val for val in raw_series) / total),
-                                        "currency_ratio": float(sum(("€" in val) or ("â‚¬" in val) or ("$" in val) or ("£" in val) for val in raw_series) / total),
-                                    }
-                    except Exception:
-                        raw_samples = {}
-                        raw_pattern_stats = {}
-                        raw_value_counts = {}
-
-                    review_context = {
-                        "business_objective": business_objective,
-                        "strategy_title": selected.get("title", ""),
-                        "required_columns": required_cols,
-                        "input_dialect": input_dialect,
-                        "raw_samples": raw_samples,
-                        "raw_pattern_stats": raw_pattern_stats,
-                        "raw_value_counts": raw_value_counts,
-                        "raw_null_stats": raw_null_stats,
-                        "raw_vs_clean_null_delta": raw_vs_clean_null_delta,
-                        "cleaned_stats": cleaned_stats,
-                        "cleaned_samples": cleaned_samples,
-                        "cleaned_value_counts": cleaned_value_counts,
-                        "cleaned_range_stats": cleaned_range_stats,
-                        "cleaned_preview_rows": cleaned_preview_rows,
-                        "cleaning_manifest": manifest_obj,
-                        "manifest_conversions": conversions,
-                        "manifest_type_checks": type_checks,
-                        "leakage_check": leakage_check,
-                        "steward_summary": steward_summary,
-                        "execution_contract": {
-                            "data_requirements": contract.get("data_requirements", []),
-                            "validations": contract.get("validations", []),
-                            "feature_availability": contract.get("feature_availability", []),
-                            "availability_summary": contract.get("availability_summary", ""),
-                            "decision_variables": contract.get("decision_variables", []),
-                            "missing_sentinels": contract.get("missing_sentinels", []),
-                            "spec_extraction": contract.get("spec_extraction", {}),
-                            "business_alignment": contract.get("business_alignment", {}),
-                            "notes_for_engineers": contract.get("notes_for_engineers", []),
-                        },
-                        "cleaning_code_excerpt": code[:4000],
-                    }
-                    review_result = cleaning_reviewer.review_cleaning(review_context)
+                    cleaning_view = (
+                        state.get("cleaning_view")
+                        or (state.get("contract_views") or {}).get("cleaning_view")
+                        or {}
+                    )
+                    review_result = cleaning_reviewer.review_cleaning(
+                        cleaning_view,
+                        cleaned_csv_path=local_cleaned_path,
+                        cleaning_manifest_path=local_manifest_path,
+                        raw_csv_path=csv_path,
+                    )
                     try:
                         os.makedirs("artifacts", exist_ok=True)
                         with open(os.path.join("artifacts", "cleaning_reviewer_report.json"), "w", encoding="utf-8") as f_rep:
@@ -6963,31 +6956,53 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             "cleaning_reviewer",
                             prompt=getattr(cleaning_reviewer, "last_prompt", None),
                             response=getattr(cleaning_reviewer, "last_response", None) or review_result,
-                            context=review_context,
+                            context=cleaning_view,
                             verdicts=review_result,
                         )
 
-                    if isinstance(review_result, dict) and review_result.get("status") == "REJECTED":
-                        if not state.get("cleaning_reviewer_retry_done"):
-                            base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                            fixes = review_result.get("required_fixes", [])
-                            fixes_text = ""
-                            if isinstance(fixes, list) and fixes:
-                                fixes_text = "\nREQUIRED_FIXES:\n- " + "\n- ".join(str(item) for item in fixes)
-                            payload = "CLEANING_REVIEWER_ALERT:\n" + str(review_result.get("feedback", "")).strip() + fixes_text
-                            new_state = dict(state)
-                            new_state["cleaning_reviewer_retry_done"] = True
-                            new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
-                            print("Cleaning reviewer rejected output: retrying Data Engineer with guidance.")
-                            return run_data_engineer(new_state)
-                        return {
-                            "cleaning_code": code,
-                            "cleaned_data_preview": "Error: Cleaning Reviewer Rejected",
-                            "error_message": "CRITICAL: Cleaning reviewer rejected cleaned data.",
-                        }
+                    if isinstance(review_result, dict):
+                        status = review_result.get("status")
+                        if status == "REJECTED":
+                            if not state.get("cleaning_reviewer_retry_done"):
+                                base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                                fixes = review_result.get("required_fixes", [])
+                                fixes_text = ""
+                                if isinstance(fixes, list) and fixes:
+                                    fixes_text = "\nREQUIRED_FIXES:\n- " + "\n- ".join(str(item) for item in fixes)
+                                payload = "CLEANING_REVIEWER_ALERT:\n" + str(review_result.get("feedback", "")).strip() + fixes_text
+                                new_state = dict(state)
+                                new_state["cleaning_reviewer_retry_done"] = True
+                                new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+                                print("Cleaning reviewer rejected output: retrying Data Engineer with guidance.")
+                                return run_data_engineer(new_state)
+                            if run_id:
+                                log_run_event(run_id, "pipeline_aborted_reason", {"reason": "cleaning_reviewer_rejected"})
+                            return {
+                                "cleaning_code": code,
+                                "cleaned_data_preview": "Error: Cleaning Reviewer Rejected",
+                                "error_message": "CRITICAL: Cleaning reviewer rejected cleaned data.",
+                                "pipeline_aborted_reason": "cleaning_reviewer_rejected",
+                                "data_engineer_failed": True,
+                                "budget_counters": counters,
+                            }
+                        if status == "APPROVE_WITH_WARNINGS":
+                            warnings = review_result.get("warnings") or []
+                            if not isinstance(warnings, list):
+                                warnings = [str(warnings)]
+                            state["cleaning_reviewer_warnings"] = warnings
                 except Exception as review_err:
-                    print(f"Warning: cleaning reviewer failed: {review_err}")
-
+                    msg = f"CRITICAL: Cleaning reviewer failed: {review_err}"
+                    print(msg)
+                    if run_id:
+                        log_run_event(run_id, "pipeline_aborted_reason", {"reason": "cleaning_reviewer_failed"})
+                    return {
+                        "cleaning_code": code,
+                        "cleaned_data_preview": "Error: Cleaning Reviewer Failed",
+                        "error_message": msg,
+                        "pipeline_aborted_reason": "cleaning_reviewer_failed",
+                        "data_engineer_failed": True,
+                        "budget_counters": counters,
+                    }
             # Guard: derived columns should not be constant if present
             derived_issues = []
             derived_evidence = {}

@@ -16,6 +16,13 @@
       "params": {}
     }
   ],
+  "cleaning_gates": [
+    {
+      "name": "required_columns_present",
+      "severity": "HARD",
+      "params": {}
+    }
+  ],
   "evaluation_spec": {
     "objective_type": "classification",
     "reviewer_gates": ["metrics_present"],

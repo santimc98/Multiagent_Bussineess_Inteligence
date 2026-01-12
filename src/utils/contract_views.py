@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, TypedDict
 from src.utils.contract_v41 import (
     get_canonical_columns,
     get_column_roles,
+    get_cleaning_gates,
     get_qa_gates,
     get_required_outputs,
     get_validation_requirements,
@@ -69,6 +70,17 @@ class ResultsAdvisorView(TypedDict, total=False):
     evidence_inventory: List[Dict[str, Any]]
 
 
+class CleaningView(TypedDict, total=False):
+    role: str
+    strategy_title: str
+    business_objective: str
+    required_columns: List[str]
+    dialect: Dict[str, Any]
+    cleaning_gates: List[Dict[str, Any]]
+    column_roles: Dict[str, List[str]]
+    allowed_feature_sets: Dict[str, Any]
+
+
 class QAView(TypedDict, total=False):
     role: str
     qa_gates: List[Dict[str, Any]]
@@ -86,7 +98,10 @@ _PRESERVE_KEYS = {
     "forbidden_features",
     "reviewer_gates",
     "qa_gates",
+    "cleaning_gates",
     "gates",
+    "plot_spec",
+    "plots",
 }
 
 _IDENTIFIER_TOKENS = {
@@ -370,6 +385,26 @@ def _resolve_qa_gates(contract_min: Dict[str, Any], contract_full: Dict[str, Any
         gates = _normalize(eval_spec.get("qa_gates"))
         if gates:
             return gates
+    return []
+
+
+def _resolve_cleaning_gates(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> List[Dict[str, Any]]:
+    gates = get_cleaning_gates(contract_full)
+    if gates:
+        return gates
+    gates = get_cleaning_gates(contract_min)
+    if gates:
+        return gates
+    eval_spec = contract_full.get("evaluation_spec") if isinstance(contract_full, dict) else None
+    if isinstance(eval_spec, dict):
+        raw = eval_spec.get("cleaning_gates")
+        if isinstance(raw, list):
+            return [g for g in raw if isinstance(g, dict)]
+    eval_spec = contract_min.get("evaluation_spec") if isinstance(contract_min, dict) else None
+    if isinstance(eval_spec, dict):
+        raw = eval_spec.get("cleaning_gates")
+        if isinstance(raw, list):
+            return [g for g in raw if isinstance(g, dict)]
     return []
 
 
@@ -702,6 +737,8 @@ def build_ml_view(
     if case_rules is not None:
         view["case_rules"] = case_rules
     policy = contract_full.get("reporting_policy")
+    if not isinstance(policy, dict) or not policy:
+        policy = contract_min.get("reporting_policy")
     plot_spec = _cap_plot_spec(policy.get("plot_spec") if isinstance(policy, dict) else None)
     if plot_spec is not None:
         view["plot_spec"] = plot_spec
@@ -841,6 +878,33 @@ def build_results_advisor_view(
         "objective_type": objective_type,
         "reporting_policy": policy,
         "evidence_inventory": _normalize_artifact_index(artifact_index),
+    }
+    return trim_to_budget(view, 12000)
+
+
+def build_cleaning_view(
+    contract_full: Dict[str, Any] | None,
+    contract_min: Dict[str, Any] | None,
+    artifact_index: Any,
+) -> Dict[str, Any]:
+    contract_full = contract_full if isinstance(contract_full, dict) else {}
+    contract_min = contract_min if isinstance(contract_min, dict) else {}
+    required_columns = _resolve_required_columns(contract_min, contract_full)
+    column_roles = _resolve_column_roles(contract_min, contract_full)
+    allowed_feature_sets = _resolve_allowed_feature_sets(contract_min, contract_full)
+    dialect = _resolve_output_dialect(contract_min, contract_full)
+    cleaning_gates = _resolve_cleaning_gates(contract_min, contract_full)
+    view: CleaningView = {
+        "role": "cleaning_reviewer",
+        "strategy_title": _first_value(contract_full.get("strategy_title"), contract_min.get("strategy_title")) or "",
+        "business_objective": _first_value(
+            contract_full.get("business_objective"), contract_min.get("business_objective")
+        ) or "",
+        "required_columns": required_columns,
+        "dialect": dialect,
+        "cleaning_gates": cleaning_gates,
+        "column_roles": column_roles,
+        "allowed_feature_sets": allowed_feature_sets,
     }
     return trim_to_budget(view, 12000)
 
