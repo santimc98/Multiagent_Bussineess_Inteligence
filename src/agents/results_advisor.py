@@ -512,10 +512,17 @@ class ResultsAdvisorAgent:
         if isinstance(data_adequacy, dict):
             reasons = data_adequacy.get("reasons", []) if isinstance(data_adequacy.get("reasons"), list) else []
             threshold_reached = bool(data_adequacy.get("threshold_reached"))
-            if data_adequacy.get("status") in {"data_limited", "insufficient_signal"} or threshold_reached or "signal_ceiling_reached" in reasons:
+            infra_reasons = [r for r in reasons if "cleaned_data_read_failed" in str(r) or "required_outputs_missing" in str(r)]
+            if infra_reasons:
+                return {
+                    "action": "RETRY",
+                    "reason": "Infrastructure or artifact issues detected in data adequacy.",
+                    "next_changes": ["Fix pipeline IO/artifacts before further iterations."],
+                }
+            if threshold_reached or "signal_ceiling_reached" in reasons:
                 return {
                     "action": "STOP",
-                    "reason": "Data adequacy indicates signal ceiling or insufficient signal.",
+                    "reason": "Data adequacy indicates signal ceiling reached.",
                     "next_changes": [],
                 }
         if isinstance(metric_history, list) and self._detect_plateau(metric_history, window, epsilon):
@@ -524,6 +531,14 @@ class ResultsAdvisorAgent:
                 "reason": "Metrics plateau across recent iterations.",
                 "next_changes": [],
             }
+        if isinstance(data_adequacy, dict):
+            status = data_adequacy.get("status")
+            if status in {"data_limited", "insufficient_signal", "unknown"}:
+                return {
+                    "action": "RETRY",
+                    "reason": "Data adequacy inconclusive; address missing signal before stopping.",
+                    "next_changes": self._suggest_next_changes(review_feedback),
+                }
         return {
             "action": "RETRY",
             "reason": "Continue iteration to improve metrics with targeted changes.",

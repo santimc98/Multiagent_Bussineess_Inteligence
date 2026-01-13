@@ -1,6 +1,8 @@
+import csv
 import difflib
 import json
 import os
+import re
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -19,13 +21,99 @@ def _safe_load_json(path: str) -> Dict[str, Any]:
         return {}
 
 
-def _safe_load_csv(path: str) -> pd.DataFrame | None:
-    if not os.path.exists(path):
+def _load_output_dialect(manifest_path: str = "data/cleaning_manifest.json") -> Dict[str, Any] | None:
+    if not os.path.exists(manifest_path):
         return None
+    manifest = _safe_load_json(manifest_path)
+    dialect = manifest.get("output_dialect") if isinstance(manifest, dict) else None
+    if isinstance(dialect, dict) and dialect.get("sep"):
+        return dialect
+    return None
+
+
+def _read_sample(path: str, encoding: str, size: int = 50_000) -> str:
     try:
-        return pd.read_csv(path)
+        with open(path, "r", encoding=encoding, errors="replace") as handle:
+            return handle.read(size)
     except Exception:
-        return None
+        return ""
+
+
+def _sniff_delimiter(sample: str) -> str:
+    candidates = [",", ";", "\t", "|"]
+    if sample:
+        try:
+            sniffed = csv.Sniffer().sniff(sample, delimiters=candidates)
+            if sniffed.delimiter in candidates:
+                return sniffed.delimiter
+        except Exception:
+            pass
+    counts = {delim: sample.count(delim) for delim in candidates}
+    best = max(counts, key=counts.get) if counts else ","
+    return best if counts.get(best, 0) > 0 else ","
+
+
+def _infer_decimal_from_sample(sample: str, sep: str) -> str:
+    comma_hits = len(re.findall(r"\d+,\d+", sample))
+    dot_hits = len(re.findall(r"\d+\.\d+", sample))
+    if comma_hits > dot_hits:
+        return ","
+    return "."
+
+
+def _sniff_csv_dialect(path: str) -> Dict[str, Any]:
+    sample = _read_sample(path, "utf-8")
+    sep = _sniff_delimiter(sample)
+    decimal = _infer_decimal_from_sample(sample, sep)
+    return {"sep": sep, "decimal": decimal, "encoding": "utf-8"}
+
+
+def _read_header_line(path: str, encoding: str) -> str:
+    try:
+        with open(path, "r", encoding=encoding, errors="replace") as handle:
+            return (handle.readline() or "").strip()
+    except Exception:
+        return ""
+
+
+def _pick_alternate_sep(header: str, current_sep: str) -> str | None:
+    candidates = [",", ";", "\t", "|"]
+    best = None
+    best_count = 0
+    for delim in candidates:
+        if delim == current_sep:
+            continue
+        count = header.count(delim)
+        if count > best_count:
+            best_count = count
+            best = delim
+    return best
+
+
+def _safe_load_csv(path: str) -> tuple[pd.DataFrame | None, str | None]:
+    if not os.path.exists(path):
+        return None, "file_missing"
+    dialect = _load_output_dialect() or _sniff_csv_dialect(path)
+    sep = dialect.get("sep") or ","
+    decimal = dialect.get("decimal") or "."
+    encoding = dialect.get("encoding") or "utf-8"
+    try:
+        df = pd.read_csv(path, sep=sep, decimal=decimal, encoding=encoding)
+    except Exception as exc:
+        return None, f"{type(exc).__name__}:{exc}"
+    if df.shape[1] == 1:
+        header = _read_header_line(path, encoding)
+        alt_sep = _pick_alternate_sep(header, sep)
+        if header and alt_sep:
+            sample = _read_sample(path, encoding)
+            alt_decimal = _infer_decimal_from_sample(sample, alt_sep)
+            try:
+                alt_df = pd.read_csv(path, sep=alt_sep, decimal=alt_decimal, encoding=encoding)
+                if alt_df.shape[1] > 1:
+                    return alt_df, None
+            except Exception:
+                pass
+    return df, None
 
 
 def _is_number(value: Any) -> bool:
@@ -65,6 +153,38 @@ def _metric_category(metric_name: str) -> str:
     if any(token in key for token in ["mae", "rmse", "mse", "mape", "smape", "r2", "r_squared"]):
         return "regression"
     return "other"
+
+
+def _infer_objective_family_from_metrics(metric_keys: List[str]) -> str | None:
+    counts: Dict[str, int] = {}
+    for key in metric_keys:
+        category = _metric_category(key)
+        if category == "other":
+            continue
+        counts[category] = counts.get(category, 0) + 1
+    if not counts:
+        return None
+    return max(counts.items(), key=lambda item: item[1])[0]
+
+
+def _infer_objective_family(
+    contract: Dict[str, Any],
+    metrics_report: Dict[str, Any],
+    weights: Dict[str, Any],
+) -> str | None:
+    validation = contract.get("validation_requirements", {}) if isinstance(contract, dict) else {}
+    metric_keys: List[str] = []
+    metrics_spec = validation.get("metrics") if isinstance(validation, dict) else None
+    if isinstance(metrics_spec, dict):
+        metric_keys.extend([str(key) for key in metrics_spec.keys()])
+    elif isinstance(metrics_spec, list):
+        metric_keys.extend([str(key) for key in metrics_spec])
+    elif isinstance(metrics_spec, str):
+        metric_keys.append(metrics_spec)
+    if not metric_keys:
+        metric_pool = _extract_metric_pool(weights, metrics_report)
+        metric_keys = list(metric_pool.keys())
+    return _infer_objective_family_from_metrics(metric_keys)
 
 
 def _metric_higher_is_better(metric_name: str) -> bool:
@@ -375,9 +495,10 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
     contract = _safe_load_json("data/execution_contract.json") or state.get("execution_contract", {})
     weights = _safe_load_json("data/weights.json")
     metrics_report = _safe_load_json("data/metrics.json")
-    cleaned = _safe_load_csv("data/cleaned_data.csv")
-    case_summary = _safe_load_csv("data/case_summary.csv")
-    base_missing = cleaned is None or (not metrics_report and not weights)
+    cleaned, cleaned_err = _safe_load_csv("data/cleaned_data.csv")
+    case_summary, _case_summary_err = _safe_load_csv("data/case_summary.csv")
+    cleaned_read_failed = cleaned is None and cleaned_err not in (None, "file_missing")
+    base_missing = (cleaned is None and not cleaned_read_failed) or (not metrics_report and not weights)
     objective_type = (
         state.get("objective_type")
         or (contract.get("evaluation_spec") or {}).get("objective_type")
@@ -396,6 +517,10 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         "calibration": "ranking",
     }
     objective_family = objective_map.get(objective_key, "unknown")
+    if objective_family == "unknown":
+        inferred = _infer_objective_family(contract, metrics_report, weights)
+        if inferred:
+            objective_family = inferred
 
     if objective_family == "unknown":
         output_report = _safe_load_json("data/output_contract_report.json")
@@ -414,14 +539,20 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
                 }
         reasons: List[str] = []
         if cleaned is None:
-            reasons.append("cleaned_data_missing")
+            if cleaned_read_failed:
+                reasons.append(f"cleaned_data_read_failed:{cleaned_err}")
+            else:
+                reasons.append("cleaned_data_missing")
         if missing_outputs:
             reasons.append("required_outputs_missing")
         if valid_row_fraction is not None and valid_row_fraction < 0.8:
             reasons.append("low_valid_row_fraction")
         if any(val > 0.5 for val in missingness_summary.values() if isinstance(val, float)):
             reasons.append("high_missingness")
-        status = "insufficient_signal" if reasons else "sufficient_signal"
+        if any(reason.startswith("cleaned_data_read_failed") for reason in reasons):
+            status = "unknown"
+        else:
+            status = "insufficient_signal" if reasons else "sufficient_signal"
         threshold = int(state.get("data_adequacy_threshold", 3) or 3)
         consecutive = int(state.get("data_adequacy_consecutive", 0) or 0)
         return {
@@ -553,6 +684,11 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
         reg_proxy = {"best_abs_spearman": None, "best_feature": None, "best_r2_proxy": None}
 
     reasons: List[str] = []
+    if cleaned is None:
+        if cleaned_read_failed:
+            reasons.append(f"cleaned_data_read_failed:{cleaned_err}")
+        else:
+            reasons.append("cleaned_data_missing")
     if base_missing:
         reasons.append("pipeline_aborted_before_metrics")
     signals: Dict[str, Any] = {
@@ -655,7 +791,9 @@ def build_data_adequacy_report(state: Dict[str, Any]) -> Dict[str, Any]:
     if "classification_baseline_missing" in reasons or "regression_baseline_missing" in reasons:
         recommendations.append("Include baseline metrics (dummy/naive) to quantify lift over trivial models.")
 
-    if base_missing:
+    if cleaned_read_failed:
+        status = "unknown"
+    elif base_missing:
         status = "insufficient_signal"
     else:
         status = "data_limited" if data_limited else "sufficient_signal"
