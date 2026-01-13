@@ -391,6 +391,9 @@ def _normalize_gate_name(name: Any) -> str:
     alias_map = {
         "numericparsingvalidation": "numeric_parsing_validation",
         "numeric_parsing_validation": "numeric_parsing_validation",
+        "numeric_parsing_verification": "numeric_parsing_validation",
+        "numericparsingverification": "numeric_parsing_validation",
+        "numeric_parsing_check": "numeric_parsing_validation",
     }
     return alias_map.get(key, key)
 
@@ -1277,9 +1280,13 @@ def _check_row_count_sanity(manifest: Dict[str, Any], params: Dict[str, Any]) ->
     rows_after = manifest.get("rows_after")
     row_counts = manifest.get("row_counts") or {}
     if rows_before is None:
-        rows_before = row_counts.get("initial")
+        for key in ("initial", "original", "input", "rows_before", "total"):
+            if rows_before is None:
+                rows_before = row_counts.get(key)
     if rows_after is None:
-        rows_after = row_counts.get("final")
+        for key in ("final", "after_cleaning", "output", "rows_after"):
+            if rows_after is None:
+                rows_after = row_counts.get(key)
     if not isinstance(rows_before, (int, float)) or not isinstance(rows_after, (int, float)):
         return []
     if rows_before <= 0:
