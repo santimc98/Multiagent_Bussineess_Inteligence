@@ -654,6 +654,37 @@ def build_contract_min(
         return [col for col in cols if col in canon_set]
 
     roles = contract.get("column_roles", {}) if isinstance(contract.get("column_roles"), dict) else {}
+    if roles and all(isinstance(val, dict) and "role" in val for val in roles.values()):
+        role_lists = {
+            "pre_decision": [],
+            "decision": [],
+            "outcome": [],
+            "post_decision_audit_only": [],
+            "unknown": [],
+        }
+        role_aliases = {
+            "pre_decision": "pre_decision",
+            "predecision": "pre_decision",
+            "pre_decision_features": "pre_decision",
+            "decision": "decision",
+            "decisions": "decision",
+            "outcome": "outcome",
+            "target": "outcome",
+            "label": "outcome",
+            "post_decision_audit_only": "post_decision_audit_only",
+            "post_decision": "post_decision_audit_only",
+            "audit_only": "post_decision_audit_only",
+            "audit": "post_decision_audit_only",
+            "unknown": "unknown",
+        }
+        for col, meta in roles.items():
+            role_raw = str(meta.get("role") or "").strip().lower()
+            role_key = re.sub(r"[^a-z0-9]+", "_", role_raw).strip("_")
+            role_bucket = role_aliases.get(role_key, "unknown")
+            norm = _normalize_column_identifier(col)
+            resolved = inventory_norms.get(norm) or col
+            role_lists[role_bucket].append(resolved)
+        roles = role_lists
     roles_present = any(
         _coerce_list(roles.get(key))
         for key in ("pre_decision", "decision", "outcome", "post_decision_audit_only")

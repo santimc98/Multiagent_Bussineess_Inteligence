@@ -121,7 +121,7 @@ from src.utils.code_extract import extract_code_block, is_syntax_valid
 from src.utils.visuals import generate_fallback_plots
 from src.utils.recommendations_preview import build_recommendations_preview
 from src.utils.label_enrichment import enrich_outputs
-from src.utils.ml_validation import validate_model_metrics_consistency
+from src.utils.ml_validation import validate_model_metrics_consistency, validate_metrics_ci_consistency
 from src.utils.json_sanitize import dump_json
 
 def _norm_name(name: str) -> str:
@@ -3593,6 +3593,33 @@ def _load_json_any(path: str) -> Any:
             return json.load(f)
     except Exception:
         return None
+
+def _resolve_artifact_gate_dialect(state: Dict[str, Any], contract: Dict[str, Any]) -> Dict[str, str]:
+    csv_sep = state.get("csv_sep") or None
+    csv_decimal = state.get("csv_decimal") or None
+    csv_encoding = state.get("csv_encoding") or None
+    if (not csv_sep or not csv_decimal or not csv_encoding) and os.path.exists("data/cleaning_manifest.json"):
+        manifest = _load_json_safe("data/cleaning_manifest.json")
+        output_dialect = manifest.get("output_dialect") if isinstance(manifest, dict) else None
+        if isinstance(output_dialect, dict):
+            if not csv_sep:
+                csv_sep = output_dialect.get("sep")
+            if not csv_decimal:
+                csv_decimal = output_dialect.get("decimal")
+            if not csv_encoding:
+                csv_encoding = output_dialect.get("encoding")
+            if csv_sep and not state.get("csv_sep"):
+                state["csv_sep"] = csv_sep
+            if csv_decimal and not state.get("csv_decimal"):
+                state["csv_decimal"] = csv_decimal
+            if csv_encoding and not state.get("csv_encoding"):
+                state["csv_encoding"] = csv_encoding
+    contract_output_dialect = contract.get("output_dialect", {}) if isinstance(contract, dict) else {}
+    return {
+        "sep": csv_sep or contract_output_dialect.get("sep") or ",",
+        "decimal": csv_decimal or contract_output_dialect.get("decimal") or ".",
+        "encoding": csv_encoding or contract_output_dialect.get("encoding") or "utf-8",
+    }
 
 def _select_segment_column(columns: List[str], contract: Dict[str, Any] | None = None) -> str | None:
     if not columns:
@@ -8675,12 +8702,11 @@ def execute_code(state: AgentState) -> AgentState:
 
     eval_spec = state.get("evaluation_spec") or (contract.get("evaluation_spec") if isinstance(contract, dict) else {})
 
-    # CRITICAL: Use output_dialect from contract (ML outputs) not input dialect from state
-    # This ensures validator reads files with same dialect that ML Engineer wrote them
-    contract_output_dialect = contract.get("output_dialect", {}) if isinstance(contract, dict) else {}
-    csv_sep = contract_output_dialect.get("sep") or state.get("csv_sep", ",")
-    csv_decimal = contract_output_dialect.get("decimal") or state.get("csv_decimal", ".")
-    csv_encoding = contract_output_dialect.get("encoding") or state.get("csv_encoding", "utf-8")
+    # CRITICAL: Use runtime dialect from state first (cleaning_manifest), fallback to contract
+    dialect = _resolve_artifact_gate_dialect(state, contract)
+    csv_sep = dialect["sep"]
+    csv_decimal = dialect["decimal"]
+    csv_encoding = dialect["encoding"]
 
     artifact_issues = _artifact_alignment_gate(
         cleaned_path="data/cleaned_full.csv" if os.path.exists("data/cleaned_full.csv") else "data/cleaned_data.csv",
@@ -9075,6 +9101,16 @@ def run_result_evaluator(state: AgentState) -> AgentState:
                 dump_json("data/metrics.json", metrics_report)
             except Exception as metrics_err:
                 print(f"Warning: failed to persist fallback metrics.json: {metrics_err}")
+
+    # 5.5.1) Metrics schema consistency (mean inside CI)
+    if metrics_report:
+        ci_issues = validate_metrics_ci_consistency(metrics_report)
+        if ci_issues:
+            status = "NEEDS_IMPROVEMENT"
+            issue_text = ", ".join(ci_issues)
+            msg = f"METRICS_SCHEMA_INCONSISTENT: {issue_text}"
+            new_history.append(msg)
+            feedback = f"{feedback}\n{msg}" if feedback else msg
 
     # 5.6) Model Metrics Consistency Validation (Informative helper)
     if metrics_report:

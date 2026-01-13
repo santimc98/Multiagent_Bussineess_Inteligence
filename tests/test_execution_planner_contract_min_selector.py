@@ -101,3 +101,23 @@ def test_contract_min_inherits_roles_from_full() -> None:
     assert allowed.get("segmentation_features") == ["A"]
     assert allowed.get("model_features") == ["A", "B"]
     assert set(allowed.get("forbidden_features") or []) == {"C", "D"}
+
+
+def test_contract_min_normalizes_column_role_maps() -> None:
+    inventory = ["ColA", "ColB", "ColC", "ColD"]
+    strategy = {"required_columns": ["ColA", "ColB", "ColC", "ColD"]}
+    full_contract = {
+        "column_roles": {
+            "ColA": {"role": "pre_decision"},
+            "ColB": {"role": "decision"},
+            "ColC": {"role": "outcome"},
+            "ColD": {"role": "post_decision_audit_only"},
+        }
+    }
+    relevant = ["ColA", "ColB", "ColC", "ColD"]
+    contract_min = build_contract_min(full_contract, strategy, inventory, relevant)
+    roles = contract_min.get("column_roles", {})
+    assert roles.get("pre_decision") == ["ColA"]
+    assert roles.get("decision") == ["ColB"]
+    assert roles.get("outcome") == ["ColC"]
+    assert roles.get("post_decision_audit_only") == ["ColD"]

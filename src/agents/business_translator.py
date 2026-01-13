@@ -58,6 +58,17 @@ def _facts_from_insights(insights: Dict[str, Any], max_items: int = 8):
             facts.append({"source": "insights.json", "metric": metric, "value": value, "labels": {}})
             if len(facts) >= max_items:
                 break
+    deployment = insights.get("deployment_recommendation")
+    confidence = insights.get("confidence")
+    if deployment:
+        facts.append(
+            {
+                "source": "insights.json",
+                "metric": "deployment_recommendation",
+                "value": deployment,
+                "labels": {"confidence": confidence or ""},
+            }
+        )
     return facts
 
 def _safe_load_csv(path: str, max_rows: int = 200):

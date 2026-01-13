@@ -112,6 +112,7 @@ class ResultsAdvisorAgent:
         if not metrics_summary and isinstance(metrics_payload, dict):
             nested = metrics_payload.get("metrics")
             metrics_summary = self._extract_metrics_summary(nested, objective_type)
+        deployment_info = self._compute_deployment_recommendation(metrics_payload, predictions_summary)
         risks = []
         recommendations = []
         summary_lines: List[str] = []
@@ -189,6 +190,9 @@ class ResultsAdvisorAgent:
             "risks": risks,
             "recommendations": recommendations,
             "summary_lines": summary_lines,
+            "deployment_recommendation": deployment_info.get("deployment_recommendation"),
+            "confidence": deployment_info.get("confidence"),
+            "primary_metric": deployment_info.get("primary_metric"),
         }
         self.last_response = insights
         if not summary_lines and metrics_summary:
@@ -382,6 +386,84 @@ class ResultsAdvisorAgent:
             if len(items) >= max_items:
                 break
         return items
+
+    def _normalize_metric_key(self, name: str) -> str:
+        return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
+
+    def _pick_primary_metric_with_ci(self, model_perf: Dict[str, Any]) -> tuple[str | None, Dict[str, Any] | None]:
+        if not isinstance(model_perf, dict):
+            return None, None
+        for key, value in model_perf.items():
+            if self._normalize_metric_key(key) == "revenuelift" and isinstance(value, dict):
+                return str(key), value
+        for key, value in model_perf.items():
+            if isinstance(value, dict) and all(k in value for k in ("mean", "ci_lower", "ci_upper")):
+                return str(key), value
+        return None, None
+
+    def _extract_row_count(self, metrics: Dict[str, Any], predictions_summary: Dict[str, Any]) -> Optional[int]:
+        row_count = None
+        if isinstance(predictions_summary, dict):
+            rc = predictions_summary.get("row_count")
+            num = self._coerce_number(rc, ".")
+            if num is not None:
+                row_count = int(num)
+        model_perf = metrics.get("model_performance") if isinstance(metrics.get("model_performance"), dict) else {}
+        for key in ["training_samples", "n_samples", "n_rows", "rows", "row_count"]:
+            if row_count is not None:
+                break
+            num = self._coerce_number(model_perf.get(key), ".")
+            if num is not None:
+                row_count = int(num)
+        return row_count
+
+    def _compute_deployment_recommendation(
+        self,
+        metrics: Dict[str, Any],
+        predictions_summary: Dict[str, Any],
+        min_rows: int = 200,
+    ) -> Dict[str, Any]:
+        recommendation = "PILOT"
+        confidence = "LOW"
+        model_perf = metrics.get("model_performance") if isinstance(metrics.get("model_performance"), dict) else {}
+        metric_name, metric_payload = self._pick_primary_metric_with_ci(model_perf)
+        if not metric_name or not isinstance(metric_payload, dict):
+            return {
+                "deployment_recommendation": recommendation,
+                "confidence": confidence,
+            }
+        mean = self._coerce_number(metric_payload.get("mean"), ".")
+        lower = self._coerce_number(metric_payload.get("ci_lower"), ".")
+        upper = self._coerce_number(metric_payload.get("ci_upper"), ".")
+        if mean is None or lower is None or upper is None:
+            return {
+                "deployment_recommendation": recommendation,
+                "confidence": confidence,
+            }
+        width = max(0.0, upper - lower)
+        normalized_width = width / max(abs(mean), 1.0)
+        non_negative = all(val >= 0 for val in [mean, lower, upper])
+        ratio_like = non_negative and all(abs(val - 1.0) <= 0.2 for val in [mean, lower, upper])
+        baseline = 1.0 if ratio_like else 0.0
+        includes_baseline = lower <= baseline <= upper
+        row_count = self._extract_row_count(metrics, predictions_summary)
+
+        if includes_baseline:
+            recommendation = "PILOT"
+            confidence = "MEDIUM" if normalized_width <= 0.1 else "LOW"
+        else:
+            if row_count is not None and row_count >= min_rows:
+                recommendation = "GO"
+                confidence = "HIGH" if normalized_width <= 0.1 else "MEDIUM"
+            else:
+                recommendation = "PILOT"
+                confidence = "MEDIUM" if normalized_width <= 0.1 else "LOW"
+
+        return {
+            "deployment_recommendation": recommendation,
+            "confidence": confidence,
+            "primary_metric": metric_name,
+        }
 
     def _flatten_numeric_metrics(self, metrics: Dict[str, Any], prefix: str = "") -> Dict[str, float]:
         if not isinstance(metrics, dict):

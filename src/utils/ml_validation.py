@@ -218,3 +218,55 @@ def validate_model_metrics_consistency(
                 }
 
     return {"passed": True, "error_message": "", "details": details}
+
+
+def validate_metrics_ci_consistency(metrics: Dict[str, Any]) -> List[str]:
+    """
+    Validate that metric mean lies within ci_lower/ci_upper when present.
+    Returns issue strings like: metrics_schema_inconsistent:<metric_name>
+    """
+    issues: List[str] = []
+    if not isinstance(metrics, dict):
+        return issues
+
+    def _is_number(value: Any) -> bool:
+        try:
+            float(value)
+            return True
+        except Exception:
+            return False
+
+    def _scan(obj: Dict[str, Any], prefix: str) -> None:
+        if not isinstance(obj, dict):
+            return
+        if all(key in obj for key in ("mean", "ci_lower", "ci_upper")):
+            mean = obj.get("mean")
+            lower = obj.get("ci_lower")
+            upper = obj.get("ci_upper")
+            if not (_is_number(mean) and _is_number(lower) and _is_number(upper)):
+                issues.append(f"metrics_schema_inconsistent:{prefix}")
+            else:
+                mean_f = float(mean)
+                lower_f = float(lower)
+                upper_f = float(upper)
+                if not (lower_f <= mean_f <= upper_f):
+                    issues.append(f"metrics_schema_inconsistent:{prefix}")
+        for key, value in obj.items():
+            if isinstance(value, dict):
+                next_prefix = f"{prefix}.{key}" if prefix else str(key)
+                _scan(value, next_prefix)
+
+    model_perf = metrics.get("model_performance") if isinstance(metrics.get("model_performance"), dict) else None
+    if isinstance(model_perf, dict):
+        _scan(model_perf, "model_performance")
+    else:
+        _scan(metrics, "")
+
+    deduped = []
+    seen = set()
+    for issue in issues:
+        if issue in seen:
+            continue
+        seen.add(issue)
+        deduped.append(issue)
+    return deduped
