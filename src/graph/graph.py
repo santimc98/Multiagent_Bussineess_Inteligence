@@ -116,7 +116,12 @@ from src.utils.dataset_memory import (
     summarize_memory,
 )
 from src.utils.governance import write_governance_report, build_run_summary
-from src.utils.data_adequacy import build_data_adequacy_report, write_data_adequacy_report
+from src.utils.data_adequacy import (
+    build_data_adequacy_report,
+    write_data_adequacy_report,
+    _calc_lift,
+    _metric_higher_is_better,
+)
 from src.utils.code_extract import extract_code_block, is_syntax_valid
 from src.utils.visuals import generate_fallback_plots
 from src.utils.recommendations_preview import build_recommendations_preview
@@ -2282,7 +2287,7 @@ def _build_fix_instructions(required_fixes: List[str]) -> str:
         lines.append(f"- {fix}")
     return "\n".join(lines)
 
-def _get_iteration_policy(state: Dict[str, Any]) -> Dict[str, int] | None:
+def _get_iteration_policy(state: Dict[str, Any]) -> Dict[str, Any] | None:
     contract = state.get("execution_contract") or {}
     policy = contract.get("iteration_policy")
     if not isinstance(policy, dict):
@@ -2290,16 +2295,23 @@ def _get_iteration_policy(state: Dict[str, Any]) -> Dict[str, int] | None:
     compliance_max = policy.get("compliance_bootstrap_max")
     metric_max = policy.get("metric_improvement_max")
     runtime_max = policy.get("runtime_fix_max")
-    out: Dict[str, int] = {}
+    plateau_window = policy.get("plateau_window")
+    plateau_epsilon = policy.get("plateau_epsilon")
+    out: Dict[str, Any] = {}
     for key, val in {
         "compliance_bootstrap_max": compliance_max,
         "metric_improvement_max": metric_max,
         "runtime_fix_max": runtime_max,
+        "plateau_window": plateau_window,
+        "plateau_epsilon": plateau_epsilon,
     }.items():
         if val is None:
             continue
         try:
-            out[key] = max(1, int(val))
+            if key == "plateau_epsilon":
+                out[key] = float(val)
+            else:
+                out[key] = max(1, int(val))
         except Exception:
             continue
     return out or None
@@ -4770,6 +4782,235 @@ def _extract_metrics_snapshot(metrics_report: Dict[str, Any], weights_report: Di
             if _is_number(value):
                 snapshot[f"optimization_{key}"] = float(value)
     return snapshot
+
+def _normalize_metric_key(name: str) -> str:
+    return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
+
+def _is_baseline_metric_name(name: str) -> bool:
+    key = _normalize_metric_key(name)
+    return any(token in key for token in ["baseline", "dummy", "naive", "null", "default"])
+
+def _objective_metric_priority(objective_type: str) -> List[str]:
+    objective = str(objective_type or "unknown").lower()
+    if "classif" in objective:
+        return ["roc_auc", "auc", "f1", "precision", "recall", "accuracy", "pr_auc"]
+    if "regress" in objective or "forecast" in objective:
+        return ["rmse", "mae", "mape", "smape", "r2", "mse"]
+    if "rank" in objective:
+        return ["spearman", "kendall", "ndcg", "map", "mrr", "gini"]
+    return ["roc_auc", "f1", "rmse", "mae", "r2", "spearman"]
+
+def _coerce_float(value: Any) -> float | None:
+    if _is_number(value):
+        return float(value)
+    return None
+
+def _collect_metric_candidates(metrics_report: Dict[str, Any], weights_report: Dict[str, Any]) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    model_perf = metrics_report.get("model_performance") if isinstance(metrics_report, dict) else {}
+    if isinstance(model_perf, dict):
+        for key, value in model_perf.items():
+            if isinstance(value, dict) and "mean" in value:
+                mean = _coerce_float(value.get("mean"))
+                if mean is None:
+                    continue
+                candidates.append(
+                    {
+                        "name": str(key),
+                        "value": mean,
+                        "ci_lower": _coerce_float(value.get("ci_lower")),
+                        "ci_upper": _coerce_float(value.get("ci_upper")),
+                        "is_baseline": _is_baseline_metric_name(str(key)),
+                    }
+                )
+            else:
+                num = _coerce_float(value)
+                if num is not None:
+                    candidates.append(
+                        {
+                            "name": str(key),
+                            "value": num,
+                            "ci_lower": None,
+                            "ci_upper": None,
+                            "is_baseline": _is_baseline_metric_name(str(key)),
+                        }
+                    )
+    if isinstance(weights_report, dict):
+        for container in ("metrics", "classification", "regression", "propensity_model", "price_model", "optimization"):
+            block = weights_report.get(container)
+            if not isinstance(block, dict):
+                continue
+            for key, value in block.items():
+                num = _coerce_float(value)
+                if num is None:
+                    continue
+                candidates.append(
+                    {
+                        "name": str(key),
+                        "value": num,
+                        "ci_lower": None,
+                        "ci_upper": None,
+                        "is_baseline": _is_baseline_metric_name(str(key)),
+                    }
+                )
+    return candidates
+
+def _pick_primary_metric_candidate(
+    candidates: List[Dict[str, Any]],
+    objective_type: str,
+) -> Dict[str, Any] | None:
+    if not candidates:
+        return None
+    priority = _objective_metric_priority(objective_type)
+    with_ci = [c for c in candidates if c.get("ci_lower") is not None and c.get("ci_upper") is not None]
+    search_pool = with_ci if with_ci else candidates
+    for token in priority:
+        for cand in search_pool:
+            if token in _normalize_metric_key(cand.get("name", "")):
+                return cand
+    return search_pool[0]
+
+def _resolve_validation_requirements(
+    evaluation_spec: Dict[str, Any] | None,
+    contract: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    if isinstance(evaluation_spec, dict):
+        val = evaluation_spec.get("validation_requirements")
+        if isinstance(val, dict):
+            return val
+    if isinstance(contract, dict):
+        val = get_validation_requirements(contract)
+        if isinstance(val, dict):
+            return val
+    return {}
+
+def _build_eval_signature(
+    objective_type: str | None,
+    evaluation_spec: Dict[str, Any] | None,
+    contract: Dict[str, Any] | None,
+) -> str:
+    validation = _resolve_validation_requirements(evaluation_spec, contract)
+    method = str(validation.get("method") or "unknown").strip().lower()
+    n_folds = validation.get("n_folds") or validation.get("folds")
+    n_boot = validation.get("n_bootstrap") or validation.get("n_boot") or validation.get("bootstrap_iterations")
+    seed = validation.get("seed") or validation.get("random_state")
+    parts = [
+        f"objective_type={objective_type or 'unknown'}",
+        f"method={method or 'unknown'}",
+    ]
+    if n_folds is not None:
+        parts.append(f"n_folds={n_folds}")
+    if n_boot is not None:
+        parts.append(f"n_boot={n_boot}")
+    if seed is not None:
+        parts.append(f"seed={seed}")
+    return ";".join(parts)
+
+def _extract_primary_metric_snapshot(
+    metrics_report: Dict[str, Any] | None,
+    weights_report: Dict[str, Any] | None,
+    objective_type: str | None,
+    evaluation_spec: Dict[str, Any] | None,
+    contract: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    metrics_report = metrics_report or {}
+    weights_report = weights_report or {}
+    candidates = _collect_metric_candidates(metrics_report, weights_report)
+    primary = _pick_primary_metric_candidate(candidates, objective_type or "unknown")
+    if not primary:
+        return {}
+    baseline = None
+    primary_norm = _normalize_metric_key(primary.get("name", ""))
+    for cand in candidates:
+        if not cand.get("is_baseline"):
+            continue
+        cand_norm = _normalize_metric_key(cand.get("name", ""))
+        if primary_norm and primary_norm in cand_norm:
+            baseline = cand
+            break
+    if baseline is None:
+        baseline = next((cand for cand in candidates if cand.get("is_baseline")), None)
+    baseline_value = baseline.get("value") if baseline else None
+    primary_value = primary.get("value")
+    metric_name = primary.get("name")
+    higher_is_better = True
+    if metric_name:
+        higher_is_better = _metric_higher_is_better(metric_name)
+    lift = _calc_lift(baseline_value, primary_value, higher_is_better) if baseline_value is not None else None
+    return {
+        "primary_metric_name": metric_name,
+        "primary_metric_value": primary_value,
+        "baseline_metric_name": baseline.get("name") if baseline else None,
+        "baseline_value": baseline_value,
+        "lift": lift,
+        "ci_lower": primary.get("ci_lower"),
+        "ci_upper": primary.get("ci_upper"),
+        "eval_signature": _build_eval_signature(objective_type, evaluation_spec, contract),
+    }
+
+def _detect_metric_plateau(
+    metric_history: List[Dict[str, Any]] | None,
+    window: int = 2,
+    epsilon: float = 0.01,
+) -> tuple[bool, str]:
+    history = [item for item in (metric_history or []) if isinstance(item, dict)]
+    if len(history) < window:
+        return False, ""
+    last = history[-1]
+    signature = last.get("eval_signature") or "unknown"
+    metric_name = last.get("primary_metric_name")
+    comparable = []
+    for item in history:
+        if metric_name and item.get("primary_metric_name") != metric_name:
+            continue
+        if signature != "unknown" and item.get("eval_signature") != signature:
+            continue
+        comparable.append(item)
+    if len(comparable) < window:
+        return False, ""
+    recent = comparable[-window:]
+    lifts = [item.get("lift") for item in recent]
+    if all(isinstance(val, (int, float)) for val in lifts):
+        if all(val < epsilon for val in lifts):
+            return True, f"lift<{epsilon} for {window} iterations"
+    values = []
+    ci_pairs = []
+    for item in recent:
+        val = item.get("primary_metric_value")
+        if not isinstance(val, (int, float)):
+            return False, ""
+        values.append(float(val))
+        ci_pairs.append((item.get("ci_lower"), item.get("ci_upper")))
+    higher_is_better = True
+    if metric_name:
+        higher_is_better = _metric_higher_is_better(metric_name)
+    any_ci = False
+    all_ci_overlap = True
+    improvements: List[float] = []
+    for idx in range(1, len(values)):
+        if higher_is_better:
+            delta = values[idx] - values[idx - 1]
+        else:
+            delta = values[idx - 1] - values[idx]
+        improvements.append(delta)
+        low1, up1 = ci_pairs[idx - 1]
+        low2, up2 = ci_pairs[idx]
+        if _is_number(low1) and _is_number(up1) and _is_number(low2) and _is_number(up2):
+            any_ci = True
+            if max(float(low1), float(low2)) > min(float(up1), float(up2)):
+                all_ci_overlap = False
+    if improvements and all(delta <= epsilon for delta in improvements):
+        if not any_ci or all_ci_overlap:
+            return True, f"metric_delta<= {epsilon} across {window} iterations"
+    return False, ""
+
+def _append_feedback_history(state: Dict[str, Any], message: str) -> None:
+    if not message:
+        return
+    history = list(state.get("feedback_history", []) or [])
+    if message not in history:
+        history.append(message)
+    state["feedback_history"] = history
 
 def _normalize_reason_tags(text: str, failed_gates: List[str] | None = None) -> List[str]:
     tags: List[str] = []
@@ -8997,6 +9238,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     
     status = eval_result.get('status', 'APPROVED')
     feedback = eval_result.get('feedback', '')
+    retry_worth_it = eval_result.get("retry_worth_it") if isinstance(eval_result, dict) else None
     
     new_history = list(state.get('feedback_history', []))
     has_deterministic_error = "Traceback" in execution_output or "EXECUTION ERROR" in execution_output
@@ -9251,6 +9493,30 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     except Exception as adequacy_err:
         print(f"Warning: data adequacy evaluation failed: {adequacy_err}")
 
+    objective_type = None
+    if isinstance(evaluation_spec, dict):
+        objective_type = evaluation_spec.get("objective_type")
+    if not objective_type and isinstance(contract, dict):
+        eval_spec_contract = contract.get("evaluation_spec")
+        if isinstance(eval_spec_contract, dict):
+            objective_type = eval_spec_contract.get("objective_type")
+    if not objective_type:
+        objective_type = strategy.get("analysis_type")
+
+    primary_metric_snapshot = _extract_primary_metric_snapshot(
+        metrics_report=metrics_report,
+        weights_report=weights_report,
+        objective_type=objective_type,
+        evaluation_spec=evaluation_spec if isinstance(evaluation_spec, dict) else None,
+        contract=contract if isinstance(contract, dict) else None,
+    )
+    metric_history = list(state.get("metric_history", []) or [])
+    if primary_metric_snapshot:
+        primary_metric_snapshot = dict(primary_metric_snapshot)
+        primary_metric_snapshot["iteration_id"] = int(state.get("iteration_count", 0)) + 1
+        metric_history.append(primary_metric_snapshot)
+        metric_history = metric_history[-20:]
+
     if _detect_refscore_alias(execution_output, contract):
         status = "NEEDS_IMPROVEMENT"
         alias_msg = (
@@ -9430,9 +9696,14 @@ def run_result_evaluator(state: AgentState) -> AgentState:
         "data_adequacy_consecutive": adequacy_consecutive,
         "data_adequacy_threshold": adequacy_threshold,
         "data_adequacy_status": adequacy_status,
+        "data_adequacy_report": data_adequacy_report,
+        "primary_metric_snapshot": primary_metric_snapshot,
+        "metric_history": metric_history,
         "hard_qa_gate_reject": hard_qa_gate_reject,
         "hard_qa_retry_count": hard_qa_retry_count,
     }
+    if retry_worth_it is not None:
+        result_state["review_retry_worth_it"] = bool(retry_worth_it)
     if state.get("qa_budget_exceeded"):
         result_state["qa_budget_exceeded"] = True
     if status in ["APPROVED", "APPROVE_WITH_WARNINGS"]:
@@ -9487,7 +9758,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
 
     try:
         strategy_spec = state.get("strategy_spec") or _load_json_safe("data/strategy_spec.json")
-        objective_type = (strategy_spec or {}).get("objective_type")
+        objective_type = objective_type or (strategy_spec or {}).get("objective_type")
         if not objective_type:
             plan = state.get("execution_plan") or _load_json_safe("data/plan.json")
             if isinstance(plan, dict):
@@ -9501,7 +9772,11 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             "artifact_index": state.get("artifact_index") or _load_json_any("data/produced_artifact_index.json"),
             "output_contract_report": oc_report,
             "review_feedback": feedback,
+            "review_verdict": status,
             "metrics": metrics_report,
+            "metric_history": metric_history,
+            "data_adequacy_report": data_adequacy_report,
+            "iteration_policy": (contract or {}).get("iteration_policy", {}) if isinstance(contract, dict) else {},
             "strategy_spec": strategy_spec,
             "reporting_policy": contract.get("reporting_policy", {}) if isinstance(contract, dict) else {},
         }
@@ -9760,6 +10035,28 @@ def check_evaluation(state: AgentState):
         if state.get('review_verdict') == "NEEDS_IMPROVEMENT":
             return "retry"
         return "approved"
+
+    if last_iter_type == "metric":
+        data_report = state.get("data_adequacy_report") or _load_json_safe("data/data_adequacy_report.json") or {}
+        reasons = data_report.get("reasons", []) if isinstance(data_report, dict) else []
+        threshold_reached = bool(data_report.get("threshold_reached")) if isinstance(data_report, dict) else False
+        if threshold_reached or "signal_ceiling_reached" in reasons:
+            msg = "DATA_LIMITED_STOP: data adequacy indicates signal ceiling reached; stopping metric iterations."
+            print(f"WARNING: {msg}")
+            _append_feedback_history(state, msg)
+            return "approved"
+        plateau_window = 2
+        plateau_epsilon = 0.01
+        if policy:
+            plateau_window = int(policy.get("plateau_window", plateau_window) or plateau_window)
+            plateau_epsilon = float(policy.get("plateau_epsilon", plateau_epsilon) or plateau_epsilon)
+        plateau, reason = _detect_metric_plateau(state.get("metric_history"), plateau_window, plateau_epsilon)
+        if plateau:
+            msg = f"PLATEAU_STOP: {reason or 'metric plateau detected'}"
+            print(f"WARNING: {msg}")
+            _append_feedback_history(state, msg)
+            return "approved"
+
     case_report = state.get("case_alignment_report", {}) or {}
     metrics = case_report.get("metrics", {}) if isinstance(case_report, dict) else {}
     try:

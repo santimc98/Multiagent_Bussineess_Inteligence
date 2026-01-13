@@ -200,13 +200,25 @@ def _infer_requires_target(strategy: Dict[str, Any], contract: Dict[str, Any]) -
     return False
 
 
+def _allow_resampling_random(requires_target: bool, contract: Dict[str, Any]) -> bool:
+    if requires_target:
+        return True
+    if not isinstance(contract, dict):
+        return False
+    validation = contract.get("validation_requirements", {})
+    if not isinstance(validation, dict):
+        return False
+    method = str(validation.get("method") or "").strip().lower()
+    return method in {"cross_validation", "bootstrap"}
+
+
 def _build_default_qa_gates(
     strategy: Dict[str, Any],
     business_objective: str,
     contract: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
     requires_target = _infer_requires_target(strategy, contract)
-    allow_resampling = _strategy_mentions_resampling(strategy, business_objective)
+    allow_resampling = _allow_resampling_random(requires_target, contract)
     gates: List[Dict[str, Any]] = [
         {"name": "security_sandbox", "severity": "HARD", "params": {}},
         {"name": "must_read_input_csv", "severity": "HARD", "params": {}},
@@ -235,7 +247,8 @@ def _apply_qa_gate_policy(
     gates = _normalize_qa_gates(raw_gates)
     if not gates:
         gates = _build_default_qa_gates(strategy, business_objective, contract)
-    allow_resampling = _strategy_mentions_resampling(strategy, business_objective)
+    requires_target = _infer_requires_target(strategy, contract)
+    allow_resampling = _allow_resampling_random(requires_target, contract)
     for gate in gates:
         if gate.get("name") == "no_synthetic_data":
             params = gate.get("params")

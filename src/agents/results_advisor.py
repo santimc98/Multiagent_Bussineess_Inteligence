@@ -152,6 +152,8 @@ class ResultsAdvisorAgent:
         elif objective_type == "ranking":
             recommendations.append("Validate ordering metrics and consider pairwise loss if rankings are unstable.")
 
+        iteration_recommendation = self._build_iteration_recommendation(context)
+
         artifacts_used = []
         for path in (metrics_artifacts + predictions_artifacts + error_artifacts + importances_artifacts):
             artifacts_used.append(path)
@@ -193,6 +195,7 @@ class ResultsAdvisorAgent:
             "deployment_recommendation": deployment_info.get("deployment_recommendation"),
             "confidence": deployment_info.get("confidence"),
             "primary_metric": deployment_info.get("primary_metric"),
+            "iteration_recommendation": iteration_recommendation,
         }
         self.last_response = insights
         if not summary_lines and metrics_summary:
@@ -463,6 +466,69 @@ class ResultsAdvisorAgent:
             "deployment_recommendation": recommendation,
             "confidence": confidence,
             "primary_metric": metric_name,
+        }
+
+    def _suggest_next_changes(self, review_feedback: str) -> List[str]:
+        text = str(review_feedback or "").lower()
+        suggestions: List[str] = []
+        if "baseline" in text or "dummy" in text:
+            suggestions.append("Add baseline metrics to quantify lift over trivial models.")
+        if "validation" in text or "cross_validation" in text or "split" in text:
+            suggestions.append("Align validation strategy with contract (CV/holdout/time split).")
+        if "leakage" in text:
+            suggestions.append("Remove post-outcome features and rerun leakage checks.")
+        if "imputer" in text or "missing" in text:
+            suggestions.append("Add preprocessing with imputation for missing values.")
+        if "metrics" in text:
+            suggestions.append("Recompute and persist metrics.json for the current outputs.")
+        if "alignment" in text:
+            suggestions.append("Address alignment_check issues before further tuning.")
+        if not suggestions:
+            suggestions.append("Simplify the model, validate splits, and report metrics with confidence intervals.")
+        return suggestions[:4]
+
+    def _detect_plateau(self, metric_history: List[Dict[str, Any]], window: int, epsilon: float) -> bool:
+        if not metric_history or len(metric_history) < window:
+            return False
+        recent = metric_history[-window:]
+        lifts = [item.get("lift") for item in recent if isinstance(item, dict)]
+        if len(lifts) == window and all(isinstance(val, (int, float)) for val in lifts):
+            return all(val < epsilon for val in lifts)
+        values = [item.get("primary_metric_value") for item in recent if isinstance(item, dict)]
+        if len(values) == window and all(isinstance(val, (int, float)) for val in values):
+            deltas = [abs(values[idx] - values[idx - 1]) for idx in range(1, len(values))]
+            return all(delta <= epsilon for delta in deltas)
+        return False
+
+    def _build_iteration_recommendation(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        data_adequacy = context.get("data_adequacy_report") or {}
+        review_feedback = str(context.get("review_feedback") or "")
+        review_verdict = str(context.get("review_verdict") or "").upper()
+        metric_history = context.get("metric_history") or []
+        policy = context.get("iteration_policy") or {}
+        window = int(policy.get("plateau_window", 2) or 2)
+        epsilon = float(policy.get("plateau_epsilon", 0.01) or 0.01)
+
+        if isinstance(data_adequacy, dict):
+            reasons = data_adequacy.get("reasons", []) if isinstance(data_adequacy.get("reasons"), list) else []
+            threshold_reached = bool(data_adequacy.get("threshold_reached"))
+            if data_adequacy.get("status") in {"data_limited", "insufficient_signal"} or threshold_reached or "signal_ceiling_reached" in reasons:
+                return {
+                    "action": "STOP",
+                    "reason": "Data adequacy indicates signal ceiling or insufficient signal.",
+                    "next_changes": [],
+                }
+        if isinstance(metric_history, list) and self._detect_plateau(metric_history, window, epsilon):
+            return {
+                "action": "STOP",
+                "reason": "Metrics plateau across recent iterations.",
+                "next_changes": [],
+            }
+        return {
+            "action": "RETRY",
+            "reason": "Continue iteration to improve metrics with targeted changes.",
+            "next_changes": self._suggest_next_changes(review_feedback),
+            "review_verdict": review_verdict if review_verdict else None,
         }
 
     def _flatten_numeric_metrics(self, metrics: Dict[str, Any], prefix: str = "") -> Dict[str, float]:
