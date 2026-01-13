@@ -27,7 +27,7 @@ class StubDataEngineer:
         return "# Error: stop"
 
 
-def test_data_engineer_retries_on_code_fence(tmp_path, monkeypatch):
+def test_data_engineer_does_not_retry_on_code_fence(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     csv_path = tmp_path / "input.csv"
     csv_path.write_text("a,b\n1,2\n", encoding="utf-8")
@@ -48,5 +48,5 @@ def test_data_engineer_retries_on_code_fence(tmp_path, monkeypatch):
 
     graph_module.run_data_engineer(state)
 
-    assert len(stub.calls) == 2
-    assert "CODE_FENCE_GUARD" in stub.calls[1]
+    assert len(stub.calls) == 1
+    assert all("CODE_FENCE_GUARD" not in call for call in stub.calls)

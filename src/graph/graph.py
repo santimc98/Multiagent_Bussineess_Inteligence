@@ -5828,20 +5828,10 @@ def run_data_engineer(state: AgentState) -> AgentState:
 
     raw_response = getattr(data_engineer, "last_response", "") or ""
     if "```" in raw_response:
-        if not state.get("de_code_fence_retry_done"):
-            new_state = dict(state)
-            new_state["de_code_fence_retry_done"] = True
-            base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-            payload = "CODE_FENCE_GUARD: Output python only, no fences, no markdown."
-            new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
-            if run_id:
-                log_run_event(run_id, "data_engineer_code_fence_retry", {"attempt": attempt_id})
-            print("Code fence guard: retrying Data Engineer with no-fence instruction.")
-            return run_data_engineer(new_state)
         if run_id:
-            log_run_event(run_id, "data_engineer_code_fence_strip", {"attempt": attempt_id})
+            log_run_event(run_id, "data_engineer_code_fence_detected", {"attempt": attempt_id})
         stripped = extract_code_block(raw_response)
-        if not stripped or not stripped.strip():
+        if (not stripped or not stripped.strip()) and not code.strip():
             msg = "CRITICAL: Data Engineer returned only fenced/empty code."
             print(msg)
             if run_id:
@@ -5856,10 +5846,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 "data_engineer_failed": True,
                 "budget_counters": counters,
             }
-        if stripped and stripped in code:
-            prefix = code.split(stripped, 1)[0]
-            code = prefix + stripped
-        print("Warning: code fences detected after retry; stripped fences and continuing.")
+        print("Warning: code fences detected in raw response; continuing without retry.")
 
     plan_payload = None
     is_plan = False

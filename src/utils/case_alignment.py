@@ -1,3 +1,4 @@
+import csv
 import json
 import os
 import re
@@ -29,6 +30,86 @@ def _load_output_dialect(manifest_path: str = "data/cleaning_manifest.json") -> 
                 "encoding": output_dialect.get("encoding", defaults["encoding"]),
             }
     return defaults
+
+
+def _read_text_sample(path: str, encoding: str, max_bytes: int = 50000) -> str:
+    if not path or not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "r", encoding=encoding, errors="replace") as handle:
+            return handle.read(max_bytes)
+    except Exception:
+        return ""
+
+
+def _infer_delimiter_from_file(path: str, encoding: str) -> Optional[str]:
+    sample = _read_text_sample(path, encoding)
+    if not sample:
+        return None
+    delimiters = [",", ";", "\t", "|"]
+    try:
+        sniffed = csv.Sniffer().sniff(sample, delimiters=delimiters)
+        if getattr(sniffed, "delimiter", None):
+            return sniffed.delimiter
+    except Exception:
+        pass
+    counts = {delim: sample.count(delim) for delim in delimiters}
+    best = max(counts, key=counts.get)
+    return best if counts.get(best, 0) > 0 else None
+
+
+def _infer_decimal_from_sample(sample: str) -> str:
+    if not sample:
+        return "."
+    comma_hits = len(re.findall(r"\d+,\d+", sample))
+    dot_hits = len(re.findall(r"\d+\.\d+", sample))
+    if comma_hits > dot_hits:
+        return ","
+    if dot_hits > comma_hits:
+        return "."
+    return "."
+
+
+def _looks_like_delimiter_mismatch(df: Optional[pd.DataFrame]) -> bool:
+    if df is None or df.empty:
+        return False
+    if df.shape[1] != 1:
+        return False
+    colname = str(df.columns[0])
+    if len(colname) <= 5:
+        return False
+    return any(token in colname for token in [",", ";", "\t", "|"])
+
+
+def _read_csv_with_dialect(path: str, dialect: Dict[str, str]) -> Tuple[Optional[pd.DataFrame], Dict[str, str]]:
+    if not path or not os.path.exists(path):
+        return None, dialect
+    try:
+        df = pd.read_csv(
+            path,
+            sep=dialect.get("sep", ","),
+            decimal=dialect.get("decimal", "."),
+            encoding=dialect.get("encoding", "utf-8"),
+        )
+    except Exception:
+        df = None
+    if _looks_like_delimiter_mismatch(df):
+        encoding = dialect.get("encoding", "utf-8")
+        inferred_sep = _infer_delimiter_from_file(path, encoding)
+        if inferred_sep and inferred_sep != dialect.get("sep"):
+            sample = _read_text_sample(path, encoding)
+            inferred_decimal = _infer_decimal_from_sample(sample)
+            dialect = {"sep": inferred_sep, "decimal": inferred_decimal, "encoding": encoding}
+            try:
+                df = pd.read_csv(
+                    path,
+                    sep=dialect.get("sep", ","),
+                    decimal=dialect.get("decimal", "."),
+                    encoding=dialect.get("encoding", "utf-8"),
+                )
+            except Exception:
+                pass
+    return df, dialect
 
 
 def _normalize(name: str) -> str:
@@ -266,15 +347,7 @@ def build_case_alignment_report(
         and (not case_summary_path or not os.path.exists(case_summary_path) or default_case_summary)
     )
     if use_scored_rows:
-        try:
-            sr = pd.read_csv(
-                scored_rows_path,
-                sep=dialect["sep"],
-                decimal=dialect["decimal"],
-                encoding=dialect["encoding"],
-            )
-        except Exception:
-            sr = None
+        sr, _ = _read_csv_with_dialect(scored_rows_path, dialect)
         if sr is not None and not sr.empty:
             group_col = _pick_group_column(sr)
             ref_col = _pick_column(sr, target_name, "target")
@@ -339,14 +412,8 @@ def build_case_alignment_report(
         weight_variants = {key: _weight_key_variants(key) for key in weights.keys()}
         for path in data_paths:
             if os.path.exists(path):
-                try:
-                    df = pd.read_csv(
-                        path,
-                        sep=dialect["sep"],
-                        decimal=dialect["decimal"],
-                        encoding=dialect["encoding"],
-                    )
-                except Exception:
+                df, _ = _read_csv_with_dialect(path, dialect)
+                if df is None:
                     continue
                 target_col = _pick_column(df, target_name, "target")
                 if not target_col:
@@ -375,12 +442,9 @@ def build_case_alignment_report(
     if ref_series is None or score_series is None:
         if os.path.exists(case_summary_path):
             try:
-                cs = pd.read_csv(
-                    case_summary_path,
-                    sep=dialect["sep"],
-                    decimal=dialect["decimal"],
-                    encoding=dialect["encoding"],
-                )
+                cs, _ = _read_csv_with_dialect(case_summary_path, dialect)
+                if cs is None:
+                    cs = pd.DataFrame()
                 if not cs.empty:
                     case_col = _pick_case_column(cs)
                     if case_col:

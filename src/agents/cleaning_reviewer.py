@@ -342,24 +342,23 @@ def _normalize_cleaning_gates(raw: Any) -> List[Dict[str, Any]]:
     seen: set[str] = set()
     for gate in raw:
         if isinstance(gate, dict):
-            name = gate.get("name") or gate.get("id") or gate.get("gate")
+            name = _normalize_gate_name(gate.get("name") or gate.get("id") or gate.get("gate"))
             if not name:
                 continue
             severity = _normalize_severity(gate.get("severity"), gate.get("required"))
             params = gate.get("params")
             if not isinstance(params, dict):
                 params = {}
-            key = str(name).strip().lower()
-            if key in seen:
+            if name in seen:
                 continue
-            seen.add(key)
-            normalized.append({"name": str(name), "severity": severity, "params": params})
+            seen.add(name)
+            normalized.append({"name": name, "severity": severity, "params": params})
         elif isinstance(gate, str):
-            key = gate.strip().lower()
-            if not key or key in seen:
+            name = _normalize_gate_name(gate)
+            if not name or name in seen:
                 continue
-            seen.add(key)
-            normalized.append({"name": gate.strip(), "severity": "HARD", "params": {}})
+            seen.add(name)
+            normalized.append({"name": name, "severity": "HARD", "params": {}})
     return normalized
 
 
@@ -380,6 +379,20 @@ def _normalize_severity(severity: Any, required: Any = None) -> str:
         severity = "HARD" if bool(required) else "SOFT"
     sev = str(severity).strip().upper() if severity else "HARD"
     return sev if sev in {"HARD", "SOFT"} else "HARD"
+
+
+def _normalize_gate_name(name: Any) -> str:
+    if name is None:
+        return ""
+    raw = str(name).strip()
+    if not raw:
+        return ""
+    key = re.sub(r"[^0-9a-zA-Z]+", "_", raw).strip("_").lower()
+    alias_map = {
+        "numericparsingvalidation": "numeric_parsing_validation",
+        "numeric_parsing_validation": "numeric_parsing_validation",
+    }
+    return alias_map.get(key, key)
 
 
 def _resolve_dialect(raw: Any) -> Dict[str, Any]:
@@ -503,6 +516,62 @@ def _read_csv_sample(
         return pd.read_csv(path, **kwargs)
     except Exception:
         return None
+
+
+def _clean_numeric_strings(values: pd.Series) -> pd.Series:
+    cleaned = values.dropna().astype(str).str.strip()
+    cleaned = cleaned[cleaned != ""]
+    cleaned = cleaned[~cleaned.str.lower().isin({"nan", "none", "null"})]
+    cleaned = cleaned.str.replace(" ", "", regex=False)
+    return cleaned
+
+
+def _best_numeric_parse_ratio(values: pd.Series) -> float:
+    cleaned = _clean_numeric_strings(values)
+    if cleaned.empty:
+        return 1.0
+    candidates = [
+        cleaned,
+        cleaned.str.replace(".", "", regex=False).str.replace(",", ".", regex=False),
+        cleaned.str.replace(",", "", regex=False),
+    ]
+    best_ratio = 0.0
+    total = float(len(cleaned))
+    for candidate in candidates:
+        parsed = pd.to_numeric(candidate, errors="coerce")
+        ratio = float(parsed.notna().sum()) / total if total else 1.0
+        if ratio > best_ratio:
+            best_ratio = ratio
+    return best_ratio
+
+
+def _check_numeric_parsing_validation(
+    sample_str: Optional[pd.DataFrame],
+    sample_infer: Optional[pd.DataFrame],
+    params: Dict[str, Any],
+) -> Tuple[List[str], Dict[str, Any]]:
+    columns = _list_str(params.get("columns"))
+    threshold = float(params.get("min_parse_ratio", 0.9))
+    check_mode = str(params.get("check") or "no_string_remainders").strip().lower()
+    evidence: Dict[str, Any] = {"check": check_mode, "threshold": threshold, "ratios": {}}
+    if not columns:
+        evidence["note"] = "no_columns_configured"
+        return [], evidence
+
+    issues: List[str] = []
+    for col in columns:
+        if sample_infer is not None and col in sample_infer.columns:
+            if pd.api.types.is_numeric_dtype(sample_infer[col]):
+                evidence["ratios"][col] = 1.0
+                continue
+        if sample_str is None or col not in sample_str.columns:
+            evidence["ratios"][col] = None
+            continue
+        ratio = _best_numeric_parse_ratio(sample_str[col])
+        evidence["ratios"][col] = round(ratio, 4)
+        if ratio < threshold:
+            issues.append(f"{col} parseable_ratio={ratio:.2f} < {threshold:.2f}")
+    return issues, evidence
 
 
 def _list_str(value: Any) -> List[str]:
@@ -645,6 +714,8 @@ def _evaluate_gates_deterministic(
         elif name == "row_count_sanity":
             issues = _check_row_count_sanity(manifest, params)
             evidence["row_counts"] = (manifest.get("row_counts") or {})
+        elif name == "numeric_parsing_validation":
+            issues, evidence = _check_numeric_parsing_validation(sample_str, sample_infer, params)
         else:
             evaluated = False
             warnings.append(f"UNKNOWN_GATE_SKIPPED: {name}")
@@ -793,42 +864,25 @@ def _merge_llm_with_deterministic(
     llm = _normalize_llm_result(llm_result)
     det = deterministic
 
-    hard_failures = _merge_gate_lists(
-        llm.get("hard_failures", []), det.get("hard_failures", []), gate_names
-    )
-    soft_failures = _merge_gate_lists(
-        llm.get("soft_failures", []), det.get("soft_failures", []), gate_names
-    )
-    failed_checks = _merge_gate_lists(
-        llm.get("failed_checks", []), det.get("failed_checks", []), gate_names
-    )
-    required_fixes = _dedupe_list(det.get("required_fixes", []) + llm.get("required_fixes", []))
-    merged_warnings = _dedupe_list(warnings + det.get("warnings", []) + llm.get("warnings", []))
-
-    status = "APPROVED"
-    if hard_failures:
-        status = "REJECTED"
-    elif soft_failures:
-        status = "APPROVE_WITH_WARNINGS"
-
-    feedback = llm.get("feedback") or det.get("feedback") or ""
-    if hard_failures and feedback:
-        feedback = feedback + " Deterministic evidence confirms HARD failures."
-
     gate_results = _merge_gate_results(
         llm.get("gate_results", []),
         det.get("gate_results", []),
         gate_names,
     )
+    summary = _summarize_gate_results(gate_results)
+    merged_warnings = _dedupe_list(
+        warnings + det.get("warnings", []) + llm.get("warnings", []) + summary["warning_summaries"]
+    )
+    required_fixes = _dedupe_list(summary["required_fixes"] + det.get("required_fixes", []))
 
     return {
-        "status": status,
-        "feedback": feedback,
-        "failed_checks": failed_checks,
+        "status": summary["status"],
+        "feedback": summary["feedback"],
+        "failed_checks": summary["failed_checks"],
         "required_fixes": required_fixes,
         "warnings": merged_warnings,
-        "hard_failures": hard_failures,
-        "soft_failures": soft_failures,
+        "hard_failures": summary["hard_failures"],
+        "soft_failures": summary["soft_failures"],
         "gate_results": gate_results,
         "cleaning_gates_evaluated": gate_names,
         "contract_source_used": contract_source_used,
@@ -847,9 +901,9 @@ def _normalize_llm_result(result: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _merge_gate_lists(primary: List[Any], secondary: List[Any], allowed: List[str]) -> List[str]:
-    allowed_norm = {str(name).lower() for name in allowed}
+    allowed_norm = {_normalize_gate_name(name) for name in allowed if name}
     merged = _dedupe_list([str(item) for item in primary + secondary if item])
-    filtered = [item for item in merged if item.lower() in allowed_norm]
+    filtered = [item for item in merged if _normalize_gate_name(item) in allowed_norm]
     return filtered
 
 
@@ -862,26 +916,37 @@ def _merge_gate_results(
     for entry in det_results:
         if not isinstance(entry, dict):
             continue
-        name = str(entry.get("name", "")).strip()
+        name = _normalize_gate_name(entry.get("name", ""))
         if not name:
             continue
-        merged[name.lower()] = dict(entry)
+        normalized = dict(entry)
+        normalized["name"] = name
+        merged[name] = normalized
     for entry in llm_results:
         if not isinstance(entry, dict):
             continue
-        name = str(entry.get("name", "")).strip()
+        name = _normalize_gate_name(entry.get("name", ""))
         if not name:
             continue
-        key = name.lower()
-        existing = merged.get(key, {})
-        updated = dict(existing)
-        updated.update(entry)
-        merged[key] = updated
+        existing = merged.get(name)
+        if existing and existing.get("passed") is not None:
+            if not existing.get("evidence") and entry.get("evidence"):
+                existing["evidence"] = entry.get("evidence")
+            continue
+        if existing:
+            updated = dict(existing)
+            updated.update(entry)
+        else:
+            updated = dict(entry)
+        updated["name"] = name
+        merged[name] = updated
     ordered = []
     for gate in gate_names:
-        key = gate.lower()
+        key = _normalize_gate_name(gate)
         if key in merged:
-            ordered.append(merged[key])
+            entry = merged[key]
+            entry["name"] = gate
+            ordered.append(entry)
         else:
             ordered.append(
                 {
@@ -893,6 +958,61 @@ def _merge_gate_results(
                 }
             )
     return ordered
+
+
+def _summarize_gate_results(gate_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    hard_failures: List[str] = []
+    soft_failures: List[str] = []
+    failed_checks: List[str] = []
+    required_fixes: List[str] = []
+    failure_summaries: List[str] = []
+    warning_summaries: List[str] = []
+
+    for gate in gate_results:
+        name = str(gate.get("name", "")).strip()
+        passed = gate.get("passed")
+        if passed is not False:
+            continue
+        severity = str(gate.get("severity", "HARD")).strip().upper()
+        if severity not in {"HARD", "SOFT"}:
+            severity = "HARD"
+        issues = gate.get("issues") or []
+        issues_text = "; ".join(str(issue) for issue in issues if issue)
+        summary = f"{name}: {issues_text}" if issues_text else f"{name}: failed"
+        if name and name not in failed_checks:
+            failed_checks.append(name)
+        if severity == "HARD":
+            if name and name not in hard_failures:
+                hard_failures.append(name)
+            required_fixes.append(summary)
+            failure_summaries.append(summary)
+        else:
+            if name and name not in soft_failures:
+                soft_failures.append(name)
+            warning_summaries.append(summary)
+
+    status = "APPROVED"
+    if hard_failures:
+        status = "REJECTED"
+    elif soft_failures:
+        status = "APPROVE_WITH_WARNINGS"
+
+    if hard_failures:
+        feedback = "Cleaning reviewer rejected: " + " | ".join(failure_summaries)
+    elif soft_failures:
+        feedback = "Cleaning reviewer approved with warnings: " + " | ".join(warning_summaries)
+    else:
+        feedback = "Cleaning reviewer approved: all gates passed."
+
+    return {
+        "status": status,
+        "feedback": feedback,
+        "failed_checks": failed_checks,
+        "required_fixes": required_fixes,
+        "hard_failures": hard_failures,
+        "soft_failures": soft_failures,
+        "warning_summaries": warning_summaries,
+    }
 
 
 def _dedupe_list(items: List[Any]) -> List[str]:
