@@ -96,3 +96,5 @@ claude_plans/
 # Large Kaggle datasets (>100MB)
 data/combined_porto_seguros.csv
 data/combined_digit_recognizer.csv
+data/combined_mercari.csv
+data/combined_*.csv

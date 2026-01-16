@@ -5678,8 +5678,7 @@ def run_steward(state: AgentState) -> AgentState:
     abort_state = _abort_if_requested(state, "steward")
     if abort_state:
         return abort_state
-    clean_workspace_outputs()
-    _cleanup_run_artifacts()
+    # NOTE: Cleanup moved AFTER enter_run_workspace to clean workspace, not repo root
     run_id = state.get("run_id") if state else None
     if not run_id:
         run_id = uuid.uuid4().hex[:8]
@@ -5698,6 +5697,10 @@ def run_steward(state: AgentState) -> AgentState:
 
     # P0 FIX: Enter isolated run workspace to prevent cross-run contamination
     state = enter_run_workspace(state, run_dir)
+
+    # P0 FIX: Clean workspace AFTER entering (cleans work_dir, not repo root)
+    clean_workspace_outputs()
+    _cleanup_run_artifacts()
 
     # Initialize empty artifact index for this run (prevent stale data)
     try:
@@ -10635,6 +10638,11 @@ def generate_pdf_artifact(state: AgentState) -> AgentState:
     print("--- [7] System: Generating PDF Report ---")
     import glob
 
+    work_dir = state.get("work_dir") if isinstance(state, dict) else None
+    if not work_dir:
+        work_dir = "."
+    work_dir = os.path.abspath(work_dir)
+
     def _copy_pdf_artifact(pdf_path: str) -> None:
         run_id = state.get("run_id")
         if run_id:
@@ -10656,12 +10664,17 @@ def generate_pdf_artifact(state: AgentState) -> AgentState:
 
     report = state.get("final_report")
     existing_pdf = state.get("pdf_path")
-    if existing_pdf and os.path.exists(existing_pdf):
-        _copy_pdf_artifact(existing_pdf)
-        return {"final_report": report, "pdf_path": existing_pdf}
+    if existing_pdf:
+        candidate = existing_pdf
+        if not os.path.isabs(candidate):
+            candidate = os.path.join(work_dir, candidate)
+        if os.path.exists(candidate):
+            _copy_pdf_artifact(candidate)
+            return {"final_report": report, "pdf_path": os.path.abspath(candidate)}
     if not report:
         try:
-            with open("data/executive_summary.md", "r", encoding="utf-8") as f_exec:
+            summary_path = os.path.join(work_dir, "data", "executive_summary.md")
+            with open(summary_path, "r", encoding="utf-8") as f_exec:
                 report = f_exec.read()
         except Exception:
             report = ""
@@ -10678,25 +10691,35 @@ def generate_pdf_artifact(state: AgentState) -> AgentState:
         if not has_exec_error and fallback_plots:
             plots = [plot for plot in plots if plot not in fallback_plots]
         if not plots:
-            report_plots_dir = os.path.join("report", "static", "plots")
+            report_plots_dir = os.path.join(work_dir, "report", "static", "plots")
             if os.path.isdir(report_plots_dir):
                 plots = glob.glob(os.path.join(report_plots_dir, "*.png"))
         if plots:
             report += "\n\n## Visualizations\n"
             for plot in plots:
-                plot_ref = _normalize_path_posix(plot)
+                if os.path.isabs(plot) and plot.startswith(work_dir):
+                    rel_plot = os.path.relpath(plot, work_dir)
+                else:
+                    rel_plot = plot
+                plot_ref = _normalize_path_posix(rel_plot)
                 report += f"![{os.path.basename(plot)}]({plot_ref})\n"
-    
+
     # Generate unique filename
     unique_id = uuid.uuid4().hex[:8]
-    pdf_filename = f"final_report_{unique_id}.pdf"
-    
+    pdf_filename = os.path.join(work_dir, f"final_report_{unique_id}.pdf")
+
     # Absolute path for clarity
     abs_pdf_path = os.path.abspath(pdf_filename)
-    
-    # Convert
-    success = convert_report_to_pdf(report, pdf_filename)
-    
+
+    # Convert - ensure CWD is work_dir for relative asset resolution
+    cwd0 = os.getcwd()
+    success = False
+    try:
+        os.chdir(work_dir)
+        success = convert_report_to_pdf(report, abs_pdf_path)
+    finally:
+        os.chdir(cwd0)
+
     if success:
         print(f"PDF generated at: {abs_pdf_path}")
         run_id = state.get("run_id")
@@ -10705,7 +10728,7 @@ def generate_pdf_artifact(state: AgentState) -> AgentState:
         latest_pdf = pdf_filename
         try:
             candidates = []
-            for path in glob.glob("final_report*.pdf"):
+            for path in glob.glob(os.path.join(work_dir, "final_report*.pdf")):
                 try:
                     mtime = os.path.getmtime(path)
                 except Exception:
@@ -10718,8 +10741,9 @@ def generate_pdf_artifact(state: AgentState) -> AgentState:
         except Exception:
             latest_pdf = pdf_filename
 
-        _copy_pdf_artifact(latest_pdf)
-        return {"final_report": report, "pdf_path": pdf_filename}
+        latest_abs = os.path.abspath(latest_pdf)
+        _copy_pdf_artifact(latest_abs)
+        return {"final_report": report, "pdf_path": latest_abs}
     else:
         print("PDF Generation Failed")
         return {"final_report": report, "pdf_path": None}

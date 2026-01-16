@@ -353,6 +353,16 @@ def _create_v41_skeleton(
                     real = _find_in_inventory(c_raw.strip()) or c_raw.strip()
                     type_distribution[kind].append(real)
 
+    # Alias for artifact requirements
+    outcome_cols = col_roles_outcome
+    
+    # Infer identifiers for artifact requirements fallback
+    identifiers = []
+    for col in available_cols:
+        # Simple heuristic: exact 'id', or ends in '_id'/'Id' etc
+        if re.search(r"(?i)\b(id|uuid|key)\b", col):
+            identifiers.append(col)
+
     n_rows = 0 
     
     problem_type = strategy.get("problem_type", "unknown") if isinstance(strategy, dict) else "unknown"
@@ -445,8 +455,12 @@ def _create_v41_skeleton(
         },
         
         "artifact_requirements": {
-            "required_files": ["data/cleaned_data.csv", "data/metrics.json"],
-            "file_schemas": {}
+            "required_files": ["data/cleaned_data.csv", "data/metrics.json", "data/scored_rows.csv"],
+            "file_schemas": {},
+            "scored_rows_schema": {
+                "required_columns": identifiers if identifiers else [],  # Dynamic IDs, no hardcoded "id"
+                "recommended_columns": ["prediction"] + outcome_cols
+            }
         },
         
         "qa_gates": _apply_qa_gate_policy([], strategy, business_objective or "", {}),
@@ -834,18 +848,42 @@ def build_contract_min(
 
     # P1.1: Determine scored_rows required columns based on objective type
     objective_type = contract.get("objective_type") or strategy_dict.get("objective_type") or ""
-    scored_rows_required_columns = ["id"]  # Always need ID
 
-    # Universal heuristics for required columns (no dataset hardcode)
+    # P1.5: Infer identifier column from canonical_columns instead of hardcoding "id"
+    # Pattern matches: id, ID, _id, Id, row_id, etc.
+    id_pattern = re.compile(r"^id$|^ID$|_id$|Id$|^row_id$|^index$", re.IGNORECASE)
+    id_column = None
+    for col in canonical_columns:
+        if id_pattern.search(col):
+            id_column = col
+            break
+
+    # P1.6: Keep required_columns minimal (only id if detected)
+    scored_rows_required_columns = [id_column] if id_column else []
+
+    # P1.6: Build universal any-of groups (no dataset hardcodes)
+    required_any_of_groups = []
+    required_any_of_group_severity = []
+
+    # Group 1 (identificador): incluir id detectado + sinónimos genéricos
+    group1 = ["id", "row_id", "index", "record_id", "case_id"]
+    if id_column and id_column not in group1:
+        group1.insert(0, id_column)
+    required_any_of_groups.append(group1)
+    required_any_of_group_severity.append("warning")  # Identifier is optional (warning)
+
+    # Group 2 (predicción/score): sinónimos universales
+    required_any_of_groups.append([
+        "prediction", "pred", "probability", "prob", "score",
+        "risk_score", "predicted_prob", "predicted_value", "y_pred"
+    ])
+    required_any_of_group_severity.append("fail")  # Prediction/score is critical (fail)
+
+    # Group 3 (ranking/prioridad) SOLO si objective_type sugiere ranking/triage/targeting
     obj_lower = str(objective_type).lower()
     if any(kw in obj_lower for kw in ["ranking", "triage", "targeting", "priorit", "segment"]):
-        scored_rows_required_columns.extend(["score", "priority"])
-    elif any(kw in obj_lower for kw in ["classification", "binary", "churn", "fraud", "claim"]):
-        scored_rows_required_columns.extend(["probability", "prediction"])
-    elif any(kw in obj_lower for kw in ["regression", "forecast", "predict"]):
-        scored_rows_required_columns.extend(["prediction"])
-    elif any(kw in obj_lower for kw in ["multi", "label"]):
-        scored_rows_required_columns.extend(["prediction", "probabilities"])
+        required_any_of_groups.append(["priority", "rank", "ranking", "triage_priority"])
+        required_any_of_group_severity.append("fail")  # Ranking is critical when required
 
     artifact_requirements = {
         "clean_dataset": {
@@ -861,6 +899,8 @@ def build_contract_min(
         ],
         "scored_rows_schema": {
             "required_columns": scored_rows_required_columns,
+            "required_any_of_groups": required_any_of_groups,
+            "required_any_of_group_severity": required_any_of_group_severity,
             "recommended_columns": [],
         },
         "file_schemas": {},

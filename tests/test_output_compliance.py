@@ -136,8 +136,8 @@ class TestArtifactRequirementsCheck:
 
         result = check_artifact_requirements(artifact_requirements, str(tmp_path))
 
-        # Status is warning (not error) because files exist but columns missing
-        assert result["status"] == "warning"
+        # P1.6.1: Status is ERROR for missing required_columns
+        assert result["status"] == "error"
         missing_cols = result["scored_rows_report"]["missing_columns"]
         assert "score" in missing_cols
         assert "priority" in missing_cols
