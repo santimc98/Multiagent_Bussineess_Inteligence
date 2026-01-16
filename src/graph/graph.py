@@ -148,6 +148,12 @@ from src.utils.sandbox_resilience import (
     run_code_with_optional_timeout,
     run_cmd_with_retry,
     safe_download_file,
+    safe_download_bytes,
+    is_transient_sandbox_error,
+    DE_TIMEOUT_S,
+    ML_TIMEOUT_SMALL_S,
+    ML_TIMEOUT_MEDIUM_S,
+    ML_TIMEOUT_LARGE_S,
 )
 from src.utils.dataset_size import (
     file_size_mb,
@@ -155,6 +161,49 @@ from src.utils.dataset_size import (
     classify_dataset_scale,
     get_dataset_scale_hints,
 )
+from e2b import Sandbox
+
+
+def _retry_sandbox_operations(sandbox_func, max_attempts: int = 2, run_id: Optional[str] = None, step: Optional[str] = None) -> Any:
+    """
+    Retry sandbox operations on transient errors.
+
+    Wraps sandbox_func (which must return a sandbox instance) with retry logic.
+    Returns sandbox instance and result.
+
+    Args:
+        sandbox_func: Function that creates and returns a sandbox instance
+        max_attempts: Number of attempts (default: 2)
+        run_id: Optional run ID for logging
+        step: Optional step name for logging
+
+    Returns:
+        (sandbox, result) where result is the result of sandbox_func
+    """
+    from src.utils.sandbox_resilience import is_transient_sandbox_error, run_cmd_with_retry
+
+    last_error = None
+
+    for attempt in range(max_attempts):
+        try:
+            # Call the sandbox creation function
+            sandbox, result = sandbox_func()
+            return sandbox, result
+        except Exception as e:
+            last_error = e
+            error_msg = str(e)
+
+            print(f"SANDBOX_ATTEMPT_{attempt + 1}/{max_attempts}: {error_msg}")
+
+            # Only retry if error is transient
+            if attempt < max_attempts - 1 and is_transient_sandbox_error(e):
+                print(f"RETRYING_SANDBOX step={step} attempt={attempt + 1}/{max_attempts}")
+                time.sleep(2 ** attempt)
+            else:
+                # Non-transient error or last attempt
+                raise
+
+    raise last_error
 
 def _norm_name(name: str) -> str:
     return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
@@ -6718,257 +6767,228 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 return {"error_message": msg, "cleaned_data_preview": "Error: Missing E2B Key", "budget_counters": counters}
             
             os.environ["E2B_API_KEY"] = api_key
-    
-            with Sandbox.create() as sandbox:
-                step_name = "data_engineer"
-                run_root = f"/home/user/run/{run_id}/{step_name}/attempt_{attempt_id}"
-                # 1. Setup Environment
-                print("Installing dependencies in Sandbox...")
-                sandbox.commands.run("pip install pandas numpy")
-                sandbox.commands.run(f"rm -rf {run_root}")
-                sandbox.commands.run(f"mkdir -p {run_root}/data")
-                
-                # 2. Upload Raw Data (P2.1: Use canonical path + aliases)
-                remote_raw_abs = canonical_abs(run_root, CANONICAL_RAW_REL)
-                print(f"Uploading {csv_path} to sandbox at {CANONICAL_RAW_REL}...")
-                with open(csv_path, "rb") as f:
-                    sandbox.files.write(remote_raw_abs, f)
 
-                # 2.5 Create aliases for raw data (P2.1)
-                alias_commands = build_symlink_or_copy_commands(
-                    run_root,
-                    canonical_rel=CANONICAL_RAW_REL,
-                    aliases=COMMON_RAW_ALIASES
-                )
-                if alias_commands:
-                    print(f"Creating {len(alias_commands)} raw data aliases...")
-                    full_cmd = " && ".join(alias_commands)
-                    run_cmd_with_retry(sandbox, f"sh -lc 'cd {run_root} && {full_cmd}'")
-                    print(f"SANDBOX_INPUT_CANONICAL: {CANONICAL_RAW_REL}")
-                    print(f"SANDBOX_INPUT_ALIASES: {COMMON_RAW_ALIASES}")
-    
-                # 2.5 Upload Execution Contract (best-effort)
-                local_contract_path = "data/execution_contract.json"
-                if os.path.exists(local_contract_path):
+            for sb_attempt in range(2):
+              try:
+                with Sandbox.create() as sandbox:
+                    step_name = "data_engineer"
+                    run_root = f"/home/user/run/{run_id}/{step_name}/attempt_{attempt_id}"
+                    # 1. Setup Environment
+                    print("Installing dependencies in Sandbox...")
+                    run_cmd_with_retry(sandbox, "pip install pandas numpy", retries=2)
+                    run_cmd_with_retry(sandbox, f"rm -rf {run_root}", retries=2)
+                    run_cmd_with_retry(sandbox, f"mkdir -p {run_root}/data", retries=2)
+
+                    # 2. Upload Raw Data (P2.1: Use canonical path + aliases)
+                    remote_raw_abs = canonical_abs(run_root, CANONICAL_RAW_REL)
+                    print(f"Uploading {csv_path} to sandbox at {CANONICAL_RAW_REL}...")
+                    with open(csv_path, "rb") as f:
+                        sandbox.files.write(remote_raw_abs, f)
+
+                    # 2.5 Create aliases for raw data (P2.1)
+                    alias_commands = build_symlink_or_copy_commands(
+                        run_root,
+                        canonical_rel=CANONICAL_RAW_REL,
+                        aliases=COMMON_RAW_ALIASES
+                    )
+                    if alias_commands:
+                        print(f"Creating {len(alias_commands)} raw data aliases...")
+                        full_cmd = " && ".join(alias_commands)
+                        run_cmd_with_retry(sandbox, f"sh -lc 'cd {run_root} && {full_cmd}'")
+                        print(f"SANDBOX_INPUT_CANONICAL: {CANONICAL_RAW_REL}")
+                        print(f"SANDBOX_INPUT_ALIASES: {COMMON_RAW_ALIASES}")
+
+                    # 2.5 Upload Execution Contract (best-effort)
+                    local_contract_path = "data/execution_contract.json"
+                    if os.path.exists(local_contract_path):
+                        try:
+                            with open(local_contract_path, "rb") as f:
+                                sandbox.files.write(f"{run_root}/data/execution_contract.json", f)
+                        except Exception as contract_err:
+                            print(f"Warning: failed to upload execution_contract.json: {contract_err}")
+
+                    # 3. Execute Cleaning (P2.1: Patch placeholders + minimal backward compat)
+                    code = patch_placeholders(code, data_rel=CANONICAL_RAW_REL)
+                    working_dir_injection = (
+                        "import os\n"
+                        f"os.makedirs(r\"{run_root}\", exist_ok=True)\n"
+                        f"os.chdir(r\"{run_root}\")\n"
+                    )
+                    code = working_dir_injection + code
+                    print("Executing Cleaning Script in Sandbox...")
+                    execution = run_code_with_optional_timeout(sandbox, code, timeout_s=DE_TIMEOUT_S)
+
+                    # Capture Output
+                    stdout_text = "\n".join(execution.logs.stdout or [])
+                    stderr_text = "\n".join(execution.logs.stderr or [])
+                    output_log = ""
+                    if stdout_text:
+                        output_log += stdout_text
+                    if stderr_text:
+                        output_log += stderr_text
                     try:
-                        with open(local_contract_path, "rb") as f:
-                            sandbox.files.write(f"{run_root}/data/execution_contract.json", f)
-                    except Exception as contract_err:
-                        print(f"Warning: failed to upload execution_contract.json: {contract_err}")
-    
-                # 3. Execute Cleaning (P2.1: Patch placeholders + minimal backward compat)
-                code = patch_placeholders(code, data_rel=CANONICAL_RAW_REL)
-                working_dir_injection = (
-                    "import os\n"
-                    f"os.makedirs(r\"{run_root}\", exist_ok=True)\n"
-                    f"os.chdir(r\"{run_root}\")\n"
-                )
-                code = working_dir_injection + code
-                print("Executing Cleaning Script in Sandbox...")
-                execution = sandbox.run_code(code)
-                
-                # Capture Output
-                stdout_text = "\n".join(execution.logs.stdout or [])
-                stderr_text = "\n".join(execution.logs.stderr or [])
-                output_log = ""
-                if stdout_text:
-                    output_log += stdout_text
-                if stderr_text:
-                    output_log += stderr_text
-                try:
-                    os.makedirs("artifacts", exist_ok=True)
-                    with open(os.path.join("artifacts", "data_engineer_sandbox_last.log"), "w", encoding="utf-8") as f_log:
-                        f_log.write(output_log or "")
-                except Exception as log_err:
-                    print(f"Warning: failed to persist data_engineer_sandbox_last.log: {log_err}")
-                
-                if execution.error:
-                    error_details = f"{execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
-                    print(f"Cleaning Failed in Sandbox: {error_details}")
-                    contract = state.get("execution_contract", {}) or {}
-                    derived_cols = _resolve_contract_columns(contract, sources={"derived", "output"})
-                    if "Missing required columns" in error_details and derived_cols and not state.get("de_missing_derived_retry_done"):
-                        new_state = dict(state)
-                        new_state["de_missing_derived_retry_done"] = True
-                        override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                        try:
-                            override += (
-                                "\n\nDERIVED_COLUMN_MISSING_GUARD: "
-                                f"{derived_cols} are derived. Do not treat them as required input columns. "
-                                "Only enforce source='input' columns after canonicalization; derive the rest."
-                            )
-                        except Exception:
-                            pass
-                        new_state["data_engineer_audit_override"] = override
-                        print("Derived column missing guard: retrying Data Engineer with derived-column guidance.")
-                        return run_data_engineer(new_state)
-                    if "actual_column" in error_details and "NoneType" in error_details and not state.get("de_actual_column_guard_retry_done"):
-                        new_state = dict(state)
-                        new_state["de_actual_column_guard_retry_done"] = True
-                        override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                        try:
-                            override += (
-                                "\n\nVALIDATION_PRINT_GUARD: Use actual = str(result.get('actual_column') or 'MISSING') "
-                                "before slicing; do not subscript None."
-                            )
-                        except Exception:
-                            pass
-                        new_state["data_engineer_audit_override"] = override
-                        print("Validation print guard: retrying Data Engineer with None-safe formatting.")
-                        return run_data_engineer(new_state)
-                    if "AttributeError" in error_details and "DataFrame" in error_details and "dtype" in error_details:
-                        if not state.get("de_dtype_guard_retry_done"):
+                        os.makedirs("artifacts", exist_ok=True)
+                        with open(os.path.join("artifacts", "data_engineer_sandbox_last.log"), "w", encoding="utf-8") as f_log:
+                            f_log.write(output_log or "")
+                    except Exception as log_err:
+                        print(f"Warning: failed to persist data_engineer_sandbox_last.log: {log_err}")
+
+                    if execution.error:
+                        error_details = f"{execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
+                        print(f"Cleaning Failed in Sandbox: {error_details}")
+                        contract = state.get("execution_contract", {}) or {}
+                        derived_cols = _resolve_contract_columns(contract, sources={"derived", "output"})
+                        if "Missing required columns" in error_details and derived_cols and not state.get("de_missing_derived_retry_done"):
                             new_state = dict(state)
-                            new_state["de_dtype_guard_retry_done"] = True
+                            new_state["de_missing_derived_retry_done"] = True
                             override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                             try:
                                 override += (
-                                    "\n\nDUPLICATE_COLUMN_GUARD: When reading dtype, handle duplicate column labels. "
-                                    "Use series = df[actual_col]; if isinstance(series, pd.DataFrame), "
-                                    "use series = series.iloc[:, 0] and log a warning."
+                                    "\n\nDERIVED_COLUMN_MISSING_GUARD: "
+                                    f"{derived_cols} are derived. Do not treat them as required input columns. "
+                                    "Only enforce source='input' columns after canonicalization; derive the rest."
                                 )
                             except Exception:
                                 pass
                             new_state["data_engineer_audit_override"] = override
-                            print("Duplicate column dtype guard: retrying Data Engineer.")
+                            print("Derived column missing guard: retrying Data Engineer with derived-column guidance.")
                             return run_data_engineer(new_state)
-                    if not state.get("de_runtime_retry_done"):
-                        new_state = dict(state)
-                        new_state["de_runtime_retry_done"] = True
-                        override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                        try:
-                            override += "\n\nRUNTIME_ERROR_CONTEXT:\n" + error_details[-2000:]
-                            failure_cause = _infer_de_failure_cause(error_details)
-                            if failure_cause:
-                                override += "\nWHY_IT_HAPPENED: " + failure_cause
-                            diagnosis_lines = _build_de_runtime_diagnosis(error_details)
-                            if diagnosis_lines:
-                                override += "\nERROR_DIAGNOSIS:\n- " + "\n- ".join(diagnosis_lines)
-                            explainer_text = ""
+                        if "actual_column" in error_details and "NoneType" in error_details and not state.get("de_actual_column_guard_retry_done"):
+                            new_state = dict(state)
+                            new_state["de_actual_column_guard_retry_done"] = True
+                            override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                             try:
-                                required_input = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
-                                header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep)
-                                norm_map = {}
-                                for col in header_cols:
-                                    normed = _norm_name(col)
-                                    if normed and normed not in norm_map:
-                                        norm_map[normed] = col
-                                required_raw_map = _build_required_raw_map(required_input, norm_map)
-                                explainer_ctx = {
-                                    "strategy_title": selected.get("title", "") if selected else "",
-                                    "csv_dialect": input_dialect,
-                                    "required_input_columns": required_input,
-                                    "required_raw_header_map": required_raw_map,
-                                }
-                                explainer_text = failure_explainer.explain_data_engineer_failure(
-                                    code=code,
-                                    error_details=error_details,
-                                    context=explainer_ctx,
+                                override += (
+                                    "\n\nVALIDATION_PRINT_GUARD: Use actual = str(result.get('actual_column') or 'MISSING') "
+                                    "before slicing; do not subscript None."
                                 )
-                            except Exception as explainer_err:
-                                print(f"Warning: failure explainer failed: {explainer_err}")
-                                explainer_text = ""
-                            if explainer_text:
-                                override += "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
+                            except Exception:
+                                pass
+                            new_state["data_engineer_audit_override"] = override
+                            print("Validation print guard: retrying Data Engineer with None-safe formatting.")
+                            return run_data_engineer(new_state)
+                        if "AttributeError" in error_details and "DataFrame" in error_details and "dtype" in error_details:
+                            if not state.get("de_dtype_guard_retry_done"):
+                                new_state = dict(state)
+                                new_state["de_dtype_guard_retry_done"] = True
+                                override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                                 try:
-                                    os.makedirs("artifacts", exist_ok=True)
-                                    with open(
-                                        os.path.join("artifacts", "data_engineer_failure_explainer.txt"),
-                                        "w",
-                                        encoding="utf-8",
-                                    ) as f_exp:
-                                        f_exp.write(explainer_text.strip())
-                                except Exception as exp_err:
-                                    print(f"Warning: failed to persist data_engineer_failure_explainer.txt: {exp_err}")
-                        except Exception:
-                            pass
-                        new_state["data_engineer_audit_override"] = override
-                        print("Runtime error guard: retrying Data Engineer with error context.")
-                        return run_data_engineer(new_state)
-                    return {
-                        "cleaning_code": code,
-                        "cleaned_data_preview": "Error: Cleaning Failed",
-                        "error_message": f"Sandbox Cleaning Failed: {error_details}",
-                        "budget_counters": counters,
-                    }
-                
-                # 4. Verification & Download
-                # Check if cleaned file exists
-                ls_check = sandbox.commands.run(f"ls {run_root}/data/cleaned_data.csv")
-                if ls_check.exit_code != 0:
-                      return {
-                         "cleaning_code": code,
-                         "cleaned_data_preview": "Error: File Not Created",
-                         "error_message": f"Cleaning script finished but data/cleaned_data.csv was not found.\nLogs:\n{output_log}",
-                         "budget_counters": counters,
-                    }
-    
-                # Persist DE artifact
-                try:
-                    os.makedirs("artifacts", exist_ok=True)
-                    with open(os.path.join("artifacts", "data_engineer_last.py"), "w", encoding="utf-8") as f_art:
-                        f_art.write(code)
-                except Exception as art_err:
-                    print(f"Warning: failed to persist data_engineer_last.py: {art_err}")
-    
-                downloaded_paths = []
-
-                # Download Result (CSV)
-                print("Downloading cleaned data...")
-                local_cleaned_path = "data/cleaned_data.csv"
-                os.makedirs("data", exist_ok=True)
-                
-                try:
-                    # Try standard download
-                    with open(local_cleaned_path, "wb") as f_local:
-                        remote_bytes = sandbox.files.read(f"{run_root}/data/cleaned_data.csv")
-                        if isinstance(remote_bytes, str):
-                            remote_bytes = remote_bytes.encode("utf-8")
-                        elif isinstance(remote_bytes, memoryview):
-                            remote_bytes = remote_bytes.tobytes()
-                        elif isinstance(remote_bytes, bytearray):
-                            remote_bytes = bytes(remote_bytes)
-                        f_local.write(remote_bytes)
-                except Exception as dl_err:
-                    print(f"Standard download failed ({dl_err}), trying Base64 fallback...")
-                    proc = sandbox.commands.run(f"base64 -w 0 {run_root}/data/cleaned_data.csv")
-                    if proc.exit_code == 0:
-                        b64_content = proc.stdout.strip()
-                        decoded = base64.b64decode(b64_content)
-                        with open(local_cleaned_path, "wb") as f_local:
-                            f_local.write(decoded)
-                    else:
-                          return {
+                                    override += (
+                                        "\n\nDUPLICATE_COLUMN_GUARD: When reading dtype, handle duplicate column labels. "
+                                        "Use series = df[actual_col]; if isinstance(series, pd.DataFrame), "
+                                        "use series = series.iloc[:, 0] and log a warning."
+                                    )
+                                except Exception:
+                                    pass
+                                new_state["data_engineer_audit_override"] = override
+                                print("Duplicate column dtype guard: retrying Data Engineer.")
+                                return run_data_engineer(new_state)
+                        if not state.get("de_runtime_retry_done"):
+                            new_state = dict(state)
+                            new_state["de_runtime_retry_done"] = True
+                            override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                            try:
+                                override += "\n\nRUNTIME_ERROR_CONTEXT:\n" + error_details[-2000:]
+                                failure_cause = _infer_de_failure_cause(error_details)
+                                if failure_cause:
+                                    override += "\nWHY_IT_HAPPENED: " + failure_cause
+                                diagnosis_lines = _build_de_runtime_diagnosis(error_details)
+                                if diagnosis_lines:
+                                    override += "\nERROR_DIAGNOSIS:\n- " + "\n- ".join(diagnosis_lines)
+                                explainer_text = ""
+                                try:
+                                    required_input = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
+                                    header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep)
+                                    norm_map = {}
+                                    for col in header_cols:
+                                        normed = _norm_name(col)
+                                        if normed and normed not in norm_map:
+                                            norm_map[normed] = col
+                                    required_raw_map = _build_required_raw_map(required_input, norm_map)
+                                    explainer_ctx = {
+                                        "strategy_title": selected.get("title", "") if selected else "",
+                                        "csv_dialect": input_dialect,
+                                        "required_input_columns": required_input,
+                                        "required_raw_header_map": required_raw_map,
+                                    }
+                                    explainer_text = failure_explainer.explain_data_engineer_failure(
+                                        code=code,
+                                        error_details=error_details,
+                                        context=explainer_ctx,
+                                    )
+                                except Exception as explainer_err:
+                                    print(f"Warning: failure explainer failed: {explainer_err}")
+                                    explainer_text = ""
+                                if explainer_text:
+                                    override += "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
+                                    try:
+                                        os.makedirs("artifacts", exist_ok=True)
+                                        with open(
+                                            os.path.join("artifacts", "data_engineer_failure_explainer.txt"),
+                                            "w",
+                                            encoding="utf-8",
+                                        ) as f_exp:
+                                            f_exp.write(explainer_text.strip())
+                                    except Exception as exp_err:
+                                        print(f"Warning: failed to persist data_engineer_failure_explainer.txt: {exp_err}")
+                            except Exception:
+                                pass
+                            new_state["data_engineer_audit_override"] = override
+                            print("Runtime error guard: retrying Data Engineer with error context.")
+                            return run_data_engineer(new_state)
+                        return {
                             "cleaning_code": code,
-                            "cleaned_data_preview": "Error: Download Failed",
-                            "error_message": f"Failed to download cleaned data: {proc.stderr}",
+                            "cleaned_data_preview": "Error: Cleaning Failed",
+                            "error_message": f"Sandbox Cleaning Failed: {error_details}",
                             "budget_counters": counters,
                         }
-                if os.path.exists(local_cleaned_path):
-                    downloaded_paths.append(local_cleaned_path)
-    
-                # Download Manifest (JSON) - Roundtrip Support
-                print("Downloading cleaning manifest...")
-                local_manifest_path = "data/cleaning_manifest.json"
-                try:
-                    # Try standard download
-                    with open(local_manifest_path, "wb") as f_local:
-                        remote_bytes = sandbox.files.read(f"{run_root}/data/cleaning_manifest.json")
-                        if isinstance(remote_bytes, str):
-                            remote_bytes = remote_bytes.encode("utf-8")
-                        elif isinstance(remote_bytes, memoryview):
-                            remote_bytes = remote_bytes.tobytes()
-                        elif isinstance(remote_bytes, bytearray):
-                            remote_bytes = bytes(remote_bytes)
-                        f_local.write(remote_bytes)
-                except Exception:
-                    # Fallback Base64
-                    proc = sandbox.commands.run(f"base64 -w 0 {run_root}/data/cleaning_manifest.json")
-                    if proc.exit_code == 0:
-                        b64_content = proc.stdout.strip()
-                        decoded = base64.b64decode(b64_content)
+
+                    # 4. Verification & Download
+                    # Check if cleaned file exists
+                    ls_check = run_cmd_with_retry(sandbox, f"ls {run_root}/data/cleaned_data.csv", retries=2)
+                    if ls_check.exit_code != 0:
+                        return {
+                            "cleaning_code": code,
+                            "cleaned_data_preview": "Error: File Not Created",
+                            "error_message": f"Cleaning script finished but data/cleaned_data.csv was not found.\nLogs:\n{output_log}",
+                            "budget_counters": counters,
+                        }
+
+                    # Persist DE artifact
+                    try:
+                        os.makedirs("artifacts", exist_ok=True)
+                        with open(os.path.join("artifacts", "data_engineer_last.py"), "w", encoding="utf-8") as f_art:
+                            f_art.write(code)
+                    except Exception as art_err:
+                        print(f"Warning: failed to persist data_engineer_last.py: {art_err}")
+
+                    downloaded_paths = []
+
+                    # Download Result (CSV) using centralized helper
+                    print("Downloading cleaned data...")
+                    local_cleaned_path = "data/cleaned_data.csv"
+                    os.makedirs("data", exist_ok=True)
+
+                    csv_content = safe_download_bytes(sandbox, f"{run_root}/data/cleaned_data.csv")
+                    if csv_content is None:
+                        return {
+                            "cleaning_code": code,
+                            "cleaned_data_preview": "Error: Download Failed",
+                            "error_message": "Failed to download cleaned data from sandbox",
+                            "budget_counters": counters,
+                        }
+                    with open(local_cleaned_path, "wb") as f_local:
+                        f_local.write(csv_content)
+                    if os.path.exists(local_cleaned_path):
+                        downloaded_paths.append(local_cleaned_path)
+
+                    # Download Manifest (JSON) - Roundtrip Support using centralized helper
+                    print("Downloading cleaning manifest...")
+                    local_manifest_path = "data/cleaning_manifest.json"
+                    manifest_content = safe_download_bytes(sandbox, f"{run_root}/data/cleaning_manifest.json")
+                    if manifest_content is not None:
                         with open(local_manifest_path, "wb") as f_local:
-                            f_local.write(decoded)
+                            f_local.write(manifest_content)
                     else:
                         print("Warning: Manifest download failed (not found?). Creating default.")
                         # Create default manifest if missing
@@ -6979,153 +6999,160 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         }
                         with open(local_manifest_path, "w") as f_def:
                             json.dump(default_manifest, f_def)
-                if os.path.exists(local_manifest_path):
-                    downloaded_paths.append(local_manifest_path)
-                try:
-                    os.makedirs("artifacts", exist_ok=True)
-                    with open(os.path.join("artifacts", "cleaning_manifest_last.json"), "wb") as f_copy:
-                        with open(local_manifest_path, "rb") as f_src:
-                            f_copy.write(f_src.read())
-                except Exception as copy_err:
-                    print(f"Warning: failed to persist cleaning_manifest_last.json: {copy_err}")
+                    if os.path.exists(local_manifest_path):
+                        downloaded_paths.append(local_manifest_path)
+                    try:
+                        os.makedirs("artifacts", exist_ok=True)
+                        with open(os.path.join("artifacts", "cleaning_manifest_last.json"), "wb") as f_copy:
+                            with open(local_manifest_path, "rb") as f_src:
+                                f_copy.write(f_src.read())
+                    except Exception as copy_err:
+                        print(f"Warning: failed to persist cleaning_manifest_last.json: {copy_err}")
 
-                manifest_data = {}
-                try:
-                    with open(local_manifest_path, "r", encoding="utf-8") as f_manifest:
-                        manifest_data = json.load(f_manifest)
-                except Exception:
                     manifest_data = {}
-                manifest_alerts = _extract_manifest_alerts(
-                    manifest_data,
-                    _resolve_contract_columns(state.get("execution_contract", {}), sources={"derived", "output"})
-                )
-                if manifest_alerts and not state.get("de_manifest_guard_retry_done"):
-                    new_state = dict(state)
-                    new_state["de_manifest_guard_retry_done"] = True
-                    base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                    payload = "MANIFEST_ALERTS:\n" + "\n".join(f"- {alert}" for alert in manifest_alerts)
-                    new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
-                    print("MANIFEST_GUARD: retrying Data Engineer once with manifest alerts.")
-                    return run_data_engineer(new_state)
-
-                outputs_listing = []
-                try:
-                    listing_proc = sandbox.commands.run(
-                        f"sh -lc 'cd {run_root} && find . -maxdepth 4 -type f -printf \"%p\\t%s\\n\" 2>/dev/null'"
+                    try:
+                        with open(local_manifest_path, "r", encoding="utf-8") as f_manifest:
+                            manifest_data = json.load(f_manifest)
+                    except Exception:
+                        manifest_data = {}
+                    manifest_alerts = _extract_manifest_alerts(
+                        manifest_data,
+                        _resolve_contract_columns(state.get("execution_contract", {}), sources={"derived", "output"})
                     )
-                    if listing_proc.exit_code == 0:
-                        outputs_listing = [line for line in listing_proc.stdout.splitlines() if line.strip()]
-                except Exception:
+                    if manifest_alerts and not state.get("de_manifest_guard_retry_done"):
+                        new_state = dict(state)
+                        new_state["de_manifest_guard_retry_done"] = True
+                        base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                        payload = "MANIFEST_ALERTS:\n" + "\n".join(f"- {alert}" for alert in manifest_alerts)
+                        new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+                        print("MANIFEST_GUARD: retrying Data Engineer once with manifest alerts.")
+                        return run_data_engineer(new_state)
+
                     outputs_listing = []
-                if run_id:
-                    log_sandbox_attempt(
-                        run_id,
-                        step_name,
-                        attempt_id,
-                        code=code,
-                        stdout=stdout_text,
-                        stderr=stderr_text,
-                        outputs_listing=outputs_listing,
-                        downloaded_paths=downloaded_paths,
-                        exit_code=getattr(execution, "exit_code", None),
-                        error_tail=(execution.error.traceback if execution.error else None),
-                    )
+                    try:
+                        listing_proc = sandbox.commands.run(
+                            f"sh -lc 'cd {run_root} && find . -maxdepth 4 -type f -printf \"%p\\t%s\\n\" 2>/dev/null'"
+                        )
+                        if listing_proc.exit_code == 0:
+                            outputs_listing = [line for line in listing_proc.stdout.splitlines() if line.strip()]
+                    except Exception:
+                        outputs_listing = []
+                    if run_id:
+                        log_sandbox_attempt(
+                            run_id,
+                            step_name,
+                            attempt_id,
+                            code=code,
+                            stdout=stdout_text,
+                            stderr=stderr_text,
+                            outputs_listing=outputs_listing,
+                            downloaded_paths=downloaded_paths,
+                            exit_code=getattr(execution, "exit_code", None),
+                            error_tail=(execution.error.traceback if execution.error else None),
+                        )
 
-                required_input = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
-                raw_rows = _count_raw_rows(csv_path, csv_encoding, csv_sep, csv_decimal)
-                cleaned_encoding = None
-                try:
-                    cleaned_encoding = (
-                        manifest_data.get("output_dialect", {}).get("encoding")
-                        if isinstance(manifest_data.get("output_dialect"), dict)
-                        else None
-                    )
-                except Exception:
+                    required_input = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
+                    raw_rows = _count_raw_rows(csv_path, csv_encoding, csv_sep, csv_decimal)
                     cleaned_encoding = None
-                cleaned_encoding = cleaned_encoding or "utf-8"
-                cleaned_sep = None
-                cleaned_decimal = None
-                try:
-                    if isinstance(manifest_data.get("output_dialect"), dict):
-                        cleaned_sep = manifest_data["output_dialect"].get("sep")
-                        cleaned_decimal = manifest_data["output_dialect"].get("decimal")
-                except Exception:
+                    try:
+                        cleaned_encoding = (
+                            manifest_data.get("output_dialect", {}).get("encoding")
+                            if isinstance(manifest_data.get("output_dialect"), dict)
+                            else None
+                        )
+                    except Exception:
+                        cleaned_encoding = None
+                    cleaned_encoding = cleaned_encoding or "utf-8"
                     cleaned_sep = None
                     cleaned_decimal = None
-                cleaned_rows = _count_raw_rows(local_cleaned_path, cleaned_encoding, cleaned_sep, cleaned_decimal)
-                row_drop_summary = _summarize_row_drop(
-                    manifest_data,
-                    required_input,
-                    initial_override=raw_rows,
-                    after_override=cleaned_rows,
-                )
-                if row_drop_summary and not state.get("de_row_drop_retry_done"):
-                    new_state = dict(state)
-                    new_state["de_row_drop_retry_done"] = True
-                    base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
-                    payload = (
-                        "CLEANING_RECOVERY_ALERT:\n"
-                        f"- rows_initial={row_drop_summary.get('initial')}\n"
-                        f"- rows_after={row_drop_summary.get('after')}\n"
-                        f"- drop_frac={row_drop_summary.get('drop_frac')}\n"
-                    )
-                    suspects = row_drop_summary.get("suspects") or []
-                    if suspects:
-                        payload += "SUSPECT_CONVERSIONS:\n" + json.dumps(suspects, ensure_ascii=True)
-                        try:
-                            header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep)
-                            norm_map = {}
-                            for col in header_cols:
-                                normed = _norm_name(col)
-                                if normed and normed not in norm_map:
-                                    norm_map[normed] = col
-                            suspect_cols = [item.get("column") for item in suspects if item.get("column")]
-                            sample_context = _build_required_sample_context(
-                                csv_path, input_dialect, suspect_cols, norm_map, max_rows=200
-                            )
-                            if sample_context:
-                                payload = f"{payload}\n\n{sample_context}"
-                        except Exception:
-                            pass
                     try:
-                        explainer_text = failure_explainer.explain_data_engineer_failure(
-                            code=code,
-                            error_details=payload,
-                            context={
-                                "strategy_title": selected.get("title", "") if selected else "",
-                                "csv_dialect": input_dialect,
-                                "required_input_columns": required_input,
-                                "row_drop_summary": row_drop_summary,
-                            },
+                        if isinstance(manifest_data.get("output_dialect"), dict):
+                            cleaned_sep = manifest_data["output_dialect"].get("sep")
+                            cleaned_decimal = manifest_data["output_dialect"].get("decimal")
+                    except Exception:
+                        cleaned_sep = None
+                        cleaned_decimal = None
+                    cleaned_rows = _count_raw_rows(local_cleaned_path, cleaned_encoding, cleaned_sep, cleaned_decimal)
+                    row_drop_summary = _summarize_row_drop(
+                        manifest_data,
+                        required_input,
+                        initial_override=raw_rows,
+                        after_override=cleaned_rows,
+                    )
+                    if row_drop_summary and not state.get("de_row_drop_retry_done"):
+                        new_state = dict(state)
+                        new_state["de_row_drop_retry_done"] = True
+                        base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                        payload = (
+                            "CLEANING_RECOVERY_ALERT:\n"
+                            f"- rows_initial={row_drop_summary.get('initial')}\n"
+                            f"- rows_after={row_drop_summary.get('after')}\n"
+                            f"- drop_frac={row_drop_summary.get('drop_frac')}\n"
                         )
-                    except Exception as explainer_err:
-                        print(f"Warning: failure explainer failed: {explainer_err}")
-                        explainer_text = ""
-                    if explainer_text:
-                        payload = payload + "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
+                        suspects = row_drop_summary.get("suspects") or []
+                        if suspects:
+                            payload += "SUSPECT_CONVERSIONS:\n" + json.dumps(suspects, ensure_ascii=True)
+                            try:
+                                header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep)
+                                norm_map = {}
+                                for col in header_cols:
+                                    normed = _norm_name(col)
+                                    if normed and normed not in norm_map:
+                                        norm_map[normed] = col
+                                suspect_cols = [item.get("column") for item in suspects if item.get("column")]
+                                sample_context = _build_required_sample_context(
+                                    csv_path, input_dialect, suspect_cols, norm_map, max_rows=200
+                                )
+                                if sample_context:
+                                    payload = f"{payload}\n\n{sample_context}"
+                            except Exception:
+                                pass
                         try:
-                            os.makedirs("artifacts", exist_ok=True)
-                            with open(
-                                os.path.join("artifacts", "data_engineer_failure_explainer.txt"),
-                                "w",
-                                encoding="utf-8",
-                            ) as f_exp:
-                                f_exp.write(explainer_text.strip())
-                        except Exception as exp_err:
-                            print(f"Warning: failed to persist data_engineer_failure_explainer.txt: {exp_err}")
-                    new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
-                    print("ROW_DROP_GUARD: retrying Data Engineer with recovery context.")
-                    return run_data_engineer(new_state)
+                            explainer_text = failure_explainer.explain_data_engineer_failure(
+                                code=code,
+                                error_details=payload,
+                                context={
+                                    "strategy_title": selected.get("title", "") if selected else "",
+                                    "csv_dialect": input_dialect,
+                                    "required_input_columns": required_input,
+                                    "row_drop_summary": row_drop_summary,
+                                },
+                            )
+                        except Exception as explainer_err:
+                            print(f"Warning: failure explainer failed: {explainer_err}")
+                            explainer_text = ""
+                        if explainer_text:
+                            payload = payload + "\nLLM_FAILURE_EXPLANATION:\n" + explainer_text.strip()
+                            try:
+                                os.makedirs("artifacts", exist_ok=True)
+                                with open(
+                                    os.path.join("artifacts", "data_engineer_failure_explainer.txt"),
+                                    "w",
+                                    encoding="utf-8",
+                                ) as f_exp:
+                                    f_exp.write(explainer_text.strip())
+                            except Exception as exp_err:
+                                print(f"Warning: failed to persist data_engineer_failure_explainer.txt: {exp_err}")
+                        new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+                        print("ROW_DROP_GUARD: retrying Data Engineer with recovery context.")
+                        return run_data_engineer(new_state)
 
-                print("Cleaning Success (Artifacts Downloaded).")
-    
-                # Apply output_dialect for downstream reads
-                csv_sep, csv_decimal, csv_encoding, dialect_updated = get_output_dialect_from_manifest(
-                    local_manifest_path, csv_sep, csv_decimal, csv_encoding
-                )
-                if dialect_updated:
-                    print(f"Downstream dialect updated from output_dialect: sep={csv_sep}, decimal={csv_decimal}, encoding={csv_encoding}")
-    
+                    print("Cleaning Success (Artifacts Downloaded).")
+
+                    # Apply output_dialect for downstream reads
+                    csv_sep, csv_decimal, csv_encoding, dialect_updated = get_output_dialect_from_manifest(
+                        local_manifest_path, csv_sep, csv_decimal, csv_encoding
+                    )
+                    if dialect_updated:
+                        print(f"Downstream dialect updated from output_dialect: sep={csv_sep}, decimal={csv_decimal}, encoding={csv_encoding}")
+
+                break  # Sandbox execution successful, exit retry loop
+              except Exception as e:
+                if sb_attempt == 0 and is_transient_sandbox_error(e):
+                    print(f"SANDBOX_RETRY step=data_engineer attempt={sb_attempt+1} err={e}")
+                    continue
+                raise
+
         if not os.path.exists(local_cleaned_path):
             return {
                 "cleaning_code": code,
@@ -7712,23 +7739,23 @@ def run_data_engineer(state: AgentState) -> AgentState:
                 "budget_counters": counters,
             }
 
-         # P2.3: Calculate dataset scale hints after Data Engineer
-         work_dir = state.get("work_dir", ".")
-         dataset_scale_hints = get_dataset_scale_hints(work_dir, "data/cleaned_data.csv")
+        # P2.3: Calculate dataset scale hints after Data Engineer
+        work_dir = state.get("work_dir", ".")
+        dataset_scale_hints = get_dataset_scale_hints(work_dir, "data/cleaned_data.csv")
 
-         if run_id:
-             log_run_event(
-                 run_id,
-                 "data_engineer_complete",
-                 {
-                     "rows": len(df_final),
-                     "columns": len(df_final.columns),
-                     "dataset_scale": dataset_scale_hints.get("scale"),
-                     "dataset_file_mb": dataset_scale_hints.get("file_mb"),
-                 },
-             )
+        if run_id:
+            log_run_event(
+                run_id,
+                "data_engineer_complete",
+                {
+                    "rows": len(df_final),
+                    "columns": len(df_final.columns),
+                    "dataset_scale": dataset_scale_hints.get("scale"),
+                    "dataset_file_mb": dataset_scale_hints.get("file_mb"),
+                },
+            )
 
-         return {
+        return {
              "cleaning_code": code,
              "cleaned_data_preview": preview,
              "csv_sep": csv_sep,
@@ -8936,231 +8963,238 @@ def execute_code(state: AgentState) -> AgentState:
         if not api_key:
             msg = "CRITICAL: E2B_API_KEY missing in .env file."
             return {"error_message": msg, "execution_output": msg, "budget_counters": counters}
-        os.environ["E2B_API_KEY"] = api_key 
-        
-        with Sandbox.create() as sandbox:
-            step_name = "ml_engineer"
-            run_root = f"/home/user/run/{run_id}/{step_name}/attempt_{attempt_id}"
-            print("Installing dependencies in Sandbox...")
-            pkg_sets = get_sandbox_install_packages(required_deps)
-            base_cmd = "pip install -q " + " ".join(pkg_sets["base"])
-            sandbox.commands.run(base_cmd)
-            if pkg_sets["extra"]:
-                extra_cmd = "pip install -q " + " ".join(pkg_sets["extra"])
-                sandbox.commands.run(extra_cmd)
-            sandbox.commands.run(f"rm -rf {run_root}")
-            sandbox.commands.run(f"mkdir -p {run_root}/static/plots")
-            sandbox.commands.run(f"mkdir -p {run_root}/data")
-            
-            # P2.1: Use canonical cleaned path + aliases (P2.2: run_cmd_with_retry)
-            local_csv = state.get("ml_data_path") or "data/cleaned_data.csv"
-            if not os.path.exists(local_csv) and local_csv != "data/cleaned_data.csv":
-                local_csv = "data/cleaned_data.csv"
+        os.environ["E2B_API_KEY"] = api_key
 
-            # Upload cleaned data (P2.1: Canonical path)
-            remote_clean_abs = canonical_abs(run_root, CANONICAL_CLEANED_REL)
+        # Determine ML timeout based on dataset scale (P2.2)
+        dataset_scale = state.get("dataset_scale") or (state.get("dataset_scale_hints") or {}).get("scale")
+        if dataset_scale == "small":
+            ml_timeout = ML_TIMEOUT_SMALL_S
+        elif dataset_scale == "large":
+            ml_timeout = ML_TIMEOUT_LARGE_S
+        else:
+            ml_timeout = ML_TIMEOUT_MEDIUM_S  # Default to medium
 
-            if os.path.exists(local_csv):
-                with open(local_csv, "rb") as f:
-                    sandbox.files.write(remote_clean_abs, f)
-                print(f"Data uploaded to {CANONICAL_CLEANED_REL}")
+        for sb_attempt in range(2):
+          try:
+            with Sandbox.create() as sandbox:
+                step_name = "ml_engineer"
+                run_root = f"/home/user/run/{run_id}/{step_name}/attempt_{attempt_id}"
+                print("Installing dependencies in Sandbox...")
+                pkg_sets = get_sandbox_install_packages(required_deps)
+                base_cmd = "pip install -q " + " ".join(pkg_sets["base"])
+                run_cmd_with_retry(sandbox, base_cmd, retries=2)
+                if pkg_sets["extra"]:
+                    extra_cmd = "pip install -q " + " ".join(pkg_sets["extra"])
+                    run_cmd_with_retry(sandbox, extra_cmd, retries=2)
+                run_cmd_with_retry(sandbox, f"rm -rf {run_root}", retries=2)
+                run_cmd_with_retry(sandbox, f"mkdir -p {run_root}/static/plots", retries=2)
+                run_cmd_with_retry(sandbox, f"mkdir -p {run_root}/data", retries=2)
 
-            # P2.1: Create aliases for cleaned data (run_cmd_with_retry for resilience)
-            cleaned_alias_commands = build_symlink_or_copy_commands(
-                run_root,
-                canonical_rel=CANONICAL_CLEANED_REL,
-                aliases=COMMON_CLEANED_ALIASES
-            )
-            if cleaned_alias_commands:
-                print(f"Creating {len(cleaned_alias_commands)} cleaned data aliases...")
-                full_cmd = " && ".join(cleaned_alias_commands)
-                run_cmd_with_retry(sandbox, f"sh -lc 'cd {run_root} && {full_cmd}'")
-                print(f"SANDBOX_INPUT_CANONICAL: {CANONICAL_CLEANED_REL}")
-                print(f"SANDBOX_INPUT_ALIASES: {COMMON_CLEANED_ALIASES}")
+                # P2.1: Use canonical cleaned path + aliases (P2.2: run_cmd_with_retry)
+                local_csv = state.get("ml_data_path") or "data/cleaned_data.csv"
+                if not os.path.exists(local_csv) and local_csv != "data/cleaned_data.csv":
+                    local_csv = "data/cleaned_data.csv"
 
-            # P2.1: Upload manifest to canonical path
-            local_manifest = "data/cleaning_manifest.json"
-            remote_manifest_abs = canonical_abs(run_root, CANONICAL_MANIFEST_REL)
+                # Upload cleaned data (P2.1: Canonical path)
+                remote_clean_abs = canonical_abs(run_root, CANONICAL_CLEANED_REL)
 
-            if os.path.exists(local_manifest):
-                with open(local_manifest, "rb") as f:
-                    sandbox.files.write(remote_manifest_abs, f)
-                print(f"Manifest uploaded to {CANONICAL_MANIFEST_REL}")
+                if os.path.exists(local_csv):
+                    with open(local_csv, "rb") as f:
+                        sandbox.files.write(remote_clean_abs, f)
+                    print(f"Data uploaded to {CANONICAL_CLEANED_REL}")
 
-                # P2.1: Create alias for manifest in root
-                sandbox.commands.run(f"cd {run_root} && ln -sf {CANONICAL_MANIFEST_REL} cleaning_manifest.json || cp -f {CANONICAL_MANIFEST_REL} cleaning_manifest.json")
+                # P2.1: Create aliases for cleaned data (run_cmd_with_retry for resilience)
+                cleaned_alias_commands = build_symlink_or_copy_commands(
+                    run_root,
+                    canonical_rel=CANONICAL_CLEANED_REL,
+                    aliases=COMMON_CLEANED_ALIASES
+                )
+                if cleaned_alias_commands:
+                    print(f"Creating {len(cleaned_alias_commands)} cleaned data aliases...")
+                    full_cmd = " && ".join(cleaned_alias_commands)
+                    run_cmd_with_retry(sandbox, f"sh -lc 'cd {run_root} && {full_cmd}'")
+                    print(f"SANDBOX_INPUT_CANONICAL: {CANONICAL_CLEANED_REL}")
+                    print(f"SANDBOX_INPUT_ALIASES: {COMMON_CLEANED_ALIASES}")
 
-            # P2.1: Patch code with placeholders (minimal backward compat)
-            code = patch_placeholders(code, data_rel=CANONICAL_CLEANED_REL, manifest_rel=CANONICAL_MANIFEST_REL)
-            if local_csv:
-                # Keep minimal backward compat: only replace exact local_csv paths
-                code = code.replace(local_csv, remote_clean_abs)
-                if not local_csv.startswith("./"):
-                    code = code.replace(f"./{local_csv}", remote_clean_abs)
+                # P2.1: Upload manifest to canonical path
+                local_manifest = "data/cleaning_manifest.json"
+                remote_manifest_abs = canonical_abs(run_root, CANONICAL_MANIFEST_REL)
 
-            working_dir_injection = (
-                "import os\n"
-                f"os.makedirs(r\"{run_root}\", exist_ok=True)\n"
-                f"os.chdir(r\"{run_root}\")\n"
-            )
-            code = working_dir_injection + code
+                if os.path.exists(local_manifest):
+                    with open(local_manifest, "rb") as f:
+                        sandbox.files.write(remote_manifest_abs, f)
+                    print(f"Manifest uploaded to {CANONICAL_MANIFEST_REL}")
 
-            # Persist executed ML script for traceability
-            try:
-                os.makedirs("artifacts", exist_ok=True)
-                with open(os.path.join("artifacts", "ml_engineer_last.py"), "w", encoding="utf-8") as f_art:
-                    f_art.write(code)
-            except Exception as artifact_err:
-                print(f"Warning: failed to persist ml_engineer_last.py: {artifact_err}")
-            if run_id:
-                run_dir = get_run_dir(run_id)
-                if run_dir:
-                    try:
-                        base = os.path.join(run_dir, "agents", "ml_engineer", f"iteration_{attempt_id}")
-                        os.makedirs(base, exist_ok=True)
-                        with open(os.path.join(base, "script_executed.py"), "w", encoding="utf-8") as f_exec:
-                            f_exec.write(code)
-                    except Exception:
-                        pass
+                    # P2.1: Create alias for manifest in root
+                    run_cmd_with_retry(sandbox, f"cd {run_root} && ln -sf {CANONICAL_MANIFEST_REL} cleaning_manifest.json || cp -f {CANONICAL_MANIFEST_REL} cleaning_manifest.json", retries=2)
 
-            print("Running code in Sandbox...")
-            execution = sandbox.run_code(code)
-            
-            stdout_text = "\n".join(execution.logs.stdout or [])
-            stderr_text = "\n".join(execution.logs.stderr or [])
-            output = ""
-            if stdout_text:
-                output += "\nSTDOUT:\n" + stdout_text
-            if stderr_text:
-                output += "\nSTDERR:\n" + stderr_text
-            
-            if execution.error:
-                output += f"\n\nEXECUTION ERROR:\n{execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
+                # P2.1: Patch code with placeholders (minimal backward compat)
+                code = patch_placeholders(code, data_rel=CANONICAL_CLEANED_REL, manifest_rel=CANONICAL_MANIFEST_REL)
+                if local_csv:
+                    # Keep minimal backward compat: only replace exact local_csv paths
+                    code = code.replace(local_csv, remote_clean_abs)
+                    if not local_csv.startswith("./"):
+                        code = code.replace(f"./{local_csv}", remote_clean_abs)
 
-            downloaded_paths = []
+                working_dir_injection = (
+                    "import os\n"
+                    f"os.makedirs(r\"{run_root}\", exist_ok=True)\n"
+                    f"os.chdir(r\"{run_root}\")\n"
+                )
+                code = working_dir_injection + code
 
-            # Robust Artifact Download (P0 Fix)
-            # Use shell command that always succeeds even if no files found
-            ls_proc = sandbox.commands.run(f"sh -lc 'ls -1 {run_root}/static/plots/*.png 2>/dev/null || true'")
-            
-            if ls_proc.exit_code == 0:
-                os.makedirs("static/plots", exist_ok=True)
-                # Filter empty strings from split
-                plot_files = [p for p in ls_proc.stdout.strip().split('\n') if p]
-                
-                if not plot_files:
-                    print("Info: No plots generated by the script.")
-                else:
-                    for remote_plot in plot_files:
-                        if remote_plot.endswith('.png'):
-                            try:
-                                # Base64 robust download
-                                proc = sandbox.commands.run(f"base64 -w 0 {remote_plot}")
-                                if proc.exit_code == 0:
-                                    b64_content = proc.stdout.strip()
-                                    content = base64.b64decode(b64_content)
-                                    if len(content) > 0:
-                                        local_name = os.path.basename(remote_plot)
-                                        local_path = os.path.join("static/plots", local_name)
-                                        with open(local_path, "wb") as f_local:
-                                            f_local.write(content)
-                                        downloaded_paths.append(local_path)
-                                        print(f"Downloaded plot: {local_name}")
-                            except Exception as e:
-                                 print(f"Failed to download {remote_plot}: {e}")
-            else:
-                print(f"Warning: Plot listing failed (Exit Code {ls_proc.exit_code})")
+                # Persist executed ML script for traceability
+                try:
+                    os.makedirs("artifacts", exist_ok=True)
+                    with open(os.path.join("artifacts", "ml_engineer_last.py"), "w", encoding="utf-8") as f_art:
+                        f_art.write(code)
+                except Exception as artifact_err:
+                    print(f"Warning: failed to persist ml_engineer_last.py: {artifact_err}")
+                if run_id:
+                    run_dir = get_run_dir(run_id)
+                    if run_dir:
+                        try:
+                            base = os.path.join(run_dir, "agents", "ml_engineer", f"iteration_{attempt_id}")
+                            os.makedirs(base, exist_ok=True)
+                            with open(os.path.join(base, "script_executed.py"), "w", encoding="utf-8") as f_exec:
+                                f_exec.write(code)
+                        except Exception:
+                            pass
 
-            # Download required outputs per contract (beyond plots)
-            req_outputs = required_outputs or state.get("execution_contract", {}).get("required_outputs", []) or []
-            for pattern in req_outputs:
-                if not pattern:
-                    continue
-                if pattern.startswith("/"):
-                    remote_pattern = pattern
-                else:
-                    remote_pattern = f"{run_root}/{pattern}"
-                list_cmd = f"sh -lc 'ls -1 {remote_pattern} 2>/dev/null || true'"
-                lst = sandbox.commands.run(list_cmd)
-                if lst.exit_code != 0:
-                    continue
-                files = [p for p in lst.stdout.strip().split("\n") if p]
-                for remote_path in files:
-                    if not remote_path:
-                        continue
-                    try:
-                        proc = sandbox.commands.run(f"base64 -w 0 {remote_path}")
-                        if proc.exit_code == 0:
-                            b64_content = proc.stdout.strip()
-                            content = base64.b64decode(b64_content)
-                            if len(content) >= 0:
-                                if remote_path.startswith(run_root):
-                                    local_path = remote_path[len(run_root):].lstrip("/")
-                                elif remote_path.startswith("/home/user/"):
-                                    local_path = remote_path[len("/home/user/"):].lstrip("/")
+                print("Running code in Sandbox...")
+                execution = run_code_with_optional_timeout(sandbox, code, timeout_s=ml_timeout)
+
+                stdout_text = "\n".join(execution.logs.stdout or [])
+                stderr_text = "\n".join(execution.logs.stderr or [])
+                output = ""
+                if stdout_text:
+                    output += "\nSTDOUT:\n" + stdout_text
+                if stderr_text:
+                    output += "\nSTDERR:\n" + stderr_text
+
+                if execution.error:
+                    output += f"\n\nEXECUTION ERROR:\n{execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
+
+                downloaded_paths = []
+
+                # Robust Artifact Download (P0 Fix) using centralized helper
+                # Use shell command that always succeeds even if no files found
+                ls_proc = run_cmd_with_retry(sandbox, f"sh -lc 'ls -1 {run_root}/static/plots/*.png 2>/dev/null || true'", retries=2)
+
+                if ls_proc.exit_code == 0:
+                    os.makedirs("static/plots", exist_ok=True)
+                    # Filter empty strings from split
+                    plot_files = [p for p in ls_proc.stdout.strip().split('\n') if p]
+
+                    if not plot_files:
+                        print("Info: No plots generated by the script.")
+                    else:
+                        for remote_plot in plot_files:
+                            if remote_plot.endswith('.png'):
+                                # Use centralized download helper for binary files
+                                content = safe_download_bytes(sandbox, remote_plot)
+                                if content and len(content) > 0:
+                                    local_name = os.path.basename(remote_plot)
+                                    local_path = os.path.join("static/plots", local_name)
+                                    with open(local_path, "wb") as f_local:
+                                        f_local.write(content)
+                                    downloaded_paths.append(local_path)
+                                    print(f"Downloaded plot: {local_name}")
                                 else:
-                                    local_path = remote_path.lstrip("/")
-                                os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                                with open(local_path, "wb") as f_local:
-                                    f_local.write(content)
-                                downloaded_paths.append(local_path)
-                                print(f"Downloaded required output: {local_path}")
-                    except Exception as dl_err:
-                        print(f"Warning: failed to download required output {remote_path}: {dl_err}")
-
-            # Download optional plot insights if present
-            for rel_path in ["data/plot_insights.json"]:
-                if rel_path.startswith("/"):
-                    remote_path = rel_path
+                                    print(f"Warning: Failed to download {remote_plot}")
                 else:
-                    remote_path = f"{run_root}/{rel_path}"
-                list_cmd = f"sh -lc 'ls -1 {remote_path} 2>/dev/null || true'"
-                lst = sandbox.commands.run(list_cmd)
-                if lst.exit_code != 0:
-                    continue
-                files = [p for p in lst.stdout.strip().split("\n") if p]
-                for remote_opt in files:
-                    if not remote_opt:
+                    print(f"Warning: Plot listing failed (Exit Code {ls_proc.exit_code})")
+
+                # Download required outputs per contract (beyond plots) using centralized helper
+                req_outputs = required_outputs or state.get("execution_contract", {}).get("required_outputs", []) or []
+                for pattern in req_outputs:
+                    if not pattern:
                         continue
-                    try:
-                        proc = sandbox.commands.run(f"base64 -w 0 {remote_opt}")
-                        if proc.exit_code == 0:
-                            b64_content = proc.stdout.strip()
-                            content = base64.b64decode(b64_content)
+                    if pattern.startswith("/"):
+                        remote_pattern = pattern
+                    else:
+                        remote_pattern = f"{run_root}/{pattern}"
+                    list_cmd = f"sh -lc 'ls -1 {remote_pattern} 2>/dev/null || true'"
+                    lst = sandbox.commands.run(list_cmd)
+                    if lst.exit_code != 0:
+                        continue
+                    files = [p for p in lst.stdout.strip().split("\n") if p]
+                    for remote_path in files:
+                        if not remote_path:
+                            continue
+                        content = safe_download_bytes(sandbox, remote_path)
+                        if content is not None:
+                            if remote_path.startswith(run_root):
+                                local_path = remote_path[len(run_root):].lstrip("/")
+                            elif remote_path.startswith("/home/user/"):
+                                local_path = remote_path[len("/home/user/"):].lstrip("/")
+                            else:
+                                local_path = remote_path.lstrip("/")
+                            os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+                            with open(local_path, "wb") as f_local:
+                                f_local.write(content)
+                            downloaded_paths.append(local_path)
+                            print(f"Downloaded required output: {local_path}")
+                        else:
+                            print(f"Warning: failed to download required output {remote_path}")
+
+                # Download optional plot insights if present using centralized helper
+                for rel_path in ["data/plot_insights.json"]:
+                    if rel_path.startswith("/"):
+                        remote_path = rel_path
+                    else:
+                        remote_path = f"{run_root}/{rel_path}"
+                    list_cmd = f"sh -lc 'ls -1 {remote_path} 2>/dev/null || true'"
+                    lst = sandbox.commands.run(list_cmd)
+                    if lst.exit_code != 0:
+                        continue
+                    files = [p for p in lst.stdout.strip().split("\n") if p]
+                    for remote_opt in files:
+                        if not remote_opt:
+                            continue
+                        content = safe_download_bytes(sandbox, remote_opt)
+                        if content is not None:
                             if remote_opt.startswith(run_root):
                                 local_path = remote_opt[len(run_root):].lstrip("/")
                             elif remote_opt.startswith("/home/user/"):
                                 local_path = remote_opt[len("/home/user/"):].lstrip("/")
                             else:
                                 local_path = remote_opt.lstrip("/")
-                            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                            os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
                             with open(local_path, "wb") as f_local:
                                 f_local.write(content)
                             downloaded_paths.append(local_path)
                             print(f"Downloaded optional output: {local_path}")
-                    except Exception as dl_err:
-                        print(f"Warning: failed to download optional output {remote_opt}: {dl_err}")
-            list_cmd = f"sh -lc 'cd {run_root} && find . -maxdepth 5 -type f -printf \"%p\\t%s\\n\" 2>/dev/null'"
-            outputs_listing = []
-            try:
-                listing_proc = sandbox.commands.run(list_cmd)
-                if listing_proc.exit_code == 0:
-                    outputs_listing = [line for line in listing_proc.stdout.splitlines() if line.strip()]
-            except Exception:
+                        else:
+                            print(f"Warning: failed to download optional output {remote_opt}")
+                list_cmd = f"sh -lc 'cd {run_root} && find . -maxdepth 5 -type f -printf \"%p\\t%s\\n\" 2>/dev/null'"
                 outputs_listing = []
-            if run_id:
-                log_sandbox_attempt(
-                    run_id,
-                    step_name,
-                    attempt_id,
-                    code=code,
-                    stdout=stdout_text,
-                    stderr=stderr_text,
-                    outputs_listing=outputs_listing,
-                    downloaded_paths=downloaded_paths,
-                    exit_code=getattr(execution, "exit_code", None),
-                    error_tail=(execution.error.traceback if execution.error else None),
-                )
+                try:
+                    listing_proc = sandbox.commands.run(list_cmd)
+                    if listing_proc.exit_code == 0:
+                        outputs_listing = [line for line in listing_proc.stdout.splitlines() if line.strip()]
+                except Exception:
+                    outputs_listing = []
+                if run_id:
+                    log_sandbox_attempt(
+                        run_id,
+                        step_name,
+                        attempt_id,
+                        code=code,
+                        stdout=stdout_text,
+                        stderr=stderr_text,
+                        outputs_listing=outputs_listing,
+                        downloaded_paths=downloaded_paths,
+                        exit_code=getattr(execution, "exit_code", None),
+                        error_tail=(execution.error.traceback if execution.error else None),
+                    )
+
+            break  # Sandbox execution successful, exit retry loop
+          except Exception as e:
+            if sb_attempt == 0 and is_transient_sandbox_error(e):
+                print(f"SANDBOX_RETRY step=ml_engineer attempt={sb_attempt+1} err={e}")
+                continue
+            raise
 
     except Exception as e:
         output = f"Sandbox Execution Failed: {e}"
