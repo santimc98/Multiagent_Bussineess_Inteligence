@@ -109,6 +109,12 @@ from src.utils.run_storage import (
     clean_workspace_outputs,
     normalize_status,
 )
+from src.utils.run_workspace import enter_run_workspace, exit_run_workspace
+from src.utils.artifact_resolver import (
+    load_json_scoped,
+    exists_scoped,
+    get_artifact_from_state_or_scoped,
+)
 from src.utils.dataset_memory import (
     fingerprint_dataset,
     load_dataset_memory,
@@ -472,6 +478,8 @@ def _abort_if_requested(state: Dict[str, Any], stage: str) -> Dict[str, Any] | N
             finalize_run(run_id, status_final="CRASH", state=state)
         except Exception:
             pass
+        finally:
+            exit_run_workspace(state)
     return {
         "error_message": "ABORTED_BY_USER",
         "cleaned_data_preview": "Error: Aborted",
@@ -1687,11 +1695,9 @@ def _build_contract_views(
     contract: Dict[str, Any],
     contract_min: Dict[str, Any] | None,
 ) -> Dict[str, Any]:
-    artifact_index = (
-        state.get("artifact_index")
-        or _load_json_any("data/produced_artifact_index.json")
-        or []
-    )
+    # P0 FIX: Do NOT read from disk fallback - prevents cross-run contamination.
+    # If artifact_index is empty, code below will build it fresh from contract.
+    artifact_index = state.get("artifact_index") or []
     if not artifact_index:
         required_outputs = []
         if isinstance(contract_min, dict):
@@ -5689,6 +5695,17 @@ def run_steward(state: AgentState) -> AgentState:
     memory_context = summarize_memory(memory_entries, dataset_fingerprint)
     run_dir = init_run_dir(run_id, started_at=run_start_ts)
     init_run_bundle(run_id, state, run_dir=run_dir)
+
+    # P0 FIX: Enter isolated run workspace to prevent cross-run contamination
+    state = enter_run_workspace(state, run_dir)
+
+    # Initialize empty artifact index for this run (prevent stale data)
+    try:
+        os.makedirs("data", exist_ok=True)
+        dump_json("data/produced_artifact_index.json", [])
+    except Exception:
+        pass
+
     agent_models = {
         "steward": getattr(getattr(steward, "model", None), "model_name", None),
         "strategist": getattr(getattr(strategist, "model", None), "model_name", None),
@@ -10607,6 +10624,9 @@ def run_translator(state: AgentState) -> AgentState:
         finalize_run(run_id, status_final=status_final, state=state)
     except Exception:
         pass
+    finally:
+        # P0 FIX: Always restore cwd on exit
+        exit_run_workspace(state)
     return {"final_report": report, "pdf_path": report_state.get("pdf_path")}
 # Generate Unique PDF Path to avoid file locks
 import uuid

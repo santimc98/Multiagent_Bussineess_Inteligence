@@ -154,12 +154,14 @@ def apply_retention(keep_last: int = 5, archive_dir: str = ARCHIVE_DIR) -> None:
 
 
 def clean_workspace_outputs() -> None:
-    for folder in ["analysis", "models", "reports", os.path.join("static", "plots")]:
+    """Clean workspace outputs - expanded airbag to prevent cross-run contamination."""
+    for folder in ["analysis", "models", "reports", os.path.join("static", "plots"), "plots", "artifacts"]:
         if os.path.isdir(folder):
             try:
                 shutil.rmtree(folder, ignore_errors=True)
             except Exception:
                 pass
+    # Expanded list: all artifacts that could cause cross-run contamination
     for path in [
         os.path.join("data", "metrics.json"),
         os.path.join("data", "scored_rows.csv"),
@@ -169,6 +171,23 @@ def clean_workspace_outputs() -> None:
         os.path.join("data", "cleaned_full.csv"),
         os.path.join("data", "cleaning_manifest.json"),
         os.path.join("data", "dataset_profile.json"),
+        # P0 FIX: Additional files to prevent cross-run contamination
+        os.path.join("data", "produced_artifact_index.json"),
+        os.path.join("data", "plan.json"),
+        os.path.join("data", "strategy_spec.json"),
+        os.path.join("data", "evaluation_spec.json"),
+        os.path.join("data", "run_summary.json"),
+        os.path.join("data", "steward_summary.json"),
+        os.path.join("data", "steward_summary.txt"),
+        os.path.join("data", "plot_insights.json"),
+        os.path.join("data", "insights.json"),
+        os.path.join("data", "integrity_audit_report.json"),
+        os.path.join("data", "data_adequacy_report.json"),
+        os.path.join("data", "governance_report.json"),
+        # Note: dataset_memory.json is intentionally NOT cleaned - it persists across runs
+        os.path.join("data", "contract_min.json"),
+        os.path.join("data", "execution_contract.json"),
+        os.path.join("data", "executive_summary.md"),
     ]:
         try:
             if os.path.exists(path):
