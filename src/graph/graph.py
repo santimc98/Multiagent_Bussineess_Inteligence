@@ -5663,7 +5663,6 @@ class AgentState(TypedDict):
     max_sandbox_retries: int
     ml_call_refund_pending: bool
     execution_call_refund_pending: bool
-    ml_preflight_failed: bool
     artifact_content_issues: List[str]
     artifact_content_diagnostics: Dict[str, Any]
     last_successful_execution_output: str
@@ -7937,7 +7936,6 @@ def run_engineer(state: AgentState) -> AgentState:
                 "strategy_lock_details": lock_details,
                 "budget_counters": counters,
                 # Terminal flags to halt pipeline before execution
-                "ml_preflight_failed": True,
                 "generated_code": placeholder_code,
                 "last_generated_code": placeholder_code,
                 "review_abort_reason": "strategy_lock_failed",
@@ -9580,7 +9578,7 @@ def execute_code(state: AgentState) -> AgentState:
     return result
 
 def retry_handler(state: AgentState) -> AgentState:
-    print("--- [!] Performance Low. Retrying... ---")
+    print("--- [!] Iteration Retry Triggered ---")
 
     # Fix: Ensure feedback_history is a list
     current_history = list(state.get('feedback_history', []))
@@ -10970,7 +10968,6 @@ workflow.add_node("engineer", run_engineer)
 workflow.add_node("reviewer", run_reviewer)
 workflow.add_node("qa_reviewer", run_qa_reviewer) # QA Node
 workflow.add_node("final_runtime_fix", finalize_runtime_failure)
-workflow.add_node("ml_preflight", run_ml_preflight)
 workflow.add_node("execute_code", execute_code)
 workflow.add_node("evaluate_results", run_result_evaluator) # New Node
 workflow.add_node("retry_handler", retry_handler)
@@ -10994,17 +10991,8 @@ workflow.add_conditional_edges(
     "engineer",
     check_engineer_success,
     {
-        "success": "ml_preflight",
+        "success": "execute_code",
         "failed": "translator"
-    }
-)
-
-workflow.add_conditional_edges(
-    "ml_preflight",
-    check_ml_preflight,
-    {
-        "passed": "execute_code",
-        "failed": "retry_handler",
     }
 )
 
