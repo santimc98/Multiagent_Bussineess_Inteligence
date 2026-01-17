@@ -143,6 +143,23 @@ def normalize_artifact_requirements(
     if not isinstance(required_files, list):
         required_files = []
 
+    # Normalize mixed types (str vs dict) in required_files
+    normalized_files = []
+    for item in required_files:
+        if isinstance(item, str) and item.strip():
+            normalized_files.append({"path": item.strip(), "description": ""})
+        elif isinstance(item, dict):
+            normalized_files.append(item)
+    required_files = normalized_files
+
+    # Merge file_schemas keys if present
+    file_schemas = artifact_req.get("file_schemas", {})
+    if isinstance(file_schemas, dict):
+        existing_paths = {f.get("path") for f in required_files if f.get("path")}
+        for path in file_schemas.keys():
+            if path and path not in existing_paths:
+                required_files.append({"path": path, "description": "From file_schemas"})
+
     scored_schema = artifact_req.get("scored_rows_schema", {})
     if not isinstance(scored_schema, dict):
         scored_schema = {}
@@ -187,7 +204,8 @@ def normalize_artifact_requirements(
         "scored_rows_schema": {
             "required_columns": required_columns,
             "recommended_columns": scored_schema.get("recommended_columns", [])
-        }
+        },
+        "file_schemas": file_schemas
     }
 
     return artifact_requirements, warnings

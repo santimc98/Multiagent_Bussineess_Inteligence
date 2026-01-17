@@ -903,7 +903,7 @@ def build_contract_min(
             "required_any_of_group_severity": required_any_of_group_severity,
             "recommended_columns": [],
         },
-        "file_schemas": {},
+        "file_schemas": contract.get("artifact_requirements", {}).get("file_schemas", {}) if isinstance(contract.get("artifact_requirements"), dict) else {},
         "schema_binding": {
             "required_columns": canonical_columns,
             "optional_passthrough_columns": [],

@@ -10,7 +10,7 @@ import time
 import fnmatch
 from pathlib import Path
 from datetime import datetime
-from typing import TypedDict, Dict, Any, List, Literal
+from typing import TypedDict, Dict, Any, List, Literal, Optional
 from langgraph.graph import StateGraph, END
 from e2b_code_interpreter import Sandbox
 from dotenv import load_dotenv
@@ -9016,30 +9016,47 @@ def execute_code(state: AgentState) -> AgentState:
                     print(f"SANDBOX_INPUT_CANONICAL: {CANONICAL_CLEANED_REL}")
                     print(f"SANDBOX_INPUT_ALIASES: {COMMON_CLEANED_ALIASES}")
 
-                # P2.1: Upload manifest to canonical path
+                # P2.1: Upload manifest to canonical path and root
                 local_manifest = "data/cleaning_manifest.json"
                 remote_manifest_abs = canonical_abs(run_root, CANONICAL_MANIFEST_REL)
+                remote_manifest_root_abs = os.path.join(run_root, "cleaning_manifest.json").replace("\\", "/")
 
                 if os.path.exists(local_manifest):
                     with open(local_manifest, "rb") as f:
-                        sandbox.files.write(remote_manifest_abs, f)
-                    print(f"Manifest uploaded to {CANONICAL_MANIFEST_REL}")
-
-                    # P2.1: Create alias for manifest in root
-                    run_cmd_with_retry(sandbox, f"cd {run_root} && ln -sf {CANONICAL_MANIFEST_REL} cleaning_manifest.json || cp -f {CANONICAL_MANIFEST_REL} cleaning_manifest.json", retries=2)
-
-                # P2.1: Patch code with placeholders (minimal backward compat)
+                        manifest_content = f.read()
+                        sandbox.files.write(remote_manifest_abs, manifest_content)
+                        sandbox.files.write(remote_manifest_root_abs, manifest_content)
+                    print(f"Manifest uploaded to {CANONICAL_MANIFEST_REL} and root")
+                
+                # P2.1: Patch code with placeholders and explicit absolute entries
                 code = patch_placeholders(code, data_rel=CANONICAL_CLEANED_REL, manifest_rel=CANONICAL_MANIFEST_REL)
+                
+                # Explicit substitutions to ensure absolute paths and avoid .//
                 if local_csv:
-                    # Keep minimal backward compat: only replace exact local_csv paths
-                    code = code.replace(local_csv, remote_clean_abs)
-                    if not local_csv.startswith("./"):
-                        code = code.replace(f"./{local_csv}", remote_clean_abs)
+                     # Replace generic data paths with remote_clean_abs
+                     # Use pattern matching or strict order to avoid double replacement
+                     code = code.replace("./data/cleaned_data.csv", remote_clean_abs)
+                     code = code.replace("'data/cleaned_data.csv'", f"'{remote_clean_abs}'")
+                     code = code.replace('"data/cleaned_data.csv"', f'"{remote_clean_abs}"')
+                     
+                     # Only if local_csv is something else like 'data/input.csv'
+                     if local_csv not in ["data/cleaned_data.csv", "./data/cleaned_data.csv"]:
+                         code = code.replace(local_csv, remote_clean_abs)
+                         if not local_csv.startswith("./"):
+                             code = code.replace(f"./{local_csv}", remote_clean_abs)
 
+                # Manifest patching -> Point to ROOT manifest as requested
+                code = code.replace("./data/cleaning_manifest.json", remote_manifest_root_abs)
+                code = code.replace("'data/cleaning_manifest.json'", f"'{remote_manifest_root_abs}'")
+                code = code.replace('"data/cleaning_manifest.json"', f'"{remote_manifest_root_abs}"')
+
+                # Inject robust prelude
                 working_dir_injection = (
                     "import os\n"
                     f"os.makedirs(r\"{run_root}\", exist_ok=True)\n"
                     f"os.chdir(r\"{run_root}\")\n"
+                    f"MANIFEST_PATH = r\"{remote_manifest_root_abs}\"\n"
+                    f"CLEANED_CSV_PATH = r\"{remote_clean_abs}\"\n"
                 )
                 code = working_dir_injection + code
 
