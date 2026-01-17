@@ -51,3 +51,21 @@ def log_run_event(run_id: str, event_type: str, payload: Dict[str, Any], log_dir
     }
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+def finalize_run_log(
+    run_id: str,
+    metadata: Optional[Dict[str, Any]] = None,
+    log_dir: str = "logs",
+) -> str:
+    """
+    Compat: algunos módulos esperan esta función.
+    Asegura que el log existe y registra un evento de cierre.
+    """
+    path = init_run_log(run_id, metadata=None, log_dir=log_dir)
+
+    if metadata is None:
+        metadata = {}
+
+    # Evento final (no cierra nada “real”, pero deja trazabilidad)
+    log_run_event(run_id, "run_finalize", metadata, log_dir=log_dir)
+    return path

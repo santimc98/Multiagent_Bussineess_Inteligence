@@ -28,6 +28,21 @@ def init_run_dir(run_id: str, base_dir: str = "runs", started_at: Optional[str] 
     run_dir = os.path.abspath(os.path.join(base_dir, run_id))  # CLAVE
     os.makedirs(run_dir, exist_ok=True)
 
+    latest_dir = os.path.abspath(os.path.join(base_dir, "latest"))
+    try:
+        if os.path.isdir(latest_dir):
+            shutil.rmtree(latest_dir)
+        elif os.path.exists(latest_dir):
+            os.remove(latest_dir)
+    except Exception:
+        pass
+    os.makedirs(latest_dir, exist_ok=True)
+    try:
+        with open(os.path.join(latest_dir, "run_id.txt"), "w", encoding="utf-8") as f:
+            f.write(run_id)
+    except Exception:
+        pass
+
     if started_at is None:
         started_at = datetime.utcnow().isoformat()
 
