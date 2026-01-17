@@ -5759,6 +5759,10 @@ def run_steward(state: AgentState) -> AgentState:
     if run_start_epoch is None:
         run_start_epoch = time.time()
     csv_path = state.get("csv_path") if state else ""
+    if csv_path and not os.path.isabs(csv_path):
+        resolved_csv_path = os.path.normpath(os.path.abspath(csv_path))
+        state["csv_path"] = resolved_csv_path
+        csv_path = resolved_csv_path
     dataset_fingerprint = fingerprint_dataset(csv_path)
     memory_entries = load_dataset_memory()
     memory_context = summarize_memory(memory_entries, dataset_fingerprint)
@@ -6256,7 +6260,45 @@ def run_data_engineer(state: AgentState) -> AgentState:
     input_dialect = {"encoding": csv_encoding, "sep": csv_sep, "decimal": csv_decimal}
     leakage_audit_summary = state.get("leakage_audit_summary", "")
     data_engineer_audit_override = state.get("data_engineer_audit_override", state.get("data_summary", ""))
-    header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep)
+    required_cols = []
+    required_raw_map = {}
+    sample_context = ""
+    hints = ""
+    context_payload = {}
+    header_cols = []
+    if csv_path and not os.path.exists(csv_path):
+        candidate = None
+        if not os.path.isabs(csv_path):
+            orig_cwd = state.get("_orig_cwd") or ""
+            if orig_cwd:
+                candidate = os.path.normpath(os.path.abspath(os.path.join(orig_cwd, csv_path)))
+        if candidate and os.path.exists(candidate):
+            csv_path = candidate
+            state["csv_path"] = csv_path
+        if not os.path.exists(csv_path):
+            error_message = f"Input CSV not found: {csv_path}"
+            print(error_message)
+            if run_id:
+                log_run_event(
+                    run_id,
+                    "pipeline_aborted_reason",
+                    {"reason": "input_csv_missing", "csv_path": csv_path},
+                )
+            oc_report = _persist_output_contract_report(state, reason="input_csv_missing")
+            return {
+                "cleaning_code": "",
+                "cleaned_data_preview": "Error: Input CSV Missing",
+                "error_message": error_message,
+                "output_contract_report": oc_report,
+                "pipeline_aborted_reason": "input_csv_missing",
+                "data_engineer_failed": True,
+                "budget_counters": counters,
+            }
+    if csv_path:
+        csv_path = os.path.normpath(csv_path)
+        state["csv_path"] = csv_path
+    required_cols = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
+    header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep) or []
     norm_map: Dict[str, str] = {}
     if header_cols:
         for col in header_cols:
@@ -6270,7 +6312,6 @@ def run_data_engineer(state: AgentState) -> AgentState:
             + json.dumps(norm_map, ensure_ascii=False)
         )
         data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, header_context)
-        required_cols = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
         required_raw_map = _build_required_raw_map(required_cols, norm_map)
         if required_raw_map:
             raw_map_payload = "REQUIRED_RAW_HEADER_MAP:\n" + json.dumps(required_raw_map, ensure_ascii=True)
@@ -6311,22 +6352,23 @@ def run_data_engineer(state: AgentState) -> AgentState:
             log_run_event(run_id, "de_view_context", {"length": de_view_len})
     except Exception:
         pass
+    required_all_columns = _resolve_contract_columns_for_cleaning(state.get("execution_contract", {}))
+    context_payload = {
+        "csv_path": csv_path,
+        "csv_encoding": csv_encoding,
+        "csv_sep": csv_sep,
+        "csv_decimal": csv_decimal,
+        "header_cols": header_cols,
+        "required_input_columns": required_cols,
+        "required_all_columns": required_all_columns,
+        "required_raw_header_map": required_raw_map,
+        "raw_required_sample_context": sample_context,
+        "data_engineer_audit_override": data_engineer_audit_override,
+        "de_view": de_view,
+        "execution_contract_min": de_contract_min,
+    }
     try:
         os.makedirs("artifacts", exist_ok=True)
-        context_payload = {
-            "csv_path": csv_path,
-            "csv_encoding": csv_encoding,
-            "csv_sep": csv_sep,
-            "csv_decimal": csv_decimal,
-            "header_cols": header_cols,
-            "required_input_columns": _resolve_required_input_columns(state.get("execution_contract", {}), selected),
-            "required_all_columns": _resolve_contract_columns_for_cleaning(state.get("execution_contract", {})),
-            "required_raw_header_map": required_raw_map,
-            "raw_required_sample_context": sample_context,
-            "data_engineer_audit_override": data_engineer_audit_override,
-            "de_view": de_view,
-            "execution_contract_min": de_contract_min,
-        }
         with open(os.path.join("artifacts", "data_engineer_context.json"), "w", encoding="utf-8") as f_ctx:
             json.dump(context_payload, f_ctx, indent=2, ensure_ascii=False)
     except Exception as ctx_err:

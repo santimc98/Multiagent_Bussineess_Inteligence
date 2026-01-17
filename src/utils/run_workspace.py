@@ -54,7 +54,21 @@ def enter_run_workspace(state: Dict[str, Any], run_dir: str) -> Dict[str, Any]:
         Updated state with workspace info
     """
     # Save original cwd for restoration
-    state["_orig_cwd"] = os.getcwd()
+    orig_cwd = os.getcwd()
+    state["_orig_cwd"] = orig_cwd
+
+    for key in ("csv_path", "raw_csv_path", "input_csv_path"):
+        value = state.get(key)
+        if not value or not isinstance(value, str):
+            continue
+        if os.path.isabs(value):
+            continue
+        patched = os.path.normpath(os.path.abspath(os.path.join(orig_cwd, value)))
+        if patched != value:
+            print(f"WORKSPACE_PATH_PATCH: {key} '{value}' -> '{patched}'")
+        state[key] = patched
+        if not os.path.exists(patched):
+            print(f"WORKSPACE_PATH_MISSING: {key} '{patched}'")
 
     # Initialize and enter workspace
     work_dir = init_run_workspace(run_dir)
