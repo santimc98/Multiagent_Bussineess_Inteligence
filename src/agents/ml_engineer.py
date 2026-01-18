@@ -803,6 +803,7 @@ class MLEngineerAgent:
              The file WILL exist. If it doesn't, let pd.read_csv() raise FileNotFoundError. NO synthetic fallbacks.
         5) Do NOT invent column names. Use only columns from the contract/canonical list and the loaded dataset.
         6) Do NOT mutate the input dataframe in-place. Use df_in for the raw load. If you need derived columns, create df_work = df_in.copy() and assign ONLY columns explicitly declared as derived in the Execution Contract (data_requirements with source='derived' or spec_extraction.derived_columns). If a required input column is missing, raise ValueError (no dummy values).
+        6b) Do NOT overwrite data/cleaned_data.csv. Treat it as immutable input; write derived datasets to data/model_input.csv or data/features.csv.
         7) NEVER fabricate synthetic rows/features (pd.DataFrame({}) from literals, faker, sklearn.datasets.make_*, etc.).
            - Bootstrap/CV resampling of the OBSERVED rows is allowed (and expected when validation_requirements asks for bootstrap).
            - Randomness is permitted ONLY for resampling indices; do not generate new feature values from distributions.

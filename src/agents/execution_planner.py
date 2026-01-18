@@ -939,24 +939,28 @@ def build_contract_min(
     inventory_norms = {_normalize_column_identifier(col): col for col in inventory}
 
     canonical_columns: List[str] = []
-    for col in (relevant_columns or []):
-        if not col:
-            continue
-        if col in inventory:
-            canonical_columns.append(col)
-            continue
-        norm = _normalize_column_identifier(col)
-        resolved = inventory_norms.get(norm)
-        if resolved:
-            canonical_columns.append(resolved)
-
-    if not canonical_columns:
-        for col in _coerce_list(strategy_dict.get("required_columns")):
+    contract_canonical = contract.get("canonical_columns")
+    if isinstance(contract_canonical, list) and contract_canonical:
+        canonical_columns = [str(col) for col in contract_canonical if col]
+    else:
+        for col in (relevant_columns or []):
+            if not col:
+                continue
+            if col in inventory:
+                canonical_columns.append(col)
+                continue
             norm = _normalize_column_identifier(col)
             resolved = inventory_norms.get(norm)
             if resolved:
                 canonical_columns.append(resolved)
-    canonical_columns = list(dict.fromkeys(canonical_columns))
+
+        if not canonical_columns:
+            for col in _coerce_list(strategy_dict.get("required_columns")):
+                norm = _normalize_column_identifier(col)
+                resolved = inventory_norms.get(norm)
+                if resolved:
+                    canonical_columns.append(resolved)
+        canonical_columns = list(dict.fromkeys(canonical_columns))
 
     def _filter_to_canonical(cols: List[str]) -> List[str]:
         canon_set = set(canonical_columns)
@@ -2316,7 +2320,7 @@ def _build_decisioning_requirements(
                 type_name="integer",
                 inputs=["priority_score"],
                 logic_hint="Rank records by priority_score into integer ranks (1=head, higher=lower priority).",
-                constraints={"non_null_rate_min": 0.95, "range": {"min": 1, "max": 100}},
+                constraints={"non_null_rate_min": 0.95, "range": {"min": 1, "max": None}},
             )
         )
     if is_regression:

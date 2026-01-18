@@ -144,6 +144,7 @@ class DataEngineerAgent:
         - Encoding: '$csv_encoding' | Sep: '$csv_sep' | Decimal: '$csv_decimal'
         - DE Cleaning Objective: "$business_objective"
         - Required Columns (DE View): $required_columns
+        - Optional Passthrough Columns (keep if present): $optional_passthrough_columns
         - DE_VIEW_CONTEXT (json): $de_view_context
         - CONTRACT_MIN_CONTEXT (json): $contract_min_context
         - ROLE RUNBOOK (Data Engineer): $data_engineer_runbook (adhere to goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist)
@@ -161,6 +162,7 @@ class DataEngineerAgent:
         - Derive required columns using clear, deterministic logic.
         - Build a header map for lookup (normalize only for matching), but preserve canonical_name exactly (including spaces/symbols) in the output.
         - Canonical columns must contain cleaned values (do not leave raw strings in canonical columns while writing cleaned_* shadows).
+        - Optional passthrough columns: if present in the input, keep them in the cleaned output without modification; if missing, do NOT fabricate them.
         - Print a CLEANING_VALIDATION section that reports dtype and null_frac for each required column (no advanced metrics).
         - Use DATA AUDIT + steward summary to avoid destructive parsing (null explosions) and misinterpreted number formats.
         - If a derived column has derived_owner='ml_engineer', do NOT create placeholders; leave it absent and document in the manifest.
@@ -177,6 +179,7 @@ class DataEngineerAgent:
             csv_decimal=csv_decimal,
             business_objective=business_objective,
             required_columns=json.dumps(de_view.get("required_columns") or strategy.get("required_columns", [])),
+            optional_passthrough_columns=json.dumps(de_view.get("optional_passthrough_columns") or []),
             data_audit=data_audit,
             contract_min_context=contract_json,
             de_view_context=de_view_json,

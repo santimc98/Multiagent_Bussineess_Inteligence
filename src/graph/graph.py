@@ -9852,6 +9852,13 @@ def _check_decisioning_columns(decisioning: Dict[str, Any], max_rows: int = 500)
     if not os.path.exists(file_path):
         result["missing_file"] = file_path
         return result
+    def _coerce_range_value(value: Any, default: float) -> float:
+        if value is None:
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
     with open(file_path, newline="", encoding="utf-8") as csvfile:
         reader = csv.DictReader(csvfile)
         fieldnames = reader.fieldnames or []
@@ -9871,9 +9878,10 @@ def _check_decisioning_columns(decisioning: Dict[str, Any], max_rows: int = 500)
                 continue
             constraints = entry.get("constraints") or {}
             if isinstance(constraints.get("range"), dict):
+                range_spec = constraints.get("range") or {}
                 numeric_ranges[name] = {
-                    "min": float(constraints["range"].get("min", float("-inf"))),
-                    "max": float(constraints["range"].get("max", float("inf"))),
+                    "min": _coerce_range_value(range_spec.get("min", float("-inf")), float("-inf")),
+                    "max": _coerce_range_value(range_spec.get("max", float("inf")), float("inf")),
                 }
             if entry.get("allowed_values"):
                 allowed_values[name] = set(str(val) for val in entry["allowed_values"])
@@ -9979,7 +9987,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             return {
                 "review_verdict": "NEEDS_IMPROVEMENT",
                 "review_feedback": message,
-                "failed_gates": ["decisioning_requirements_missing"],
+                "failed_gates": ["Decisioning_Requirements_Validation"],
                 "feedback_history": history,
             }
         if not decisioning_required and (missing_columns or constraint_violations):

@@ -27,11 +27,15 @@ COMMON_CLEANED_ALIASES = [
     "data.csv",
     "cleaned.csv",
     "cleaned_data.csv",
+    "train.csv",
+    "test.csv",
     "raw_data.csv",  # Lenient: some LLMs confuse naming
     "input.csv",  # Lenient: some LLMs confuse naming
     "data/raw_data.csv",
     "data/input.csv",
     "data/data.csv",
+    "data/train.csv",
+    "data/test.csv",
 ]
 
 

@@ -35,6 +35,7 @@ def _get_decisioning_requirements(contract_full: Dict[str, Any], contract_min: D
 class DEView(TypedDict, total=False):
     role: str
     required_columns: List[str]
+    optional_passthrough_columns: List[str]
     output_path: str
     output_manifest_path: str
     output_dialect: Dict[str, Any]
@@ -247,6 +248,18 @@ def _resolve_required_columns(contract_min: Dict[str, Any], contract_full: Dict[
     if canonical:
         return [str(c) for c in canonical if c]
     return []
+
+
+def _resolve_passthrough_columns(
+    contract_min: Dict[str, Any], contract_full: Dict[str, Any], required_columns: List[str]
+) -> List[str]:
+    allowed_sets = _resolve_allowed_feature_sets(contract_min, contract_full)
+    audit_only = allowed_sets.get("audit_only_features")
+    if not isinstance(audit_only, list) or not audit_only:
+        return []
+    required_set = {str(c) for c in required_columns if c}
+    passthrough = [str(c) for c in audit_only if c]
+    return [c for c in passthrough if c not in required_set]
 
 
 def _resolve_output_path(
@@ -645,11 +658,13 @@ def build_de_view(
     contract_min = contract_min if isinstance(contract_min, dict) else {}
     required_outputs = _resolve_required_outputs(contract_min, contract_full)
     required_columns = _resolve_required_columns(contract_min, contract_full)
+    passthrough_columns = _resolve_passthrough_columns(contract_min, contract_full, required_columns)
     output_path = _resolve_output_path(contract_min, contract_full, required_outputs)
     manifest_path = _resolve_manifest_path(contract_min, contract_full, required_outputs)
     view: DEView = {
         "role": "data_engineer",
         "required_columns": required_columns,
+        "optional_passthrough_columns": passthrough_columns,
         "output_path": output_path or "data/cleaned_data.csv",
         "constraints": {
             "scope": "cleaning_only",
