@@ -520,6 +520,7 @@ class BusinessTranslatorAgent:
             "plot_reference_mode": plot_reference_mode,
         }
         visuals_context_json = json.dumps(visuals_context_data, ensure_ascii=False)
+        contract = _safe_load_json("data/execution_contract.json") or {}
         decisioning_context = translator_view.get("decisioning_requirements") or contract.get("decisioning_requirements") or {}
         if not isinstance(decisioning_context, dict):
             decisioning_context = {}
@@ -532,7 +533,6 @@ class BusinessTranslatorAgent:
         decisioning_columns_text = ", ".join(decisioning_columns) if decisioning_columns else "None requested."
         
         # Load optional artifacts for context
-        contract = _safe_load_json("data/execution_contract.json") or {}
         integrity_audit = _safe_load_json("data/integrity_audit_report.json") or {}
         output_contract_report = _safe_load_json("data/output_contract_report.json") or {}
         case_alignment_report = _safe_load_json("data/case_alignment_report.json") or {}
