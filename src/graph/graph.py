@@ -1719,17 +1719,32 @@ def _ensure_plot_spec_in_policy(policy: Dict[str, Any], contract: Dict[str, Any]
     if not isinstance(policy, dict):
         policy = {}
     plot_spec = policy.get("plot_spec")
-    needs_plot_spec = True
     if isinstance(plot_spec, dict):
         enabled = plot_spec.get("enabled", True)
         plots = plot_spec.get("plots")
+        if isinstance(plots, list) and plots:
+            return policy
         if enabled is False:
-            needs_plot_spec = False
-        elif isinstance(plots, list) and plots:
-            needs_plot_spec = False
-    if needs_plot_spec:
-        policy = dict(policy)
-        policy["plot_spec"] = build_plot_spec(contract)
+            return policy
+
+    visual_reqs = (
+        contract.get("artifact_requirements", {}).get("visual_requirements")
+        if isinstance(contract.get("artifact_requirements"), dict)
+        else {}
+    )
+    if isinstance(visual_reqs, dict):
+        vis_visible = visual_reqs.get("plot_spec") if isinstance(visual_reqs.get("plot_spec"), dict) else None
+        if vis_visible:
+            policy = dict(policy)
+            policy["plot_spec"] = vis_visible
+            return policy
+        if visual_reqs.get("enabled") is False:
+            policy = dict(policy)
+            policy["plot_spec"] = {"enabled": False}
+            return policy
+
+    policy = dict(policy)
+    policy["plot_spec"] = build_plot_spec(contract)
     return policy
 
 
@@ -8988,6 +9003,11 @@ def execute_code(state: AgentState) -> AgentState:
 
     # Dependency allowlist precheck
     contract = state.get("execution_contract", {}) or {}
+    artifact_reqs = contract.get("artifact_requirements") if isinstance(contract.get("artifact_requirements"), dict) else {}
+    visual_reqs = artifact_reqs.get("visual_requirements") if isinstance(artifact_reqs.get("visual_requirements"), dict) else {}
+    visual_outputs_dir = str(visual_reqs.get("outputs_dir") or "static/plots")
+    visual_items = visual_reqs.get("items") if isinstance(visual_reqs.get("items"), list) else []
+    visual_required = bool(visual_reqs.get("required")) and bool(visual_items)
     required_deps = contract.get("required_dependencies", []) or []
     dep_result = check_dependency_precheck(code, required_deps)
     if dep_result.get("banned"):
@@ -9204,13 +9224,22 @@ def execute_code(state: AgentState) -> AgentState:
                     output += f"\n\nEXECUTION ERROR:\n{execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
 
                 downloaded_paths = []
+                visuals_missing = False
+                visual_downloaded = []
 
                 # Robust Artifact Download (P0 Fix) using centralized helper
                 # Use shell command that always succeeds even if no files found
-                ls_proc = run_cmd_with_retry(sandbox, f"sh -lc 'ls -1 {run_root}/static/plots/*.png 2>/dev/null || true'", retries=2)
+                remote_viz_dir = visual_outputs_dir.replace("\\", "/").strip("/")
+                if not remote_viz_dir:
+                    remote_viz_dir = "static/plots"
+                ls_proc = run_cmd_with_retry(
+                    sandbox,
+                    f"sh -lc 'ls -1 {run_root}/{remote_viz_dir}/*.png 2>/dev/null || true'",
+                    retries=2,
+                )
 
                 if ls_proc.exit_code == 0:
-                    os.makedirs("static/plots", exist_ok=True)
+                    os.makedirs(visual_outputs_dir, exist_ok=True)
                     # Filter empty strings from split
                     plot_files = [p for p in ls_proc.stdout.strip().split('\n') if p]
 
@@ -9223,15 +9252,39 @@ def execute_code(state: AgentState) -> AgentState:
                                 content = safe_download_bytes(sandbox, remote_plot)
                                 if content and len(content) > 0:
                                     local_name = os.path.basename(remote_plot)
-                                    local_path = os.path.join("static/plots", local_name)
+                                    local_path = os.path.join(visual_outputs_dir, local_name)
                                     with open(local_path, "wb") as f_local:
                                         f_local.write(content)
                                     downloaded_paths.append(local_path)
+                                    visual_downloaded.append(local_name)
                                     print(f"Downloaded plot: {local_name}")
                                 else:
                                     print(f"Warning: Failed to download {remote_plot}")
                 else:
                     print(f"Warning: Plot listing failed (Exit Code {ls_proc.exit_code})")
+                if run_id:
+                    log_run_event(
+                        run_id,
+                        "plots_downloaded",
+                        {
+                            "count": len(visual_downloaded),
+                            "filenames": visual_downloaded,
+                        },
+                    )
+                visuals_missing = visual_required and not bool(visual_downloaded)
+                if visuals_missing:
+                    history = list(state.get("feedback_history", []))
+                    history.append("VISUALS_MISSING: Required plot outputs were not produced.")
+                    state["feedback_history"] = history
+                    if run_id:
+                        log_run_event(
+                            run_id,
+                            "visual_requirements_missing",
+                            {
+                                "expected_items": len(visual_items),
+                                "downloaded": len(visual_downloaded),
+                            },
+                        )
 
                 # Download required outputs per contract (beyond plots) using centralized helper
                 req_outputs = required_outputs or state.get("execution_contract", {}).get("required_outputs", []) or []
@@ -9543,6 +9596,7 @@ def execute_code(state: AgentState) -> AgentState:
         "artifact_paths": artifact_paths,
         "artifact_content_issues": content_issues,
         "artifact_content_diagnostics": content_diagnostics,
+        "visuals_missing": visuals_missing,
         "last_attempt_score": attempt_score,
         "last_attempt_valid": attempt_valid,
         "sandbox_failed": sandbox_failed,
@@ -9617,6 +9671,24 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     run_id = state.get("run_id")
     if run_id:
         log_run_event(run_id, "result_evaluator_start", {})
+    contract = state.get("execution_contract", {}) or {}
+    artifact_reqs = contract.get("artifact_requirements") if isinstance(contract.get("artifact_requirements"), dict) else {}
+    visual_reqs = artifact_reqs.get("visual_requirements") if isinstance(artifact_reqs.get("visual_requirements"), dict) else {}
+    visuals_missing = bool(state.get("visuals_missing"))
+    if visual_reqs.get("required") and visuals_missing:
+        feedback_history = state.get("feedback_history", []) or []
+        message = (
+            "Reviewer: Required visual artifacts are missing from the run. "
+            "Please regenerate the plots defined in visual_requirements."
+        )
+        if run_id:
+            log_run_event(run_id, "visual_requirements_review", {"missing": len(visual_reqs.get("items", []))})
+        return {
+            "review_verdict": "NEEDS_IMPROVEMENT",
+            "review_feedback": message,
+            "failed_gates": ["visual_requirements_missing"],
+            "feedback_history": feedback_history,
+        }
 
     execution_output = state.get('execution_output', '')
     if "Traceback" in execution_output or "EXECUTION ERROR" in execution_output:

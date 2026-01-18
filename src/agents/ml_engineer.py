@@ -224,6 +224,7 @@ class MLEngineerAgent:
         ml_view = ml_view or {}
         ml_view_json = json.dumps(ml_view, indent=2)
         plot_spec_json = json.dumps(ml_view.get("plot_spec", {}), indent=2)
+        visual_requirements_json = json.dumps(ml_view.get("visual_requirements", {}), indent=2)
         
         # STRUCTURED CRITICAL ERRORS SECTION
         critical_errors: List[str] = []
@@ -835,6 +836,7 @@ class MLEngineerAgent:
         - Strategy: $strategy_title ($analysis_type)
         - ML_VIEW_CONTEXT (json): $ml_view_context
         - PLOT_SPEC_CONTEXT (json): $plot_spec_context
+        - VISUAL_REQUIREMENTS_CONTEXT (json): $visual_requirements_context
         - CONTRACT_MIN_CONTEXT (json): $contract_min_context
         - Execution Contract (json): $execution_contract_json
         - Deliverables: $deliverables_json
@@ -948,17 +950,18 @@ class MLEngineerAgent:
         - If price sensitivity curves or optimal pricing guide are required, they must NOT be empty.
           If segment-level estimation is too sparse, fallback to global curves or coarser segments; never emit empty artifacts.
 
-        PLOT_SPEC EXECUTION (STRICT, EVIDENCE-BASED)
-        - If PLOT_SPEC_CONTEXT.enabled == true, you MUST generate plots exactly from plot_spec.plots.
-        - For each plot:
-          * Load from preferred_sources in order (use scored_rows first for model outputs if available).
-          * Verify required_columns_any_of / required_columns_all_of; if not satisfied, skip with a clear skip_reason.
-          * Save to /home/user/run/static/plots/{plot_id}.png (sanitize plot_id for filenames).
-        - Use matplotlib only (no seaborn) and set matplotlib.use('Agg') before importing pyplot.
-        - Write data/plot_insights.json as a list of dicts with:
-          plot_id, file, title, goal, status, skip_reason, evidence {sources_used, columns_used, n_rows},
-          key_findings (quantified), caption.
-        - No synthetic data. Do not use np.random for visuals.
+        VISUAL REQUIREMENTS EXECUTION (CONTRACT-DRIVEN)
+        - Use VISUAL_REQUIREMENTS_CONTEXT to manage plotting. Do NOT invent additional plots outside the items list.
+        - If visual_requirements.enabled == false:
+          * Do NOT generate PNGs; you may omit creating files under static/plots except for a stub directory.
+          * Write data/visuals_status.json with {"plots_disabled": true, "reason": "Not requested"}.
+        - If visual_requirements.enabled == true:
+          * Generate each item listed in visual_requirements.items and save to <visual_requirements.outputs_dir>/<expected_filename>.
+          * Respect constraints: sample rows according to sampling_strategy and limit to max_rows_for_plot before computing visuals.
+          * If an item is required (visual_requirements.required is true) and you cannot produce it, log failure in data/alignment_check.json and append a warning to feedback_history.
+          * Record a JSON object per item in data/visuals_status.json with fields: plot_id, file, status (ok|skipped|missing), skip_reason, sources_used, columns_used, rows_used.
+        - Use matplotlib with Agg backend and keep seaborn imports out of saved plots (import only when necessary).
+        - Avoid synthetic data (np.random) when generating plots; sampling should reuse observed rows only.
 
         REQUIRED ARTIFACT RULES (minimal, contract-driven)
         - Always:
@@ -1054,6 +1057,7 @@ class MLEngineerAgent:
             contract_min_context=json.dumps(execution_contract_compact, indent=2),
             ml_view_context=ml_view_json,
             plot_spec_context=plot_spec_json,
+            visual_requirements_context=visual_requirements_json,
             evaluation_spec_json=evaluation_spec_json,
             spec_extraction_json=spec_extraction_json,
             ml_engineer_runbook=ml_runbook_json,

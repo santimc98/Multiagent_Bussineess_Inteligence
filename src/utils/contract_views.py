@@ -839,6 +839,17 @@ def build_ml_view(
         "strict_allowed_by_contract": strict_allowed_by_contract,
         "candidate_allowed_by_contract": candidate_allowed_by_contract,
     }
+    artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
+        contract_full.get("artifact_requirements")
+    )
+    visual_reqs = artifact_reqs.get("visual_requirements") if isinstance(artifact_reqs.get("visual_requirements"), dict) else {}
+    view["visual_requirements"] = {
+        "enabled": bool(visual_reqs.get("enabled")),
+        "required": bool(visual_reqs.get("required")),
+        "outputs_dir": visual_reqs.get("outputs_dir") or "static/plots",
+        "items": visual_reqs.get("items") if isinstance(visual_reqs.get("items"), list) else [],
+        "notes": visual_reqs.get("notes") or "",
+    }
     if view_warnings:
         view["view_warnings"] = view_warnings
     if case_rules is not None:
@@ -963,6 +974,17 @@ def build_translator_view(
     plot_spec = _cap_plot_spec(policy.get("plot_spec") if isinstance(policy, dict) else None)
     if plot_spec is not None:
         view["plot_spec"] = plot_spec
+    artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
+        contract_full.get("artifact_requirements")
+    )
+    visual_reqs = artifact_reqs.get("visual_requirements") if isinstance(artifact_reqs.get("visual_requirements"), dict) else {}
+    view["visual_requirements"] = {
+        "enabled": bool(visual_reqs.get("enabled")),
+        "required": bool(visual_reqs.get("required")),
+        "outputs_dir": visual_reqs.get("outputs_dir") or "static/plots",
+        "items": visual_reqs.get("items") if isinstance(visual_reqs.get("items"), list) else [],
+        "notes": visual_reqs.get("notes") or "",
+    }
     return trim_to_budget(view, 16000)
 
 

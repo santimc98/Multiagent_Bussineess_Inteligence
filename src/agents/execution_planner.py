@@ -43,6 +43,69 @@ _RESAMPLING_TOKENS = {
     "fold",
 }
 
+_VISUAL_ENABLED_TOKENS = {
+    "segment",
+    "segmentation",
+    "outlier",
+    "outliers",
+    "elasticidad",
+    "elasticity",
+    "incertidumbre",
+    "uncertainty",
+    "fairness",
+    "bias",
+    "explicabilidad",
+    "explain",
+    "calibration",
+    "calibración",
+    "geography",
+    "geographical",
+    "geo",
+    "series",
+    "temporal",
+    "timeseries",
+    "error",
+    "analysis",
+    "explainability",
+}
+
+_VISUAL_REQUIRED_PHRASES = {
+    "tablas y gráficos",
+    "tablas y graficos",
+    "tablas graficos",
+    "visual comparison",
+    "comparación visual",
+    "comparacion visual",
+    "comparativa visual",
+    "segmentación por zonas",
+    "segmentacion por zonas",
+    "segmentación por horas",
+    "segmentacion por horas",
+    "detección de outliers",
+    "deteccion de outliers",
+    "explicar drivers",
+    "explain drivers",
+}
+
+
+def _normalize_text(*values: Any) -> str:
+    tokens: List[str] = []
+    for raw in values:
+        if raw is None:
+            continue
+        if isinstance(raw, str):
+            text = raw
+        else:
+            text = json.dumps(raw, ensure_ascii=False)
+        cleaned = re.sub(r"[^0-9a-zA-ZÁÉÍÓÚáéíóúüÜñÑ]+", " ", text.lower())
+        tokens.extend(cleaned.split())
+    return " ".join(token for token in tokens if token)
+
+
+def _matches_any_phrase(text: str, phrases: set[str]) -> bool:
+    normalized = text.lower()
+    return any(phrase in normalized for phrase in phrases)
+
 
 def _normalize_qa_gate_spec(item: Any) -> Dict[str, Any] | None:
     if isinstance(item, dict):
@@ -1730,6 +1793,137 @@ def build_plot_spec(contract_full: Dict[str, Any] | None) -> Dict[str, Any]:
     }
 
 
+def _contains_visual_token(text: str, tokens: set[str]) -> bool:
+    if not text:
+        return False
+    words = set(text.split())
+    return any(tok in words for tok in tokens)
+
+
+def _map_plot_type(plot_type: str | None) -> str:
+    if not plot_type:
+        return "other"
+    normalized = str(plot_type).lower()
+    mapping = {
+        "histogram": "distribution",
+        "bar": "comparison",
+        "line": "timeseries",
+        "timeseries": "timeseries",
+        "scatter": "comparison",
+        "heatmap": "comparison",
+        "box": "distribution",
+        "pie": "comparison",
+        "area": "timeseries",
+    }
+    return mapping.get(normalized, "other")
+
+
+def _extract_columns_from_inputs(plot: Dict[str, Any]) -> List[str]:
+    inputs = plot.get("inputs") if isinstance(plot.get("inputs"), dict) else {}
+    columns: List[str] = []
+    for key in ("required_columns_any_of", "required_columns_all_of", "optional_columns"):
+        value = inputs.get(key)
+        if isinstance(value, list):
+            for entry in value:
+                if isinstance(entry, list):
+                    columns.extend([str(item) for item in entry if item])
+                elif entry:
+                    columns.append(str(entry))
+    return columns
+
+
+def _build_visual_requirements(
+    contract: Dict[str, Any],
+    strategy: Dict[str, Any],
+    business_objective: str,
+) -> Dict[str, Any]:
+    vision_text = _normalize_text(
+        strategy.get("analysis_type"),
+        strategy.get("techniques"),
+        strategy.get("notes"),
+        strategy.get("description"),
+        strategy.get("objective_type"),
+        business_objective,
+        contract.get("business_objective"),
+        contract.get("strategy_title"),
+    )
+    enabled = _contains_visual_token(vision_text, _VISUAL_ENABLED_TOKENS)
+    required = _matches_any_phrase(vision_text, _VISUAL_REQUIRED_PHRASES)
+
+    dataset_profile = (
+        contract.get("dataset_profile") if isinstance(contract.get("dataset_profile"), dict) else {}
+    )
+    row_count = 0
+    if dataset_profile:
+        for key in ("row_count", "rows", "estimated_rows"):
+            val = dataset_profile.get(key)
+            if isinstance(val, (int, float)) and val > 0:
+                row_count = int(val)
+                break
+    sampling_strategy = "random" if row_count > 50000 else "none"
+    max_rows_for_plot = 5000
+    if row_count and row_count < max_rows_for_plot:
+        max_rows_for_plot = max(row_count, 1000)
+
+    outputs_dir = "static/plots"
+    artifact_reqs = contract.get("artifact_requirements")
+    if isinstance(artifact_reqs, dict):
+        outputs_dir = artifact_reqs.get("visual_outputs_dir") or artifact_reqs.get("outputs_dir") or outputs_dir
+
+    plot_spec = build_plot_spec(contract) if enabled else {"enabled": False, "plots": [], "max_plots": 0}
+    plots = plot_spec.get("plots") if isinstance(plot_spec.get("plots"), list) else []
+    column_roles = get_column_roles(contract)
+    outcome_cols = [str(c) for c in (column_roles.get("outcome") or []) if c]
+    items: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for idx, plot in enumerate(plots):
+        if not isinstance(plot, dict):
+            continue
+        plot_id = str(plot.get("plot_id") or plot.get("id") or f"visual_{idx}")
+        safe_id = re.sub(r"[^0-9a-zA-Z]+", "_", plot_id).strip("_").lower() or f"visual_{idx}"
+        if safe_id in seen_ids:
+            safe_id = f"{safe_id}_{idx}"
+        seen_ids.add(safe_id)
+        goal = str(plot.get("goal") or plot.get("title") or "Visual insight")
+        inputs = plot.get("inputs") if isinstance(plot.get("inputs"), dict) else {}
+        preferred_sources = [str(src) for src in (inputs.get("preferred_sources") or []) if src]
+        columns_from_plot = _extract_columns_from_inputs(plot)
+        requires_target = any(col in outcome_cols for col in columns_from_plot)
+        requires_predictions = any("scored_rows.csv" in src for src in preferred_sources)
+        requires_segments = "segment" in safe_id or "segment" in goal.lower()
+        items.append(
+            {
+                "id": safe_id,
+                "purpose": goal,
+                "type": _map_plot_type(plot.get("type") or plot.get("plot_type")),
+                "inputs": {
+                    "requires_target": requires_target,
+                    "requires_predictions": requires_predictions,
+                    "requires_segments": requires_segments,
+                    "columns_hint": columns_from_plot[:6],
+                },
+                "constraints": {
+                    "max_rows_for_plot": max_rows_for_plot,
+                    "sampling_strategy": sampling_strategy,
+                },
+                "expected_filename": f"{safe_id}.png",
+            }
+        )
+    notes = (
+        "Visual requirements are contract-driven. If items are listed, produce each exactly and store status in data/visuals_status.json."
+        if items
+        else "Visual requirements are disabled for this strategy."
+    )
+    return {
+        "enabled": enabled,
+        "required": required,
+        "outputs_dir": outputs_dir,
+        "items": items,
+        "notes": notes,
+        "plot_spec": plot_spec,
+    }
+
+
 class ExecutionPlannerAgent:
     """
     LLM-driven planner that emits an execution contract (JSON) to guide downstream agents.
@@ -2885,25 +3079,23 @@ class ExecutionPlannerAgent:
             
             contract["required_outputs"] = [_normalize_path(p) for p in req_outputs]
 
-            # CRITICAL FIX: Sync visualization_requirements with required_outputs
-            # If visualization_requirements defines plots, add them to required_outputs
-            # so ML Engineer knows to generate them (not just skip gracefully)
-            viz_reqs = contract.get("visualization_requirements", {})
-            if isinstance(viz_reqs, dict):
-                required_plots = viz_reqs.get("required_plots", [])
-                if required_plots:
-                    for plot in required_plots:
-                        if not isinstance(plot, dict):
+            artifact_reqs = contract.get("artifact_requirements", {})
+            if isinstance(artifact_reqs, dict):
+                visual_reqs = artifact_reqs.get("visual_requirements")
+                if isinstance(visual_reqs, dict):
+                    outputs_dir = visual_reqs.get("outputs_dir") or "static/plots"
+                    items = visual_reqs.get("items") if isinstance(visual_reqs.get("items"), list) else []
+                    for item in items:
+                        if not isinstance(item, dict):
                             continue
-                        plot_name = plot.get("name", "")
-                        if not plot_name:
+                        expected = item.get("expected_filename")
+                        if not expected:
                             continue
-                        # Convert "Price-Response Curves" -> "price_response_curves.png"
-                        safe_name = plot_name.lower().replace(" ", "_").replace("-", "_")
-                        safe_name = "".join(c for c in safe_name if c.isalnum() or c == "_")
-                        plot_path = f"static/plots/{safe_name}.png"
-
-                        # Add to required_outputs if not already present
+                        plot_path = (
+                            expected
+                            if os.path.isabs(expected)
+                            else os.path.normpath(os.path.join(outputs_dir, expected))
+                        )
                         if plot_path not in contract["required_outputs"]:
                             contract["required_outputs"].append(plot_path)
 
@@ -4438,6 +4630,16 @@ domain_expert_critique:
         if validation_result.get("normalized_artifact_requirements"):
             contract["artifact_requirements"] = validation_result["normalized_artifact_requirements"]
 
+        artifact_reqs = contract.get("artifact_requirements")
+        if not isinstance(artifact_reqs, dict):
+            artifact_reqs = {}
+        artifact_reqs["visual_requirements"] = _build_visual_requirements(
+            contract,
+            strategy,
+            business_objective or "",
+        )
+        contract["artifact_requirements"] = artifact_reqs
+
         contract = _attach_reporting_policy(contract)
 
         def _sanitize_runbook_text(text: str) -> str:
@@ -4553,4 +4755,3 @@ domain_expert_critique:
             spec["confidence"] = 0.6  # Lower confidence if fields missing
         
         return spec
-
