@@ -5,6 +5,28 @@ import re
 from pathlib import Path
 from typing import Optional
 
+def resolve_image_path(img_path: str, base_dir_abs: Optional[str]) -> Optional[str]:
+    if not img_path:
+        return None
+
+    if os.path.isabs(img_path) and os.path.exists(img_path):
+        return img_path
+
+    candidates = []
+    if base_dir_abs:
+        candidates.append(os.path.join(base_dir_abs, img_path))
+        basename = os.path.basename(img_path)
+        candidates.append(os.path.join(base_dir_abs, "artifacts", "plots", basename))
+        candidates.append(os.path.join(base_dir_abs, "work", "artifacts", "plots", basename))
+        candidates.append(os.path.join(base_dir_abs, "sandbox", "downloaded_artifacts", "plots", basename))
+    else:
+        candidates.append(os.path.abspath(img_path))
+
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
 def convert_report_to_pdf(
     markdown_content: str,
     output_filename: str = "final_report.pdf",
@@ -23,20 +45,27 @@ def convert_report_to_pdf(
         # Remove images from markdown text so we can control their placement manually
         markdown_text_clean = re.sub(r'!\[(.*?)\]\((.*?)\)', '', markdown_content)
         
-        # FALLBACK: If no images in markdown, scan static/plots
+        # FALLBACK: If no images in markdown, scan known plot folders
         if not images:
             if base_dir_abs:
-                plots_dir = os.path.join(base_dir_abs, "static", "plots")
+                candidate_dirs = [
+                    os.path.join(base_dir_abs, "static", "plots"),
+                    os.path.join(base_dir_abs, "artifacts", "plots"),
+                    os.path.join(base_dir_abs, "work", "artifacts", "plots"),
+                ]
             else:
-                plots_dir = os.path.abspath("static/plots")
-            if os.path.exists(plots_dir):
-                supported_ext = ('.png', '.jpg', '.jpeg')
-                # Sort for consistency
+                candidate_dirs = [
+                    os.path.abspath(os.path.join("static", "plots")),
+                    os.path.abspath(os.path.join("artifacts", "plots")),
+                    os.path.abspath(os.path.join("work", "artifacts", "plots")),
+                ]
+            supported_ext = ('.png', '.jpg', '.jpeg')
+            for plots_dir in candidate_dirs:
+                if not os.path.exists(plots_dir):
+                    continue
                 plot_files = sorted([f for f in os.listdir(plots_dir) if f.lower().endswith(supported_ext)])
-                
                 for f in plot_files:
                     full_path = os.path.join(plots_dir, f)
-                    # Use filename as alt text
                     images.append((f, full_path))
         
         # 2. Convert Cleaned Markdown to HTML
@@ -46,41 +75,33 @@ def convert_report_to_pdf(
         image_grid_html = ""
         image_grid_html += "<h3>Visual Analysis</h3>"
         
-        if images:
+        resolved_images = []
+        for alt_text, img_path in images:
+            abs_path = resolve_image_path(img_path, base_dir_abs)
+            if abs_path:
+                resolved_images.append((alt_text, abs_path))
+
+        if resolved_images:
             image_grid_html += '<table style="width: 100%; border: none;">'
             
-            for i, (alt_text, img_path) in enumerate(images):
+            for i, (alt_text, abs_path) in enumerate(resolved_images):
                 # Start row for even indices (0, 2, 4...)
                 if i % 2 == 0:
                     image_grid_html += '<tr>'
-                
-                # Resolve absolute path and URI
-                if not os.path.isabs(img_path):
-                    if base_dir_abs:
-                        abs_path = os.path.abspath(os.path.join(base_dir_abs, img_path))
-                    else:
-                        abs_path = os.path.abspath(img_path)
-                else:
-                    abs_path = img_path
-                
+
                 # Create Cell
-                if os.path.exists(abs_path):
-                    # Robust Windows Path (xhtml2pdf prefers forward slashes)
-                    img_src = Path(abs_path).resolve().as_posix()
-                    
-                    image_grid_html += f'''
-                        <td style="width: 50%; padding: 5px; vertical-align: top; border: none;">
-                            <div style="text-align: center;">
-                                <img src="{img_src}" style="width: 500px; height: auto;" />
-                                <p style="font-size: 8pt; color: #666;">{alt_text}</p>
-                            </div>
-                        </td>
-                    '''
-                else:
-                    image_grid_html += f'<td style="border: none; color: red;">[Image Not Found: {img_path}]</td>'
+                img_src = Path(abs_path).resolve().as_posix()
+                image_grid_html += f'''
+                    <td style="width: 50%; padding: 5px; vertical-align: top; border: none;">
+                        <div style="text-align: center;">
+                            <img src="{img_src}" style="width: 500px; height: auto;" />
+                            <p style="font-size: 8pt; color: #666;">{alt_text}</p>
+                        </div>
+                    </td>
+                '''
                 
                 # End row for odd indices (1, 3, 5...) OR if it's the last image
-                if i % 2 == 1 or i == len(images) - 1:
+                if i % 2 == 1 or i == len(resolved_images) - 1:
                     image_grid_html += '</tr>'
             
             image_grid_html += '</table>'

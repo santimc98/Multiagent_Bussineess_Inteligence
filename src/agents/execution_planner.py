@@ -638,14 +638,14 @@ def _create_v41_skeleton(
     strategy_title = strategy.get("title", "Unknown") if isinstance(strategy, dict) else "Unknown"
     required_cols = strategy.get("required_columns", []) if isinstance(strategy, dict) else []
     available_cols = column_inventory or []
-    
-    # Minimal safe canonical_columns from strategy.required_columns filtered by inventory
-    canonical_cols = []
+
+    # Canonical columns should represent full available_columns (no truncation).
+    canonical_cols = [str(c) for c in available_cols if c]
     missing_cols = []
     fuzzy_matches = {}
-    
+
     inventory_map = {re.sub(r"[^0-9a-zA-Z]+", "", str(c).lower()): c for c in available_cols}
-    
+
     def _find_in_inventory(name: str) -> str | None:
         return inventory_map.get(re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower()))
 
@@ -653,7 +653,8 @@ def _create_v41_skeleton(
         for req in required_cols:
             found = _find_in_inventory(req)
             if found:
-                canonical_cols.append(found)
+                if found not in canonical_cols:
+                    canonical_cols.append(found)
             else:
                 missing_cols.append(str(req))
                 # Use difflib to find close matches
@@ -661,15 +662,18 @@ def _create_v41_skeleton(
                     str(req).lower(),
                     [str(c).lower() for c in available_cols],
                     n=3,
-                    cutoff=0.6
+                    cutoff=0.6,
                 )
                 if close_matches:
                     matched_originals = [
-                        c for c in available_cols 
+                        c for c in available_cols
                         if str(c).lower() in close_matches
                     ]
                     fuzzy_matches[str(req)] = matched_originals[:3]
-    
+
+    if not canonical_cols and required_cols:
+        canonical_cols = [str(col) for col in required_cols if col]
+
     # Smart Fallback: Infer roles from strategy if present
     target_col = strategy.get("target_column") if isinstance(strategy, dict) else None
     col_roles_outcome = []
@@ -724,9 +728,14 @@ def _create_v41_skeleton(
         if re.search(r"(?i)\b(id|uuid|key)\b", col):
             identifiers.append(col)
 
-    n_rows = 0 
-    
+    n_rows = 0
+
     problem_type = strategy.get("problem_type", "unknown") if isinstance(strategy, dict) else "unknown"
+    feature_selectors = []
+    if len(available_cols) > 200:
+        feature_selectors, _remaining = infer_feature_selectors(
+            available_cols, max_list_size=200, min_group_size=50
+        )
 
     return {
         "contract_version": 2,
@@ -836,8 +845,12 @@ def _create_v41_skeleton(
         "ml_engineer_runbook": DEFAULT_ML_ENGINEER_RUNBOOK,
         
         "available_columns": available_cols,
-        "canonical_columns": canonical_cols,
-        "derived_columns": derived_cols_list,
+          "canonical_columns": canonical_cols,
+          "derived_columns": derived_cols_list,
+          "feature_selectors": feature_selectors,
+          "canonical_columns_compact": compact_column_representation(available_cols, max_display=40)
+          if feature_selectors
+          else {},
         "required_outputs": ["data/cleaned_data.csv", "data/metrics.json", "data/alignment_check.json"],
         
         "iteration_policy": {
@@ -5100,7 +5113,7 @@ domain_expert_critique:
             "Return ONLY valid JSON with EXACT keys: "
             + json.dumps(repair_keys)
             + ". Do not include any other keys or commentary.\n"
-            + "Use ONLY RELEVANT_COLUMNS for canonical_columns and column_roles.\n"
+            + "Use RELEVANT_COLUMNS as focus_columns only; do NOT truncate canonical_columns.\n"
             + "RELEVANT_COLUMNS: "
             + json.dumps(relevant_columns)
             + "\n"
@@ -5200,22 +5213,21 @@ domain_expert_critique:
         if column_inventory and not contract.get("available_columns"):
             contract["available_columns"] = column_inventory
 
+        available_columns = contract.get("available_columns")
+        if isinstance(available_columns, list) and available_columns:
+            contract["canonical_columns"] = [str(c) for c in available_columns if c]
+            if len(available_columns) > 200:
+                feature_selectors, _remaining = infer_feature_selectors(
+                    available_columns, max_list_size=200, min_group_size=50
+                )
+                if feature_selectors:
+                    contract["feature_selectors"] = feature_selectors
+                    contract["canonical_columns_compact"] = compact_column_representation(
+                        available_columns, max_display=40
+                    )
+
         if relevant_columns:
-            relevant_set = set(relevant_columns)
-            canonical_cols = contract.get("canonical_columns")
-            if isinstance(canonical_cols, list) and canonical_cols:
-                contract["canonical_columns"] = [c for c in canonical_cols if c in relevant_set]
-            else:
-                contract["canonical_columns"] = list(relevant_columns)
-            column_roles = contract.get("column_roles")
-            if isinstance(column_roles, dict):
-                filtered_roles = {}
-                for role, cols in column_roles.items():
-                    if isinstance(cols, list):
-                        filtered_roles[role] = [c for c in cols if c in relevant_set]
-                    else:
-                        filtered_roles[role] = cols
-                contract["column_roles"] = filtered_roles
+            contract["focus_columns"] = list(relevant_columns)
             contract["omitted_columns_policy"] = omitted_columns_policy
 
         contract = _prune_identifier_model_features(contract)

@@ -172,10 +172,27 @@ def _run_code_via_commands_run(
 
     sandbox.files.write(script_path, code)
 
+    return run_python_file_with_optional_timeout(
+        sandbox,
+        script_path,
+        timeout_s=timeout_s,
+        workdir=run_dir if workdir else None,
+    )
+
+
+def run_python_file_with_optional_timeout(
+    sandbox: Any,
+    path: str,
+    timeout_s: Optional[int] = None,
+    workdir: Optional[str] = None,
+) -> Any:
+    if not path:
+        return _ExecutionResult("", "Missing script path", 1)
+
     if workdir:
-        cmd = f"sh -c 'cd {shlex.quote(run_dir)} && python {shlex.quote(script_path)}'"
+        cmd = f"sh -c 'cd {shlex.quote(workdir)} && python {shlex.quote(path)}'"
     else:
-        cmd = f"python {shlex.quote(script_path)}"
+        cmd = f"python {shlex.quote(path)}"
 
     supports_timeout = False
     try:
@@ -212,9 +229,12 @@ def run_code_with_optional_timeout(sandbox: Any, code: str, timeout_s: Optional[
     run_code = getattr(sandbox, "run_code", None)
     if callable(run_code):
         sig = inspect.signature(run_code)
-        if "timeout" in sig.parameters and timeout_s is not None:
-            return run_code(code, timeout=timeout_s)
-        return run_code(code)
+        if "timeout" in sig.parameters:
+            if timeout_s is not None:
+                return run_code(code, timeout=timeout_s)
+            return run_code(code)
+        if timeout_s is None:
+            return run_code(code)
 
     return _run_code_via_commands_run(sandbox, code, timeout_s=timeout_s)
 

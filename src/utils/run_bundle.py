@@ -222,6 +222,10 @@ def log_sandbox_attempt(
     downloaded_paths: Optional[List[str]] = None,
     exit_code: Optional[int] = None,
     error_tail: Optional[str] = None,
+    success: Optional[bool] = None,
+    stage: Optional[str] = None,
+    exception_type: Optional[str] = None,
+    exception_msg: Optional[str] = None,
 ) -> None:
     run_dir = get_run_dir(run_id)
     if not run_dir:
@@ -252,6 +256,14 @@ def log_sandbox_attempt(
         "exit_code": exit_code,
         "error_tail": error_tail,
     }
+    if success is not None:
+        record["success"] = bool(success)
+    if stage:
+        record["stage"] = stage
+    if exception_type:
+        record["exception_type"] = exception_type
+    if exception_msg:
+        record["exception_msg"] = exception_msg
     _RUN_ATTEMPTS.setdefault(run_id, []).append(record)
 
 

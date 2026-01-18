@@ -154,6 +154,7 @@ from src.utils.sandbox_paths import (
 )
 from src.utils.sandbox_resilience import (
     run_code_with_optional_timeout,
+    run_python_file_with_optional_timeout,
     run_cmd_with_retry,
     safe_download_file,
     safe_download_bytes,
@@ -370,6 +371,49 @@ def _apply_static_autofixes(code: str) -> tuple[str, List[Dict[str, Any]]]:
             {
                 "rule": "nested_dict_setdefault",
                 "count": int(nested_count),
+                "before_hash": before_hash,
+                "after_hash": _hash_text(updated),
+            }
+        )
+    if "json.dump(" in updated and "_json_dump_patched" not in updated:
+        json_patch = (
+            "import json\n"
+            "def _json_default(obj):\n"
+            "    try:\n"
+            "        import numpy as np\n"
+            "    except Exception:\n"
+            "        np = None\n"
+            "    try:\n"
+            "        import pandas as pd\n"
+            "    except Exception:\n"
+            "        pd = None\n"
+            "    if np is not None:\n"
+            "        if isinstance(obj, (np.integer,)):\n"
+            "            return int(obj)\n"
+            "        if isinstance(obj, (np.floating,)):\n"
+            "            return float(obj)\n"
+            "        if isinstance(obj, (np.bool_,)):\n"
+            "            return bool(obj)\n"
+            "        if isinstance(obj, (np.ndarray,)):\n"
+            "            return obj.tolist()\n"
+            "    if pd is not None and isinstance(obj, pd.Series):\n"
+            "        return obj.tolist()\n"
+            "    if obj is None:\n"
+            "        return None\n"
+            "    raise TypeError(f\"Object of type {type(obj)} is not JSON serializable\")\n"
+            "\n"
+            "_json_dump_original = json.dump\n"
+            "def _json_dump_patched(obj, fp, **kwargs):\n"
+            "    kwargs.setdefault(\"default\", _json_default)\n"
+            "    return _json_dump_original(obj, fp, **kwargs)\n"
+            "json.dump = _json_dump_patched\n"
+        )
+        before_hash = _hash_text(updated)
+        updated = json_patch + "\n" + updated
+        fixes.append(
+            {
+                "rule": "json_dump_default_patch",
+                "count": 1,
                 "before_hash": before_hash,
                 "after_hash": _hash_text(updated),
             }
@@ -7023,14 +7067,14 @@ def run_data_engineer(state: AgentState) -> AgentState:
 
             os.environ["E2B_API_KEY"] = api_key
 
+            step_name = "data_engineer"
             for sb_attempt in range(2):
               try:
                 with create_sandbox_with_retry(Sandbox, max_attempts=2, run_id=run_id, step="data_engineer") as sandbox:
-                    if not hasattr(sandbox, "run_code"):
+                    if not hasattr(sandbox, "commands"):
                         raise RuntimeError(
-                            "E2B Sandbox missing run_code. Ensure we are using e2b_code_interpreter.Sandbox (Sandbox)."
+                            "E2B Sandbox missing commands runner. Ensure sandbox supports commands.run."
                         )
-                    step_name = "data_engineer"
                     run_root = f"/home/user/run/{run_id}/{step_name}/attempt_{attempt_id}"
                     # 1. Setup Environment
                     print("Installing dependencies in Sandbox...")
@@ -7073,31 +7117,81 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         f"os.makedirs(r\"{run_root}\", exist_ok=True)\n"
                         f"os.chdir(r\"{run_root}\")\n"
                     )
-                    code = working_dir_injection + code
-                    print("Executing Cleaning Script in Sandbox...")
-                    execution = run_code_with_optional_timeout(sandbox, code, timeout_s=DE_TIMEOUT_S)
+                code = working_dir_injection + code
+                print("Executing Cleaning Script in Sandbox...")
+                script_path = f"{run_root}/cleaning.py"
+                sandbox.files.write(script_path, code)
+                execution = run_python_file_with_optional_timeout(
+                    sandbox,
+                    script_path,
+                    timeout_s=DE_TIMEOUT_S,
+                    workdir=run_root,
+                )
 
-                    # Capture Output
-                    stdout_text = "\n".join(execution.logs.stdout or [])
-                    stderr_text = "\n".join(execution.logs.stderr or [])
-                    output_log = ""
-                    if stdout_text:
-                        output_log += stdout_text
-                    if stderr_text:
-                        output_log += stderr_text
+                # Capture Output
+                stdout_text = "\n".join(execution.logs.stdout or [])
+                stderr_text = "\n".join(execution.logs.stderr or [])
+                output_log = ""
+                if stdout_text:
+                    output_log += stdout_text
+                if stderr_text:
+                    output_log += stderr_text
+                try:
+                    os.makedirs("artifacts", exist_ok=True)
+                    with open(os.path.join("artifacts", "data_engineer_sandbox_last.log"), "w", encoding="utf-8") as f_log:
+                        f_log.write(output_log or "")
+                except Exception as log_err:
+                    print(f"Warning: failed to persist data_engineer_sandbox_last.log: {log_err}")
+
+                if execution.error:
+                    error_details = f"{execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
+                    print(f"Cleaning Failed in Sandbox: {error_details}")
+                    error_payload = {
+                        "stage": "execution_error",
+                        "exception_type": execution.error.name,
+                        "exception_msg": execution.error.value,
+                        "traceback": execution.error.traceback,
+                        "attempt": attempt_id,
+                    }
                     try:
                         os.makedirs("artifacts", exist_ok=True)
-                        with open(os.path.join("artifacts", "data_engineer_sandbox_last.log"), "w", encoding="utf-8") as f_log:
-                            f_log.write(output_log or "")
-                    except Exception as log_err:
-                        print(f"Warning: failed to persist data_engineer_sandbox_last.log: {log_err}")
-
-                    if execution.error:
-                        error_details = f"{execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
-                        print(f"Cleaning Failed in Sandbox: {error_details}")
-                        contract = state.get("execution_contract", {}) or {}
-                        derived_cols = _resolve_contract_columns(contract, sources={"derived", "output"})
-                        if "Missing required columns" in error_details and derived_cols and not state.get("de_missing_derived_retry_done"):
+                        with open(
+                            os.path.join("artifacts", "data_engineer_sandbox_last_error.json"),
+                            "w",
+                            encoding="utf-8",
+                        ) as f_err:
+                            json.dump(error_payload, f_err, indent=2, ensure_ascii=True)
+                    except Exception as err:
+                        print(f"Warning: failed to persist data_engineer_sandbox_last_error.json: {err}")
+                    outputs_listing = []
+                    try:
+                        listing_proc = sandbox.commands.run(
+                            f"sh -c 'cd {run_root} && find . -maxdepth 4 -type f -printf \"%p\\t%s\\n\" 2>/dev/null'"
+                        )
+                        if listing_proc.exit_code == 0:
+                            outputs_listing = [line for line in listing_proc.stdout.splitlines() if line.strip()]
+                    except Exception:
+                        outputs_listing = []
+                    if run_id:
+                        log_sandbox_attempt(
+                            run_id,
+                            step_name,
+                            attempt_id,
+                            code=code,
+                            stdout=stdout_text,
+                            stderr=stderr_text,
+                            outputs_listing=outputs_listing,
+                            downloaded_paths=[],
+                            exit_code=getattr(execution, "exit_code", None),
+                            error_tail=execution.error.traceback if execution.error else None,
+                            success=False,
+                            stage="execution_error",
+                            exception_type=execution.error.name,
+                            exception_msg=str(execution.error.value),
+                        )
+                    contract = state.get("execution_contract", {}) or {}
+                    derived_cols = _resolve_contract_columns(contract, sources={"derived", "output"})
+                    if "Missing required columns" in error_details and derived_cols and not state.get("de_missing_derived_retry_done"):
                             new_state = dict(state)
                             new_state["de_missing_derived_retry_done"] = True
                             override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
@@ -7112,7 +7206,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             new_state["data_engineer_audit_override"] = override
                             print("Derived column missing guard: retrying Data Engineer with derived-column guidance.")
                             return run_data_engineer(new_state)
-                        if "actual_column" in error_details and "NoneType" in error_details and not state.get("de_actual_column_guard_retry_done"):
+                    if "actual_column" in error_details and "NoneType" in error_details and not state.get("de_actual_column_guard_retry_done"):
                             new_state = dict(state)
                             new_state["de_actual_column_guard_retry_done"] = True
                             override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
@@ -7126,7 +7220,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             new_state["data_engineer_audit_override"] = override
                             print("Validation print guard: retrying Data Engineer with None-safe formatting.")
                             return run_data_engineer(new_state)
-                        if "AttributeError" in error_details and "DataFrame" in error_details and "dtype" in error_details:
+                    if "AttributeError" in error_details and "DataFrame" in error_details and "dtype" in error_details:
                             if not state.get("de_dtype_guard_retry_done"):
                                 new_state = dict(state)
                                 new_state["de_dtype_guard_retry_done"] = True
@@ -7142,7 +7236,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                 new_state["data_engineer_audit_override"] = override
                                 print("Duplicate column dtype guard: retrying Data Engineer.")
                                 return run_data_engineer(new_state)
-                        if not state.get("de_runtime_retry_done"):
+                    if not state.get("de_runtime_retry_done"):
                             new_state = dict(state)
                             new_state["de_runtime_retry_done"] = True
                             override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
@@ -7195,12 +7289,12 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             new_state["data_engineer_audit_override"] = override
                             print("Runtime error guard: retrying Data Engineer with error context.")
                             return run_data_engineer(new_state)
-                        return {
-                            "cleaning_code": code,
-                            "cleaned_data_preview": "Error: Cleaning Failed",
-                            "error_message": f"Sandbox Cleaning Failed: {error_details}",
-                            "budget_counters": counters,
-                        }
+                    return {
+                        "cleaning_code": code,
+                        "cleaned_data_preview": "Error: Cleaning Failed",
+                        "error_message": f"Sandbox Cleaning Failed: {error_details}",
+                        "budget_counters": counters,
+                    }
 
                     # 4. Verification & Download
                     # Check if cleaned file exists
@@ -7308,6 +7402,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             downloaded_paths=downloaded_paths,
                             exit_code=getattr(execution, "exit_code", None),
                             error_tail=(execution.error.traceback if execution.error else None),
+                            success=True,
+                            stage="completed",
                         )
 
                     required_input = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
@@ -7407,6 +7503,50 @@ def run_data_engineer(state: AgentState) -> AgentState:
 
                 break  # Sandbox execution successful, exit retry loop
               except Exception as e:
+                error_payload = {
+                    "stage": "exception",
+                    "exception_type": type(e).__name__,
+                    "exception_msg": str(e),
+                    "traceback": traceback.format_exc(),
+                    "attempt": attempt_id,
+                }
+                try:
+                    os.makedirs("artifacts", exist_ok=True)
+                    with open(
+                        os.path.join("artifacts", "data_engineer_sandbox_last.log"),
+                        "w",
+                        encoding="utf-8",
+                    ) as f_log:
+                        f_log.write(str(e))
+                except Exception as log_err:
+                    print(f"Warning: failed to persist data_engineer_sandbox_last.log: {log_err}")
+                try:
+                    os.makedirs("artifacts", exist_ok=True)
+                    with open(
+                        os.path.join("artifacts", "data_engineer_sandbox_last_error.json"),
+                        "w",
+                        encoding="utf-8",
+                    ) as f_err:
+                        json.dump(error_payload, f_err, indent=2, ensure_ascii=True)
+                except Exception as err:
+                    print(f"Warning: failed to persist data_engineer_sandbox_last_error.json: {err}")
+                if run_id:
+                    log_sandbox_attempt(
+                        run_id,
+                        step_name,
+                        attempt_id,
+                        code=code,
+                        stdout="",
+                        stderr="",
+                        outputs_listing=[],
+                        downloaded_paths=[],
+                        exit_code=None,
+                        error_tail=str(e),
+                        success=False,
+                        stage="exception",
+                        exception_type=type(e).__name__,
+                        exception_msg=str(e),
+                    )
                 if sb_attempt == 0 and is_transient_sandbox_error(e):
                     print(f"SANDBOX_RETRY step=data_engineer attempt={sb_attempt+1} err={e}")
                     continue
@@ -9277,14 +9417,14 @@ def execute_code(state: AgentState) -> AgentState:
         else:
             ml_timeout = ML_TIMEOUT_MEDIUM_S  # Default to medium
 
+        step_name = "ml_engineer"
         for sb_attempt in range(2):
           try:
             with create_sandbox_with_retry(Sandbox, max_attempts=2, run_id=run_id, step="ml_engineer") as sandbox:
-                if not hasattr(sandbox, "run_code"):
+                if not hasattr(sandbox, "commands"):
                     raise RuntimeError(
-                        "E2B Sandbox missing run_code. Ensure we are using e2b_code_interpreter.Sandbox (CodeSandbox)."
+                        "E2B Sandbox missing commands runner. Ensure sandbox supports commands.run."
                     )
-                step_name = "ml_engineer"
                 run_root = f"/home/user/run/{run_id}/{step_name}/attempt_{attempt_id}"
                 print("Installing dependencies in Sandbox...")
                 pkg_sets = get_sandbox_install_packages(required_deps)
@@ -9386,7 +9526,14 @@ def execute_code(state: AgentState) -> AgentState:
                             pass
 
                 print("Running code in Sandbox...")
-                execution = run_code_with_optional_timeout(sandbox, code, timeout_s=ml_timeout)
+                script_path = f"{run_root}/ml_engineer.py"
+                sandbox.files.write(script_path, code)
+                execution = run_python_file_with_optional_timeout(
+                    sandbox,
+                    script_path,
+                    timeout_s=ml_timeout,
+                    workdir=run_root,
+                )
 
                 stdout_text = "\n".join(execution.logs.stdout or [])
                 stderr_text = "\n".join(execution.logs.stderr or [])
@@ -9398,6 +9545,34 @@ def execute_code(state: AgentState) -> AgentState:
 
                 if execution.error:
                     output += f"\n\nEXECUTION ERROR:\n{execution.error.name}: {execution.error.value}\n{execution.error.traceback}"
+                    error_payload = {
+                        "stage": "execution_error",
+                        "exception_type": execution.error.name,
+                        "exception_msg": execution.error.value,
+                        "traceback": execution.error.traceback,
+                        "attempt": attempt_id,
+                    }
+                    try:
+                        os.makedirs("artifacts", exist_ok=True)
+                        with open(
+                            os.path.join("artifacts", "ml_engineer_sandbox_last_error.json"),
+                            "w",
+                            encoding="utf-8",
+                        ) as f_err:
+                            json.dump(error_payload, f_err, indent=2, ensure_ascii=True)
+                    except Exception as err:
+                        print(f"Warning: failed to persist ml_engineer_sandbox_last_error.json: {err}")
+
+                try:
+                    os.makedirs("artifacts", exist_ok=True)
+                    with open(
+                        os.path.join("artifacts", "ml_engineer_sandbox_last.log"),
+                        "w",
+                        encoding="utf-8",
+                    ) as f_log:
+                        f_log.write(output)
+                except Exception as log_err:
+                    print(f"Warning: failed to persist ml_engineer_sandbox_last.log: {log_err}")
 
                 downloaded_paths = []
                 visuals_missing = False
@@ -9561,6 +9736,8 @@ def execute_code(state: AgentState) -> AgentState:
                         outputs_listing = [line for line in listing_proc.stdout.splitlines() if line.strip()]
                 except Exception:
                     outputs_listing = []
+                attempt_success = execution.error is None
+                attempt_stage = "completed" if attempt_success else "execution_error"
                 if run_id:
                     log_sandbox_attempt(
                         run_id,
@@ -9573,10 +9750,58 @@ def execute_code(state: AgentState) -> AgentState:
                         downloaded_paths=downloaded_paths,
                         exit_code=getattr(execution, "exit_code", None),
                         error_tail=(execution.error.traceback if execution.error else None),
+                        success=attempt_success,
+                        stage=attempt_stage,
+                        exception_type=(execution.error.name if execution.error else None),
+                        exception_msg=(str(execution.error.value) if execution.error else None),
                     )
 
             break  # Sandbox execution successful, exit retry loop
           except Exception as e:
+            error_payload = {
+                "stage": "exception",
+                "exception_type": type(e).__name__,
+                "exception_msg": str(e),
+                "traceback": traceback.format_exc(),
+                "attempt": attempt_id,
+            }
+            try:
+                os.makedirs("artifacts", exist_ok=True)
+                with open(
+                    os.path.join("artifacts", "ml_engineer_sandbox_last.log"),
+                    "w",
+                    encoding="utf-8",
+                ) as f_log:
+                    f_log.write(str(e))
+            except Exception as log_err:
+                print(f"Warning: failed to persist ml_engineer_sandbox_last.log: {log_err}")
+            try:
+                os.makedirs("artifacts", exist_ok=True)
+                with open(
+                    os.path.join("artifacts", "ml_engineer_sandbox_last_error.json"),
+                    "w",
+                    encoding="utf-8",
+                ) as f_err:
+                    json.dump(error_payload, f_err, indent=2, ensure_ascii=True)
+            except Exception as err:
+                print(f"Warning: failed to persist ml_engineer_sandbox_last_error.json: {err}")
+            if run_id:
+                log_sandbox_attempt(
+                    run_id,
+                    step_name,
+                    attempt_id,
+                    code=code,
+                    stdout="",
+                    stderr="",
+                    outputs_listing=[],
+                    downloaded_paths=[],
+                    exit_code=None,
+                    error_tail=str(e),
+                    success=False,
+                    stage="exception",
+                    exception_type=type(e).__name__,
+                    exception_msg=str(e),
+                )
             if sb_attempt == 0 and is_transient_sandbox_error(e):
                 print(f"SANDBOX_RETRY step=ml_engineer attempt={sb_attempt+1} err={e}")
                 continue
