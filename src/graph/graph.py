@@ -9,6 +9,7 @@ import csv
 import threading
 import time
 import fnmatch
+import traceback
 from pathlib import Path
 from datetime import datetime
 from typing import TypedDict, Dict, Any, List, Literal, Optional
@@ -8346,6 +8347,26 @@ def run_engineer(state: AgentState) -> AgentState:
     except Exception as e:
         msg = f"CRITICAL: ML Engineer crashed in host: {str(e)}"
         print(msg)
+        trace_text = traceback.format_exc()
+        iter_id = int(state.get("iteration_count", 0)) + 1
+        if run_id:
+            log_run_event(
+                run_id,
+                "ml_engineer_host_crash",
+                {
+                    "error": str(e),
+                    "exc_type": type(e).__name__,
+                    "traceback": trace_text[:5000],
+                    "iteration": iter_id,
+                },
+            )
+        try:
+            os.makedirs("artifacts", exist_ok=True)
+            crash_path = os.path.join("artifacts", "ml_engineer_host_crash.txt")
+            with open(crash_path, "w", encoding="utf-8") as f_crash:
+                f_crash.write(trace_text)
+        except Exception as artifact_err:
+            print(f"Warning: failed to persist ml_engineer_host_crash.txt: {artifact_err}")
         return {
             "error_message": msg,
             "generated_code": "# Generation Failed",

@@ -207,6 +207,65 @@ class MLEngineerAgent:
             return ""
         return "\n\n".join(blocks[:max_blocks])
 
+    def _extract_decisioning_context(
+        self,
+        ml_view: Dict[str, Any] | None,
+        execution_contract: Dict[str, Any] | None,
+    ) -> tuple[str, str, str]:
+        decisioning_requirements: Dict[str, Any] = {}
+        if isinstance(ml_view, dict):
+            decisioning_requirements = ml_view.get("decisioning_requirements") or {}
+        if not decisioning_requirements and isinstance(execution_contract, dict):
+            decisioning_requirements = execution_contract.get("decisioning_requirements") or {}
+        if not isinstance(decisioning_requirements, dict):
+            decisioning_requirements = {}
+        decisioning_requirements_context = json.dumps(decisioning_requirements, indent=2)
+        decisioning_columns = []
+        output_block = decisioning_requirements.get("output") if isinstance(decisioning_requirements, dict) else None
+        required_columns = output_block.get("required_columns") if isinstance(output_block, dict) else None
+        if isinstance(required_columns, list):
+            for col in required_columns:
+                if isinstance(col, dict) and col.get("name"):
+                    decisioning_columns.append(str(col.get("name")))
+        decisioning_columns_text = ", ".join(decisioning_columns) if decisioning_columns else "None requested."
+        decisioning_policy_notes = decisioning_requirements.get("policy_notes", "")
+        if decisioning_policy_notes is None:
+            decisioning_policy_notes = ""
+        if not isinstance(decisioning_policy_notes, str):
+            decisioning_policy_notes = str(decisioning_policy_notes)
+        return decisioning_requirements_context, decisioning_columns_text, decisioning_policy_notes
+
+    def _extract_visual_requirements_context(self, ml_view: Dict[str, Any] | None) -> str:
+        visual_requirements: Dict[str, Any] = {}
+        if isinstance(ml_view, dict):
+            visual_requirements = ml_view.get("visual_requirements") or {}
+        if not isinstance(visual_requirements, dict):
+            visual_requirements = {}
+        return json.dumps(visual_requirements, indent=2)
+
+    def _build_system_prompt(
+        self,
+        template: str,
+        render_kwargs: Dict[str, Any] | None,
+        ml_view: Dict[str, Any] | None = None,
+        execution_contract: Dict[str, Any] | None = None,
+    ) -> str:
+        render_kwargs = render_kwargs if isinstance(render_kwargs, dict) else {}
+        decisioning_requirements_context, decisioning_columns_text, decisioning_policy_notes = (
+            self._extract_decisioning_context(ml_view, execution_contract)
+        )
+        visual_requirements_context = self._extract_visual_requirements_context(ml_view)
+        merged = dict(render_kwargs)
+        merged.update(
+            {
+                "decisioning_requirements_context": decisioning_requirements_context,
+                "decisioning_policy_notes": decisioning_policy_notes,
+                "decisioning_columns_text": decisioning_columns_text,
+                "visual_requirements_context": visual_requirements_context,
+            }
+        )
+        return render_prompt(template, **merged)
+
     def _build_incomplete_reprompt_context(
         self,
         execution_contract: Dict[str, Any] | None,
@@ -224,18 +283,10 @@ class MLEngineerAgent:
         ml_view = ml_view or {}
         ml_view_json = json.dumps(ml_view, indent=2)
         plot_spec_json = json.dumps(ml_view.get("plot_spec", {}), indent=2)
-        decisioning_requirements = ml_view.get("decisioning_requirements") or (execution_contract or {}).get(
-            "decisioning_requirements", {}
-        ) or {}
-        decisioning_requirements_context = json.dumps(decisioning_requirements, indent=2)
-        decisioning_columns = [
-            str(col.get("name"))
-            for col in (decisioning_requirements.get("output", {}).get("required_columns") or [])
-            if isinstance(col, dict) and col.get("name")
-        ]
-        decisioning_columns_text = ", ".join(decisioning_columns) if decisioning_columns else "None requested."
-        decisioning_policy_notes = decisioning_requirements.get("policy_notes", "")
-        visual_requirements_json = json.dumps(ml_view.get("visual_requirements", {}), indent=2)
+        decisioning_requirements_context, decisioning_columns_text, decisioning_policy_notes = (
+            self._extract_decisioning_context(ml_view, execution_contract)
+        )
+        visual_requirements_json = self._extract_visual_requirements_context(ml_view)
         
         # STRUCTURED CRITICAL ERRORS SECTION
         critical_errors: List[str] = []
@@ -310,6 +361,14 @@ class MLEngineerAgent:
                 ml_view_json,
                 "PLOT_SPEC_CONTEXT:",
                 plot_spec_json,
+                "DECISIONING_REQUIREMENTS_CONTEXT:",
+                decisioning_requirements_context,
+                "DECISIONING_COLUMNS:",
+                decisioning_columns_text,
+                "DECISIONING_POLICY_NOTES:",
+                decisioning_policy_notes or "None",
+                "VISUAL_REQUIREMENTS_CONTEXT:",
+                visual_requirements_json,
                 "CONTRACT_MIN_CONTEXT:",
                 json.dumps(contract_min, indent=2),
                 "REQUIRED OUTPUTS:",
@@ -1051,9 +1110,7 @@ class MLEngineerAgent:
         ml_view_json = json.dumps(ml_view, indent=2)
         plot_spec_json = json.dumps(ml_view.get("plot_spec", {}), indent=2)
         evaluation_spec_json = json.dumps((execution_contract or {}).get("evaluation_spec", {}), indent=2)
-        # Safe Rendering for System Prompt
-        system_prompt = render_prompt(
-            SYSTEM_PROMPT_TEMPLATE,
+        render_kwargs = dict(
             business_objective=business_objective,
             strategy_title=strategy.get('title', 'Unknown'),
             analysis_type=str(strategy.get('analysis_type', 'predictive')).upper(),
@@ -1076,10 +1133,6 @@ class MLEngineerAgent:
             contract_min_context=json.dumps(execution_contract_compact, indent=2),
             ml_view_context=ml_view_json,
             plot_spec_context=plot_spec_json,
-            decisioning_requirements_context=decisioning_requirements_context,
-            decisioning_policy_notes=decisioning_policy_notes,
-            decisioning_columns_text=decisioning_columns_text,
-            visual_requirements_context=visual_requirements_json,
             evaluation_spec_json=evaluation_spec_json,
             spec_extraction_json=spec_extraction_json,
             ml_engineer_runbook=ml_runbook_json,
@@ -1089,6 +1142,13 @@ class MLEngineerAgent:
             iteration_memory_json=json.dumps(iteration_memory or [], indent=2),
             iteration_memory_block=iteration_memory_block or "",
             dataset_scale=dataset_scale,
+        )
+        # Safe Rendering for System Prompt
+        system_prompt = self._build_system_prompt(
+            SYSTEM_PROMPT_TEMPLATE,
+            render_kwargs,
+            ml_view=ml_view,
+            execution_contract=execution_contract or {},
         )
         
         # USER TEMPLATES (Static)
