@@ -253,6 +253,7 @@ def _review_cleaning_impl(
         manifest=manifest,
         raw_sample=raw_sample,
         column_roles=column_roles,
+        allowed_feature_sets=view.get("allowed_feature_sets") or {},
     )
     warnings.extend(dialect_warnings)
     deterministic_result = _assemble_result(
@@ -326,8 +327,8 @@ def _merge_cleaning_gates(view: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], s
     universal_gates = _normalize_cleaning_gates(_FALLBACK_CLEANING_GATES)
     warnings: List[str] = []
     if contract_gates:
-        merged = _dedupe_gates(contract_gates + universal_gates)
-        source = "merged" if universal_gates else "cleaning_view"
+        merged = _dedupe_gates(contract_gates)
+        source = "cleaning_view"
     else:
         merged = universal_gates
         source = "fallback"
@@ -366,7 +367,7 @@ def _dedupe_gates(gates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen: set[str] = set()
     deduped: List[Dict[str, Any]] = []
     for gate in gates:
-        key = str(gate.get("name", "")).strip().lower()
+        key = _normalize_gate_name(gate.get("name", ""))
         if not key or key in seen:
             continue
         seen.add(key)
@@ -381,13 +382,16 @@ def _normalize_severity(severity: Any, required: Any = None) -> str:
     return sev if sev in {"HARD", "SOFT"} else "HARD"
 
 
+def normalize_gate_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (name or "").strip().lower()).strip("_")
+
+
 def _normalize_gate_name(name: Any) -> str:
     if name is None:
         return ""
-    raw = str(name).strip()
-    if not raw:
+    key = normalize_gate_name(str(name))
+    if not key:
         return ""
-    key = re.sub(r"[^0-9a-zA-Z]+", "_", raw).strip("_").lower()
     alias_map = {
         "numericparsingvalidation": "numeric_parsing_validation",
         "numeric_parsing_validation": "numeric_parsing_validation",
@@ -577,6 +581,24 @@ def _check_numeric_parsing_validation(
     return issues, evidence
 
 
+def _compute_null_fraction(
+    sample_infer: Optional[pd.DataFrame],
+    sample_str: Optional[pd.DataFrame],
+    column: str,
+) -> Optional[float]:
+    series = None
+    if sample_infer is not None and column in sample_infer.columns:
+        series = sample_infer[column]
+    elif sample_str is not None and column in sample_str.columns:
+        series = sample_str[column]
+    if series is None:
+        return None
+    total = len(series)
+    if total == 0:
+        return None
+    return float(series.isna().sum() / total)
+
+
 def _list_str(value: Any) -> List[str]:
     if isinstance(value, list):
         return [str(item) for item in value if item]
@@ -674,6 +696,7 @@ def _evaluate_gates_deterministic(
     manifest: Dict[str, Any],
     raw_sample: Optional[pd.DataFrame],
     column_roles: Dict[str, List[str]],
+    allowed_feature_sets: Dict[str, Any],
 ) -> Dict[str, Any]:
     hard_failures: List[str] = []
     soft_failures: List[str] = []
@@ -683,19 +706,22 @@ def _evaluate_gates_deterministic(
     failure_summaries: List[str] = []
     warning_summaries: List[str] = []
     gate_results: List[Dict[str, Any]] = []
+    model_features = _list_str(allowed_feature_sets.get("model_features")) if isinstance(allowed_feature_sets, dict) else []
 
     for gate in gates:
         name = gate["name"]
+        gate_key = _normalize_gate_name(name)
         severity = gate["severity"]
         params = gate["params"]
         issues: List[str] = []
         evidence: Dict[str, Any] = {}
         evaluated = True
+        severity_used = severity
 
-        if name == "required_columns_present":
+        if gate_key == "required_columns_present":
             issues = _check_required_columns(required_columns, cleaned_header, cleaned_csv_path)
             evidence["missing"] = [c for c in required_columns if c not in cleaned_header]
-        elif name == "id_integrity":
+        elif gate_key == "id_integrity":
             issues = _check_id_integrity(
                 cleaned_header,
                 sample_str,
@@ -703,7 +729,7 @@ def _evaluate_gates_deterministic(
                 params,
                 column_roles,
             )
-        elif name == "no_semantic_rescale":
+        elif gate_key == "no_semantic_rescale":
             issues = _check_no_semantic_rescale(
                 manifest,
                 params,
@@ -712,13 +738,57 @@ def _evaluate_gates_deterministic(
                 raw_sample,
                 sample_infer if sample_infer is not None else sample_str,
             )
-        elif name == "no_synthetic_data":
+        elif gate_key == "no_synthetic_data":
             issues = _check_no_synthetic_data(manifest)
-        elif name == "row_count_sanity":
+        elif gate_key == "row_count_sanity":
             issues = _check_row_count_sanity(manifest, params)
             evidence["row_counts"] = (manifest.get("row_counts") or {})
-        elif name == "numeric_parsing_validation":
+        elif gate_key == "numeric_parsing_validation":
             issues, evidence = _check_numeric_parsing_validation(sample_str, sample_infer, params)
+        elif gate_key == "null_handling_verification":
+            columns = _list_str(params.get("columns"))
+            allow_nulls = params.get("allow_nulls", True)
+            tolerance = params.get("tolerance")
+            if tolerance is None:
+                tolerance = params.get("null_tolerance", 0.0)
+            try:
+                tolerance_val = float(tolerance)
+            except Exception:
+                tolerance_val = 0.0
+            evidence = {
+                "columns": columns,
+                "allow_nulls": bool(allow_nulls),
+                "tolerance": tolerance_val,
+                "null_frac": {},
+            }
+            if not columns:
+                evidence["note"] = "no_columns_configured"
+            for col in columns:
+                if cleaned_header and col not in cleaned_header:
+                    issues.append(f"Missing column: {col}")
+                    severity_used = "HARD"
+                    continue
+                null_frac = _compute_null_fraction(sample_infer, sample_str, col)
+                evidence["null_frac"][col] = None if null_frac is None else round(null_frac, 4)
+                if null_frac is None:
+                    warnings.append(f"NULL_HANDLING_EVIDENCE_MISSING: {col}")
+                    continue
+                if allow_nulls is False and null_frac > tolerance_val:
+                    issues.append(f"{col} null_frac={null_frac:.4f} > {tolerance_val:.4f}")
+            warn_threshold = params.get("warn_null_frac_threshold", 0.5)
+            try:
+                warn_threshold_val = float(warn_threshold)
+            except Exception:
+                warn_threshold_val = 0.5
+            for col in model_features:
+                if col in columns:
+                    continue
+                if cleaned_header and col not in cleaned_header:
+                    continue
+                null_frac = _compute_null_fraction(sample_infer, sample_str, col)
+                if null_frac is None or null_frac < warn_threshold_val:
+                    continue
+                warnings.append(f"NULLS_OUTSIDE_GATE: {col} null_frac={null_frac:.4f}")
         else:
             evaluated = False
             warnings.append(f"UNKNOWN_GATE_SKIPPED: {name}")
@@ -729,7 +799,7 @@ def _evaluate_gates_deterministic(
         gate_results.append(
             {
                 "name": name,
-                "severity": severity,
+                "severity": severity_used,
                 "passed": passed,
                 "issues": issues,
                 "evidence": evidence or {"source": "deterministic"},
@@ -738,8 +808,8 @@ def _evaluate_gates_deterministic(
 
         if issues:
             _record_gate_failure(
-                name,
-                severity,
+                _normalize_gate_name(name),
+                severity_used,
                 issues,
                 hard_failures,
                 soft_failures,
