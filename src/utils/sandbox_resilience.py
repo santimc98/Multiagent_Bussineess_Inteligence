@@ -4,6 +4,7 @@ Sandbox resilience utilities.
 Provides retry logic and robustness for transient failures in sandbox operations.
 """
 
+import os
 import re
 import time
 import inspect
@@ -25,6 +26,23 @@ TRANSIENT_ERROR_PATTERNS = [
     "502", "503", "504",
     "connection reset", "broken pipe",
 ]
+
+_BINARY_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".pdf",
+    ".parquet",
+    ".pkl",
+    ".pickle",
+    ".joblib",
+    ".zip",
+    ".gz",
+    ".bz2",
+    ".xz",
+}
+
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 def is_transient_error_like(msg: str) -> bool:
@@ -155,7 +173,7 @@ def _run_code_via_commands_run(
     sandbox.files.write(script_path, code)
 
     if workdir:
-        cmd = f"sh -lc 'cd {shlex.quote(run_dir)} && python {shlex.quote(script_path)}'"
+        cmd = f"sh -c 'cd {shlex.quote(run_dir)} && python {shlex.quote(script_path)}'"
     else:
         cmd = f"python {shlex.quote(script_path)}"
 
@@ -266,20 +284,34 @@ def safe_download_bytes(sandbox: Any, remote_path: str, max_attempts: int = 2) -
     """
     import base64 as b64_module
 
+    remote_lower = str(remote_path or "").lower()
+    ext = os.path.splitext(remote_lower)[1]
+    binary_hint = ext in _BINARY_EXTENSIONS
+    is_png = ext == ".png"
+
     for attempt in range(max_attempts):
+        content = None
         try:
             content = sandbox.files.read(remote_path)
-            # Normalize to bytes if needed
-            if isinstance(content, (bytes, bytearray)):
-                return bytes(content) if isinstance(content, bytearray) else content
-            elif hasattr(content, "tobytes"):
-                return content.tobytes()
-            elif isinstance(content, str):
-                # Text file - encode to bytes
-                return content.encode("utf-8", errors="surrogateescape")
         except Exception as e:
             error_msg = str(e)
             print(f"DOWNLOAD_ATTEMPT_{attempt + 1}/{max_attempts} FAILED: {error_msg}")
+
+        data = None
+        if content is not None:
+            if isinstance(content, (bytes, bytearray)):
+                data = bytes(content) if isinstance(content, bytearray) else content
+            elif hasattr(content, "tobytes"):
+                data = content.tobytes()
+            elif isinstance(content, str):
+                if not binary_hint:
+                    return content.encode("utf-8", errors="surrogateescape")
+
+        if data is not None:
+            if is_png and not data.startswith(_PNG_SIGNATURE):
+                data = None
+            else:
+                return data
 
         # Try base64 fallback (always, not just on exception)
         try:
@@ -288,6 +320,8 @@ def safe_download_bytes(sandbox: Any, remote_path: str, max_attempts: int = 2) -
             proc = sandbox.commands.run(cmd)
             if proc.exit_code == 0 and proc.stdout:
                 decoded = b64_module.b64decode(proc.stdout.strip())
+                if is_png and not decoded.startswith(_PNG_SIGNATURE):
+                    continue
                 return decoded  # Already bytes from b64decode
         except Exception as e2:
             print(f"BASE64_FALLBACK_ATTEMPT_{attempt + 1}/{max_attempts} FAILED: {e2}")

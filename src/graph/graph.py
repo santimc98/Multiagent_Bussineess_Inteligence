@@ -1328,6 +1328,35 @@ def _is_glob_pattern(path: str) -> bool:
         return False
     return any(ch in path for ch in ["*", "?", "["]) or path.endswith(("/", "\\"))
 
+_REQUIRED_OUTPUT_EXTENSIONS = {
+    ".csv",
+    ".json",
+    ".png",
+    ".pdf",
+    ".parquet",
+    ".pkl",
+    ".pickle",
+    ".joblib",
+    ".txt",
+    ".md",
+}
+
+
+def _looks_like_filesystem_path(value: str) -> bool:
+    if not value:
+        return False
+    text = str(value).strip()
+    if not text:
+        return False
+    lower = text.lower()
+    if lower.startswith(("data/", "static/", "artifacts/")):
+        return True
+    if "/" in text or "\\" in text:
+        return True
+    _, ext = os.path.splitext(lower)
+    return ext in _REQUIRED_OUTPUT_EXTENSIONS
+
+
 def _normalize_output_path(path: str) -> str:
     """Normalize output paths to data/ prefix for consistency."""
     if not path:
@@ -1340,7 +1369,43 @@ def _normalize_output_path(path: str) -> str:
     return path
 
 
-def _resolve_required_outputs(contract: Dict[str, Any]) -> List[str]:
+def _merge_conceptual_outputs(
+    state: Dict[str, Any] | None,
+    contract: Dict[str, Any],
+    conceptual_outputs: List[str],
+) -> None:
+    if not conceptual_outputs or not isinstance(state, dict):
+        return
+    reporting = state.get("reporting_requirements")
+    if not isinstance(reporting, dict):
+        reporting = {}
+    merged: List[str] = []
+    seen: set[str] = set()
+
+    def _add_items(items: Any) -> None:
+        if not isinstance(items, list):
+            return
+        for item in items:
+            text = str(item).strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(text)
+
+    contract_reporting = contract.get("reporting_requirements") if isinstance(contract, dict) else None
+    _add_items(reporting.get("conceptual_outputs"))
+    if isinstance(contract_reporting, dict):
+        _add_items(contract_reporting.get("conceptual_outputs"))
+    _add_items(conceptual_outputs)
+
+    reporting["conceptual_outputs"] = merged
+    state["reporting_requirements"] = reporting
+
+
+def _resolve_required_outputs(contract: Dict[str, Any], state: Dict[str, Any] | None = None) -> List[str]:
     """
     Resolve required outputs from V4.1 contract structure.
     Priority:
@@ -1353,17 +1418,41 @@ def _resolve_required_outputs(contract: Dict[str, Any]) -> List[str]:
     if not isinstance(contract, dict):
         return []
 
+    conceptual_outputs: List[str] = []
+
+    def _split_outputs(values: Any) -> tuple[List[str], List[str]]:
+        file_like: List[str] = []
+        conceptual_like: List[str] = []
+        if isinstance(values, list):
+            for item in values:
+                if not item:
+                    continue
+                path = str(item)
+                if _looks_like_filesystem_path(path):
+                    file_like.append(_normalize_output_path(path))
+                else:
+                    conceptual_like.append(path)
+        return file_like, conceptual_like
+
     # Priority 1: evaluation_spec.required_outputs
     eval_spec = contract.get("evaluation_spec")
     if isinstance(eval_spec, dict):
         eval_outputs = eval_spec.get("required_outputs")
         if isinstance(eval_outputs, list) and eval_outputs:
-            return [_normalize_output_path(str(p)) for p in eval_outputs if p]
+            file_like, conceptual_like = _split_outputs(eval_outputs)
+            conceptual_outputs.extend(conceptual_like)
+            if file_like:
+                _merge_conceptual_outputs(state, contract, conceptual_outputs)
+                return file_like
 
     # Priority 2: contract.required_outputs
     req_outputs = contract.get("required_outputs")
     if isinstance(req_outputs, list) and req_outputs:
-        return [_normalize_output_path(str(p)) for p in req_outputs if p]
+        file_like, conceptual_like = _split_outputs(req_outputs)
+        conceptual_outputs.extend(conceptual_like)
+        if file_like:
+            _merge_conceptual_outputs(state, contract, conceptual_outputs)
+            return file_like
 
     # Priority 3: artifact_requirements.required_files
     artifact_reqs = contract.get("artifact_requirements")
@@ -1379,17 +1468,23 @@ def _resolve_required_outputs(contract: Dict[str, Any]) -> List[str]:
                 else:
                     path = entry
                 path = str(path) if path else ""
-                if path:
+                if not path:
+                    continue
+                if _looks_like_filesystem_path(path):
                     resolved.append(_normalize_output_path(path))
+                else:
+                    conceptual_outputs.append(path)
             if resolved:
+                _merge_conceptual_outputs(state, contract, conceptual_outputs)
                 return resolved
 
     # Fallback: minimal required outputs for a valid ML run
+    _merge_conceptual_outputs(state, contract, conceptual_outputs)
     return ["data/scored_rows.csv", "data/metrics.json", "data/alignment_check.json"]
 
-def _resolve_expected_output_paths(contract: Dict[str, Any]) -> List[str]:
+def _resolve_expected_output_paths(contract: Dict[str, Any], state: Dict[str, Any] | None = None) -> List[str]:
     """V4.1-only: delegates to _resolve_required_outputs."""
-    return _resolve_required_outputs(contract)
+    return _resolve_required_outputs(contract, state)
 
 
 def _purge_execution_outputs(required_outputs: List[str], keep_outputs: List[str] | None = None) -> None:
@@ -1796,7 +1891,7 @@ def _build_contract_views(
         if isinstance(contract_min, dict):
             required_outputs = contract_min.get("required_outputs") or []
         if not required_outputs:
-            required_outputs = _resolve_required_outputs(contract)
+            required_outputs = _resolve_required_outputs(contract, state)
         deliverables = _resolve_contract_deliverables(contract)
         artifact_index = _build_artifact_index(required_outputs, deliverables)
     de_view = build_de_view(contract, contract_min or {}, artifact_index)
@@ -5797,6 +5892,7 @@ class AgentState(TypedDict):
     reviewer_view: Dict[str, Any]
     translator_view: Dict[str, Any]
     results_advisor_view: Dict[str, Any]
+    reporting_requirements: Dict[str, Any]
     restrategize_count: int
     strategist_context_override: str
     missing_repeat_count: int
@@ -6957,7 +7053,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     if alias_commands:
                         print(f"Creating {len(alias_commands)} raw data aliases...")
                         full_cmd = " && ".join(alias_commands)
-                        run_cmd_with_retry(sandbox, f"sh -lc 'cd {run_root} && {full_cmd}'")
+                        run_cmd_with_retry(sandbox, f"sh -c 'cd {run_root} && {full_cmd}'")
                         print(f"SANDBOX_INPUT_CANONICAL: {CANONICAL_RAW_REL}")
                         print(f"SANDBOX_INPUT_ALIASES: {COMMON_RAW_ALIASES}")
 
@@ -7194,7 +7290,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                     outputs_listing = []
                     try:
                         listing_proc = sandbox.commands.run(
-                            f"sh -lc 'cd {run_root} && find . -maxdepth 4 -type f -printf \"%p\\t%s\\n\" 2>/dev/null'"
+                            f"sh -c 'cd {run_root} && find . -maxdepth 4 -type f -printf \"%p\\t%s\\n\" 2>/dev/null'"
                         )
                         if listing_proc.exit_code == 0:
                             outputs_listing = [line for line in listing_proc.stdout.splitlines() if line.strip()]
@@ -8947,7 +9043,7 @@ def run_ml_preflight(state: AgentState) -> AgentState:
         if fix_block:
             gate_context["edit_instructions"] = fix_block
         if run_id:
-            outputs_state = _collect_outputs_state(_resolve_required_outputs(contract))
+            outputs_state = _collect_outputs_state(_resolve_required_outputs(contract, state))
             reviewer_reasons = _normalize_reason_tags(feedback, issues)
             next_actions = _suggest_next_actions(issues, outputs_state["missing"], reviewer_reasons, [])
             entry = _build_ml_iteration_journal_entry(
@@ -8990,7 +9086,7 @@ def run_ml_preflight(state: AgentState) -> AgentState:
             "required_fixes": ["Add json.dump(..., default=_json_default) and define _json_default helper."],
         }
         if run_id:
-            outputs_state = _collect_outputs_state(_resolve_required_outputs(contract))
+            outputs_state = _collect_outputs_state(_resolve_required_outputs(contract, state))
             reviewer_reasons = _normalize_reason_tags(feedback, ["JSON_SERIALIZATION_GUARD"])
             next_actions = _suggest_next_actions(["JSON_SERIALIZATION_GUARD"], outputs_state["missing"], reviewer_reasons, [])
             entry = _build_ml_iteration_journal_entry(
@@ -9103,8 +9199,8 @@ def execute_code(state: AgentState) -> AgentState:
         fh.append(f"DEPENDENCY_BLOCKED: {blocked}")
         return {"error_message": msg, "execution_output": msg, "feedback_history": fh, "budget_counters": counters}
 
-    required_outputs = _resolve_required_outputs(contract)
-    expected_outputs = _resolve_expected_output_paths(contract)
+    required_outputs = _resolve_required_outputs(contract, state)
+    expected_outputs = _resolve_expected_output_paths(contract, state)
     _purge_execution_outputs(required_outputs, expected_outputs)
 
     eval_spec = state.get("evaluation_spec") or (contract.get("evaluation_spec") if isinstance(contract, dict) else {})
@@ -9223,7 +9319,7 @@ def execute_code(state: AgentState) -> AgentState:
                 if cleaned_alias_commands:
                     print(f"Creating {len(cleaned_alias_commands)} cleaned data aliases...")
                     full_cmd = " && ".join(cleaned_alias_commands)
-                    run_cmd_with_retry(sandbox, f"sh -lc 'cd {run_root} && {full_cmd}'")
+                    run_cmd_with_retry(sandbox, f"sh -c 'cd {run_root} && {full_cmd}'")
                     print(f"SANDBOX_INPUT_CANONICAL: {CANONICAL_CLEANED_REL}")
                     print(f"SANDBOX_INPUT_ALIASES: {COMMON_CLEANED_ALIASES}")
 
@@ -9314,7 +9410,7 @@ def execute_code(state: AgentState) -> AgentState:
                     remote_viz_dir = "static/plots"
                 ls_proc = run_cmd_with_retry(
                     sandbox,
-                    f"sh -lc 'ls -1 {run_root}/{remote_viz_dir}/*.png 2>/dev/null || true'",
+                    f"sh -c 'ls -1 {run_root}/{remote_viz_dir}/*.png 2>/dev/null || true'",
                     retries=2,
                 )
 
@@ -9375,7 +9471,7 @@ def execute_code(state: AgentState) -> AgentState:
                         remote_pattern = pattern
                     else:
                         remote_pattern = f"{run_root}/{pattern}"
-                    list_cmd = f"sh -lc 'ls -1 {remote_pattern} 2>/dev/null || true'"
+                    list_cmd = f"sh -c 'ls -1 {remote_pattern} 2>/dev/null || true'"
                     lst = sandbox.commands.run(list_cmd)
                     if lst.exit_code != 0:
                         continue
@@ -9405,7 +9501,7 @@ def execute_code(state: AgentState) -> AgentState:
                         remote_path = rel_path
                     else:
                         remote_path = f"{run_root}/{rel_path}"
-                    list_cmd = f"sh -lc 'ls -1 {remote_path} 2>/dev/null || true'"
+                    list_cmd = f"sh -c 'ls -1 {remote_path} 2>/dev/null || true'"
                     lst = sandbox.commands.run(list_cmd)
                     if lst.exit_code != 0:
                         continue
@@ -9428,7 +9524,7 @@ def execute_code(state: AgentState) -> AgentState:
                             print(f"Downloaded optional output: {local_path}")
                         else:
                             print(f"Warning: failed to download optional output {remote_opt}")
-                list_cmd = f"sh -lc 'cd {run_root} && find . -maxdepth 5 -type f -printf \"%p\\t%s\\n\" 2>/dev/null'"
+                list_cmd = f"sh -c 'cd {run_root} && find . -maxdepth 5 -type f -printf \"%p\\t%s\\n\" 2>/dev/null'"
                 outputs_listing = []
                 try:
                     listing_proc = sandbox.commands.run(list_cmd)
@@ -10491,7 +10587,7 @@ def run_result_evaluator(state: AgentState) -> AgentState:
     result_state["ml_iteration_memory_block"] = edit_block
 
     if run_id:
-        outputs_state = _collect_outputs_state(_resolve_required_outputs(contract))
+        outputs_state = _collect_outputs_state(_resolve_required_outputs(contract, state))
         reviewer_reasons = _normalize_reason_tags(review_feedback, failed_gates)
         next_actions = _suggest_next_actions([], outputs_state["missing"], reviewer_reasons, [])
         entry = _build_ml_iteration_journal_entry(
@@ -10620,7 +10716,7 @@ def prepare_runtime_fix(state: AgentState) -> AgentState:
     run_id = state.get("run_id")
     if run_id:
         contract = state.get("execution_contract", {}) or {}
-        outputs_state = _collect_outputs_state(_resolve_required_outputs(contract))
+        outputs_state = _collect_outputs_state(_resolve_required_outputs(contract, state))
         reviewer_feedback = state.get("review_feedback") or ""
         reviewer_reasons = _normalize_reason_tags(reviewer_feedback, [])
         next_actions = _suggest_next_actions([], outputs_state["missing"], reviewer_reasons, [])
