@@ -5,6 +5,7 @@ import json
 from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
 from openai import OpenAI
+from src.utils.reviewer_llm import init_reviewer_llm
 
 load_dotenv()
 
@@ -122,15 +123,9 @@ class QAReviewerAgent:
         Initializes the QA Reviewer Agent with MIMO v2 Flash.
         Role: Strict Code Quality Gate.
         """
-        self.api_key = api_key or os.getenv("MIMO_API_KEY")
-        if not self.api_key:
-            raise ValueError("MIMO API Key is required.")
-        
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url="https://api.xiaomimimo.com/v1"
-        )
-        self.model_name = "mimo-v2-flash"
+        self.provider, self.client, self.model_name, self.model_warning = init_reviewer_llm(api_key)
+        if self.model_warning:
+            print(f"WARNING: {self.model_warning}")
         self.last_prompt = None
         self.last_response = None
 
@@ -224,6 +219,12 @@ class QAReviewerAgent:
         - Only fail gates listed in QA Gates; otherwise mention as warnings.
         - When listing failed_gates, use the gate "name" values from QA Gates.
         
+        EVIDENCE REQUIREMENT:
+        - Any REJECT or warning must cite evidence from the provided artifacts or code.
+        - Include evidence in feedback using: EVIDENCE: <artifact_path>#<key> -> <short snippet>
+        - If you cannot find evidence, downgrade to APPROVE_WITH_WARNINGS and state NO_EVIDENCE_FOUND.
+        - SELF-CHECK BEFORE REJECT: without at least one concrete evidence item, you must not reject.
+        
         OUTPUT FORMAT (JSON):
         $output_format_instructions
         """
@@ -249,17 +250,48 @@ class QAReviewerAgent:
         
         user_message = render_prompt(USER_MESSAGE_TEMPLATE, code=code)
         self.last_prompt = system_prompt + "\n\n" + user_message
-        
+
+        if not self.client or self.provider == "none":
+            fallback = static_result or {
+                "status": "APPROVE_WITH_WARNINGS",
+                "feedback": "QA reviewer LLM disabled; using static checks only.",
+                "failed_gates": [],
+                "required_fixes": [],
+            }
+            status = fallback.get("status")
+            if status == "PASS":
+                fallback["status"] = "APPROVED"
+            elif status == "WARN":
+                fallback["status"] = "APPROVE_WITH_WARNINGS"
+            warnings = list(fallback.get("warnings") or [])
+            if gate_warnings:
+                warnings.extend(gate_warnings)
+            warnings.append("LLM_DISABLED_NO_API_KEY")
+            fallback["warnings"] = warnings
+            fallback.setdefault("failed_gates", [])
+            fallback.setdefault("required_fixes", [])
+            fallback["qa_gates_evaluated"] = qa_gate_names
+            fallback.setdefault("hard_failures", [])
+            fallback.setdefault("soft_failures", [])
+            fallback["contract_source_used"] = contract_source_used
+            return fallback
+
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message}
-                ],
-                response_format={"type": "json_object"}
-            )
-            content = response.choices[0].message.content
+            if self.provider == "gemini":
+                print(f"DEBUG: QA Reviewer calling Gemini ({self.model_name})...")
+                response = self.client.generate_content(system_prompt + "\n\n" + user_message)
+                content = response.text
+            else:
+                print(f"DEBUG: QA Reviewer calling MIMO ({self.model_name})...")
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message}
+                    ],
+                    response_format={"type": "json_object"}
+                )
+                content = response.choices[0].message.content
             self.last_response = content
             
             # Parse JSON (tolerant)

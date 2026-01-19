@@ -80,6 +80,37 @@ _DECISIONING_REQUIRED_PHRASES = {
     "review flag",
 }
 
+_EXPLANATION_REQUIRED_TOKENS = {
+    "explain",
+    "explanation",
+    "explainability",
+    "interpret",
+    "interpretability",
+    "justify",
+    "justification",
+    "driver",
+    "drivers",
+    "factor",
+    "factors",
+    "reason",
+    "reasons",
+    "explicar",
+    "explicacion",
+    "justificar",
+    "determinantes",
+}
+
+_EXPLANATION_REQUIRED_PHRASES = {
+    "factores determinantes",
+    "explicacion por fila",
+    "explicacion por registro",
+    "explain per row",
+    "explain each row",
+    "row explanation",
+    "per-row explanation",
+    "per record explanation",
+}
+
 _VISUAL_ENABLED_TOKENS = {
     "segment",
     "segmentation",
@@ -2373,6 +2404,12 @@ def _build_decisioning_requirements(
         kw in objective_type for kw in ["rank", "priority", "decision", "segment", "triage", "outlier", "action"]
     )
     required = _matches_any_phrase(strategy_text, _DECISIONING_REQUIRED_PHRASES)
+    explanation_needed = _contains_decisioning_token(strategy_text, _EXPLANATION_REQUIRED_TOKENS) or _matches_any_phrase(
+        strategy_text, _EXPLANATION_REQUIRED_PHRASES
+    )
+    if explanation_needed:
+        enabled = True
+        required = True
 
     canonical_columns = contract.get("canonical_columns") if isinstance(contract.get("canonical_columns"), list) else []
     canonical_columns = [str(col) for col in canonical_columns if col]
@@ -2439,6 +2476,19 @@ def _build_decisioning_requirements(
                 constraints={"non_null_rate_min": 0.95},
             )
         )
+    if explanation_needed:
+        name_hint = "top_drivers" if any(tok in strategy_text for tok in ["driver", "drivers", "factor", "factors"]) else "explanation"
+        if not any(str(entry.get("name")) == name_hint for entry in columns if isinstance(entry, dict)):
+            columns.append(
+                _build_decision_column_entry(
+                    name=name_hint,
+                    role="explanation",
+                    type_name="string",
+                    inputs=["prediction", "probability", "segment", "rule"],
+                    logic_hint="Provide a concise per-row explanation or top drivers; keep it short and auditable.",
+                    constraints={"non_null_rate_min": 0.9},
+                )
+            )
     if is_outlier:
         columns.append(
             _build_decision_column_entry(

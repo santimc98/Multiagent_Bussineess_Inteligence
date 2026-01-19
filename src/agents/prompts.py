@@ -241,6 +241,13 @@ Rules:
 * CRITICAL: required_columns MUST be a subset of canonical_columns (or derived_columns if applicable). Do NOT include metadata columns (role="unknown") or columns not in canonical_columns in required_columns. Use optional_passthrough_columns for metadata/ID columns instead.
 * If the objective is supervised prediction/optimization, the target-derived column MUST be in derived_columns_minimum.
 
+11b. EXPLANATION PER ROW (when the objective demands it)
+    If the business objective explicitly asks to explain/justify/identify drivers per record,
+    decisioning_requirements MUST include an explanation column in scored_rows schema.
+    - Use a stable name like "explanation" or "top_drivers".
+    - Keep the content minimal (short text or a list of top contributing features).
+    - Do NOT invent columns unrelated to the objective.
+
 12. ALLOWED FEATURE SETS (UNIVERSAL, REQUIRED SECTION)
     To prevent leakage and ambiguity, explicitly declare:
     "allowed_feature_sets": {

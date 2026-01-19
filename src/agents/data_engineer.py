@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from src.utils.static_safety_scan import scan_code_safety
 from src.utils.code_extract import extract_code_block
 from src.utils.senior_protocol import SENIOR_ENGINEERING_PROTOCOL
+from src.utils.contract_v41 import get_cleaning_gates
 from openai import OpenAI
 
 load_dotenv()
@@ -96,6 +97,8 @@ class DataEngineerAgent:
         contract_json = json.dumps(contract, indent=2)
         de_view = de_view or {}
         de_view_json = json.dumps(de_view, indent=2)
+        cleaning_gates = get_cleaning_gates(contract) or get_cleaning_gates(execution_contract or {}) or []
+        cleaning_gates_json = json.dumps(cleaning_gates, indent=2)
 
         # --- FIX CAUSA RAÍZ 1: Leer runbook correcto V4.1 ---
         # Primero intentar clave canónica V4.1, luego fallback a legacy
@@ -157,6 +160,7 @@ class DataEngineerAgent:
         - Optional Passthrough Columns (keep if present): $optional_passthrough_columns
         - DE_VIEW_CONTEXT (json): $de_view_context
         - CONTRACT_MIN_CONTEXT (json): $contract_min_context
+        - CLEANING_GATES_CONTEXT (json): $cleaning_gates_context
         - ROLE RUNBOOK (Data Engineer): $data_engineer_runbook (adhere to goals/must/must_not/safe_idioms/reasoning_checklist/validation_checklist)
 
         *** DATA AUDIT ***
@@ -176,6 +180,12 @@ class DataEngineerAgent:
         - Print a CLEANING_VALIDATION section that reports dtype and null_frac for each required column (no advanced metrics).
         - Use DATA AUDIT + steward summary to avoid destructive parsing (null explosions) and misinterpreted number formats.
         - If a derived column has derived_owner='ml_engineer', do NOT create placeholders; leave it absent and document in the manifest.
+
+        *** GATE CHECKLIST (CONTRACT-DRIVEN) ***
+        - Enumerate cleaning_gates by column and requirement (max_null_fraction, allow_nulls, required_columns, etc.).
+        - Before writing cleaned_data.csv, compute null_fraction for each gated column.
+        - If any HARD gate is violated, raise ValueError with a clear message: "CLEANING_GATE_FAILED: <gate_name> <details>".
+        - If a gate references a column that is missing, raise ValueError (do not fabricate columns).
         """
 
         USER_TEMPLATE = "Generate the cleaning script following Principles."
@@ -194,6 +204,7 @@ class DataEngineerAgent:
             contract_min_context=contract_json,
             de_view_context=de_view_json,
             data_engineer_runbook=de_runbook_json,
+            cleaning_gates_context=cleaning_gates_json,
             senior_engineering_protocol=SENIOR_ENGINEERING_PROTOCOL,
         )
         self.last_prompt = system_prompt + "\n\nUSER:\n" + USER_TEMPLATE

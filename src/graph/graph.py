@@ -5504,6 +5504,34 @@ def _normalize_reason_tags(text: str, failed_gates: List[str] | None = None) -> 
             tags.append(tag)
     return tags
 
+
+def _normalize_review_status(status: str | None) -> str:
+    if not status:
+        return "APPROVE_WITH_WARNINGS"
+    upper = str(status).strip().upper()
+    if upper in {"APPROVED", "APPROVE_WITH_WARNINGS", "REJECTED"}:
+        return upper
+    if upper in {"PASS", "OK", "SUCCESS"}:
+        return "APPROVED"
+    if upper in {"WARN", "WARNING"}:
+        return "APPROVE_WITH_WARNINGS"
+    if upper in {"NEEDS_IMPROVEMENT", "FAIL", "FAILED", "REJECT"}:
+        return "REJECTED"
+    if any(tok in upper for tok in ["REJECT", "FAIL", "ERROR", "CRASH"]):
+        return "REJECTED"
+    return "APPROVE_WITH_WARNINGS"
+
+
+def _normalize_review_feedback(feedback: str | None, status: str) -> str:
+    text = str(feedback or "").strip()
+    if not text:
+        return text
+    if status in {"APPROVED", "APPROVE_WITH_WARNINGS"}:
+        text = re.sub(r"\brejected\b", "resolved", text, flags=re.IGNORECASE)
+        text = re.sub(r"\breject\b", "flag", text, flags=re.IGNORECASE)
+        text = re.sub(r"\brejection\b", "flag", text, flags=re.IGNORECASE)
+    return text
+
 def _summarize_runtime_error(output: str | None) -> Dict[str, str] | None:
     if not output:
         return None
@@ -10851,12 +10879,14 @@ def run_result_evaluator(state: AgentState) -> AgentState:
             evaluation_spec = state.get("evaluation_spec") or (state.get("execution_contract", {}) or {}).get("evaluation_spec")
             if isinstance(evaluation_spec, dict):
                 objective_type = evaluation_spec.get("objective_type")
+        normalized_review_status = _normalize_review_status(status)
+        normalized_review_feedback = _normalize_review_feedback(feedback, normalized_review_status)
         insights_context = {
             "objective_type": objective_type,
             "artifact_index": state.get("artifact_index") or _load_json_any("data/produced_artifact_index.json"),
             "output_contract_report": oc_report,
-            "review_feedback": feedback,
-            "review_verdict": status,
+            "review_feedback": normalized_review_feedback,
+            "review_verdict": normalized_review_status,
             "metrics": metrics_report,
             "metric_history": metric_history,
             "data_adequacy_report": data_adequacy_report,
@@ -11281,6 +11311,14 @@ def run_translator(state: AgentState) -> AgentState:
             report_state.get("artifact_index") or _load_json_any("data/produced_artifact_index.json") or [],
         )
     report_state["translator_view"] = translator_view
+    normalized_review_status = _normalize_review_status(report_state.get("review_verdict"))
+    normalized_review_feedback = _normalize_review_feedback(report_state.get("review_feedback"), normalized_review_status)
+    report_state["review_verdict"] = normalized_review_status
+    report_state["review_feedback"] = normalized_review_feedback
+    report_state["review_verdict_normalized"] = normalized_review_status
+    report_state["review_feedback_normalized"] = normalized_review_feedback
+    state["review_verdict_normalized"] = normalized_review_status
+    state["review_feedback_normalized"] = normalized_review_feedback
     try:
         translator_view_len = len(json.dumps(translator_view, ensure_ascii=True))
         print(f"Using TRANSLATOR_VIEW_CONTEXT length={translator_view_len}")

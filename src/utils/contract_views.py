@@ -9,6 +9,7 @@ from src.utils.contract_v41 import (
     get_canonical_columns,
     get_column_roles,
     get_cleaning_gates,
+    get_derived_column_names,
     get_qa_gates,
     get_required_outputs,
     get_validation_requirements,
@@ -46,6 +47,7 @@ class MLView(TypedDict, total=False):
     role: str
     objective_type: str
     canonical_columns: List[str]
+    derived_features: List[str]
     column_roles: Dict[str, List[str]]
     decision_columns: List[str]
     outcome_columns: List[str]
@@ -366,6 +368,15 @@ def _extract_roles(roles: Dict[str, List[str]]) -> Dict[str, List[str]]:
         "outcome": _coerce_list(roles.get("outcome")),
         "audit_only": _coerce_list(roles.get("post_decision_audit_only") or roles.get("audit_only")),
     }
+
+
+def _resolve_derived_columns(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> List[str]:
+    derived: List[str] = []
+    for source in (contract_min, contract_full):
+        if not isinstance(source, dict):
+            continue
+        derived.extend(get_derived_column_names(source))
+    return list(dict.fromkeys([str(c) for c in derived if c]))
 
 
 def _resolve_allowed_feature_sets(contract_min: Dict[str, Any], contract_full: Dict[str, Any]) -> Dict[str, Any]:
@@ -779,6 +790,10 @@ def build_ml_view(
         if isinstance(candidate_list, list):
             explicit_allowed.update(str(c) for c in candidate_list if c)
 
+    derived_columns = _resolve_derived_columns(contract_min, contract_full)
+    derived_set = {str(c) for c in derived_columns if c}
+    allowed_noncanonical = set(explicit_allowed) | set(derived_set)
+
     strict_ids = []
     candidate_ids = []
     seen = set()
@@ -806,7 +821,7 @@ def build_ml_view(
         for val in items:
             if not val:
                 continue
-            if val in canonical_set:
+            if val in canonical_set or val in allowed_noncanonical:
                 filtered.append(str(val))
             else:
                 dropped.append(str(val))
@@ -830,6 +845,9 @@ def build_ml_view(
 
     model_features = [c for c in model_features_filtered if c not in forbidden_set]
     segmentation_features = [c for c in segmentation_features_filtered if c not in forbidden_set]
+    derived_features = list(
+        dict.fromkeys([c for c in derived_columns if c in set(model_features + segmentation_features)])
+    )
     final_forbidden = forbidden_filtered
     allowed_sets = {
         "segmentation_features": segmentation_features,
@@ -845,6 +863,7 @@ def build_ml_view(
         "role": "ml_engineer",
         "objective_type": objective_type,
         "canonical_columns": canonical_columns,
+        "derived_features": derived_features,
         "column_roles": column_roles,
         "decision_columns": decision_cols,
         "outcome_columns": outcome_cols,
@@ -872,8 +891,10 @@ def build_ml_view(
     artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
         contract_full.get("artifact_requirements")
     )
-    visual_reqs = artifact_reqs.get("visual_requirements") if isinstance(artifact_reqs.get("visual_requirements"), dict) else {}
-    view["visual_requirements"] = {
+    visual_reqs = (
+        artifact_reqs.get("visual_requirements") if isinstance(artifact_reqs.get("visual_requirements"), dict) else {}
+    )
+    visual_payload = {
         "enabled": bool(visual_reqs.get("enabled")),
         "required": bool(visual_reqs.get("required")),
         "outputs_dir": visual_reqs.get("outputs_dir") or "static/plots",
@@ -890,7 +911,9 @@ def build_ml_view(
         policy = contract_min.get("reporting_policy")
     plot_spec = _cap_plot_spec(policy.get("plot_spec") if isinstance(policy, dict) else None)
     if plot_spec is not None:
+        visual_payload["enabled"] = bool(plot_spec.get("enabled", True))
         view["plot_spec"] = plot_spec
+    view["visual_requirements"] = visual_payload
     view["decisioning_requirements"] = _get_decisioning_requirements(contract_full, contract_min)
     return trim_to_budget(view, 16000)
 
@@ -1011,14 +1034,19 @@ def build_translator_view(
     artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
         contract_full.get("artifact_requirements")
     )
-    visual_reqs = artifact_reqs.get("visual_requirements") if isinstance(artifact_reqs.get("visual_requirements"), dict) else {}
-    view["visual_requirements"] = {
+    visual_reqs = (
+        artifact_reqs.get("visual_requirements") if isinstance(artifact_reqs.get("visual_requirements"), dict) else {}
+    )
+    visual_payload = {
         "enabled": bool(visual_reqs.get("enabled")),
         "required": bool(visual_reqs.get("required")),
         "outputs_dir": visual_reqs.get("outputs_dir") or "static/plots",
         "items": visual_reqs.get("items") if isinstance(visual_reqs.get("items"), list) else [],
         "notes": visual_reqs.get("notes") or "",
     }
+    if plot_spec is not None:
+        visual_payload["enabled"] = bool(plot_spec.get("enabled", True))
+    view["visual_requirements"] = visual_payload
     view["decisioning_requirements"] = _get_decisioning_requirements(contract_full, contract_min)
     return trim_to_budget(view, 16000)
 

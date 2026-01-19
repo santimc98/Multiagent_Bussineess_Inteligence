@@ -4,6 +4,7 @@ import re
 from typing import Dict, Any, List
 from dotenv import load_dotenv
 from openai import OpenAI
+from src.utils.reviewer_llm import init_reviewer_llm
 
 load_dotenv()
 
@@ -27,16 +28,9 @@ class ReviewerAgent:
         """
         Initializes the Reviewer Agent with MIMO v2 Flash.
         """
-        self.api_key = api_key or os.getenv("MIMO_API_KEY")
-        if not self.api_key:
-            raise ValueError("MIMO API Key is required.")
-        
-        # Initialize OpenAI Client for MIMO
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url="https://api.xiaomimimo.com/v1"
-        )
-        self.model_name = "mimo-v2-flash"
+        self.provider, self.client, self.model_name, self.model_warning = init_reviewer_llm(api_key)
+        if self.model_warning:
+            print(f"WARNING: {self.model_warning}")
         self.last_prompt = None
         self.last_response = None
 
@@ -131,6 +125,12 @@ class ReviewerAgent:
         - If a rule is NOT present in Reviewer Gates, you may mention it as a warning but MUST NOT reject for it.
         - If Reviewer Gates is empty, fall back to the general criteria but prefer APPROVE_WITH_WARNINGS when uncertain.
 
+        ### EVIDENCE REQUIREMENT
+        - Any REJECT or warning must cite evidence from the provided artifacts or code.
+        - Include evidence in feedback using: EVIDENCE: <artifact_path>#<key> -> <short snippet>
+        - If you cannot find evidence, downgrade to APPROVE_WITH_WARNINGS and state NO_EVIDENCE_FOUND.
+        - SELF-CHECK BEFORE REJECT: without at least one concrete evidence item, you must not reject.
+
         ### OUTPUT FORMAT
         $output_format_instructions
         """
@@ -157,15 +157,28 @@ class ReviewerAgent:
             {"role": "user", "content": user_prompt}
         ]
 
+        if not self.client or self.provider == "none":
+            return {
+                "status": "APPROVE_WITH_WARNINGS",
+                "feedback": "Reviewer LLM disabled; continuing with deterministic evidence only.",
+                "failed_gates": [],
+                "required_fixes": [],
+            }
+
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                response_format={'type': 'json_object'},
-                temperature=0.0
-            )
-            
-            content = response.choices[0].message.content
+            if self.provider == "gemini":
+                print(f"DEBUG: Reviewer calling Gemini ({self.model_name})...")
+                response = self.client.generate_content(system_prompt + "\n\n" + user_prompt)
+                content = response.text
+            else:
+                print(f"DEBUG: Reviewer calling MIMO ({self.model_name})...")
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    response_format={'type': 'json_object'},
+                    temperature=0.0
+                )
+                content = response.choices[0].message.content
             self.last_response = content
             cleaned_content = self._clean_json(content)
             result = json.loads(cleaned_content)
@@ -289,6 +302,12 @@ class ReviewerAgent:
         - REJECT only if there are specific TECHNICAL fixes available (e.g. "Use Class Balancing", "Try Non-Linear Model").
         - If "Traceback" or "Error" persists in output despite your checks, REJECT.
 
+        *** EVIDENCE REQUIREMENT ***
+        - Any NEEDS_IMPROVEMENT or warning must cite evidence from artifacts or execution output.
+        - Include evidence in feedback using: EVIDENCE: <artifact_path>#<key> -> <short snippet>
+        - If you cannot find evidence, downgrade to APPROVE_WITH_WARNINGS and state NO_EVIDENCE_FOUND.
+        - SELF-CHECK BEFORE REJECT: without at least one concrete evidence item, you must not reject.
+
         OUTPUT FORMAT (JSON):
         $output_format_instructions
         """
@@ -303,17 +322,31 @@ class ReviewerAgent:
         )
         self.last_prompt = system_prompt + "\n\nEvaluate results."
 
+        if not self.client or self.provider == "none":
+            return {
+                "status": "APPROVE_WITH_WARNINGS",
+                "feedback": "Reviewer LLM disabled; continuing with deterministic evidence only.",
+                "failed_gates": [],
+                "required_fixes": [],
+                "retry_worth_it": False,
+            }
+
         try:
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": "Evaluate results."}
-                ],
-                response_format={'type': 'json_object'},
-                temperature=0.1
-            )
-            content = response.choices[0].message.content
+            if self.provider == "gemini":
+                print(f"DEBUG: Reviewer evaluation calling Gemini ({self.model_name})...")
+                response = self.client.generate_content(system_prompt + "\n\nEvaluate results.")
+                content = response.text
+            else:
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": "Evaluate results."}
+                    ],
+                    response_format={'type': 'json_object'},
+                    temperature=0.1
+                )
+                content = response.choices[0].message.content
             self.last_response = content
             cleaned_content = self._clean_json(content)
             result = json.loads(cleaned_content)

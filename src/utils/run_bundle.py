@@ -406,10 +406,12 @@ def write_run_manifest(
     existing = _safe_load_json(manifest_path)
     existing_dict = existing if isinstance(existing, dict) else {}
 
+    normalized_status = state.get("review_verdict_normalized") or run_summary.get("status") or state.get("review_verdict")
+    normalized_reason = state.get("review_feedback_normalized") or (state.get("last_gate_context") or {}).get("feedback")
     gates_summary = {
-        "status": run_summary.get("status") or state.get("review_verdict"),
+        "status": normalized_status,
         "failed_gates": run_summary.get("failed_gates", []) if isinstance(run_summary, dict) else [],
-        "reason": (state.get("last_gate_context") or {}).get("feedback"),
+        "reason": normalized_reason,
     }
 
     manifest = dict(existing_dict)

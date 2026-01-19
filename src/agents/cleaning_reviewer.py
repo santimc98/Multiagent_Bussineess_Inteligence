@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from src.utils.code_extract import extract_code_block
+from src.utils.reviewer_llm import init_reviewer_llm
 
 load_dotenv()
 
@@ -68,14 +69,9 @@ class CleaningReviewerAgent:
 
     def __init__(self, api_key: Any = None):
         self.api_key = api_key or os.getenv("MIMO_API_KEY")
-        if self.api_key:
-            self.client = OpenAI(
-                api_key=self.api_key,
-                base_url="https://api.xiaomimimo.com/v1",
-            )
-        else:
-            self.client = None
-        self.model_name = "mimo-v2-flash"
+        self.provider, self.client, self.model_name, self.model_warning = init_reviewer_llm(api_key)
+        if self.model_warning:
+            print(f"WARNING: {self.model_warning}")
         self.last_prompt = None
         self.last_response = None
 
@@ -89,6 +85,7 @@ class CleaningReviewerAgent:
                 raw_csv_path=request.get("raw_csv_path"),
                 client=self.client,
                 model_name=self.model_name,
+                provider=self.provider,
             )
         except Exception as exc:
             result = _exception_result(exc)
@@ -190,8 +187,9 @@ def _review_cleaning_impl(
     cleaned_csv_path: str,
     cleaning_manifest_path: str,
     raw_csv_path: Optional[str],
-    client: Optional[OpenAI],
+    client: Any,
     model_name: str,
+    provider: str,
 ) -> Tuple[Dict[str, Any], str, str]:
     view = cleaning_view if isinstance(cleaning_view, dict) else {}
     gates, contract_source_used, warnings = _merge_cleaning_gates(view)
@@ -263,7 +261,7 @@ def _review_cleaning_impl(
         contract_source_used,
     )
 
-    if not client:
+    if not client or provider == "none":
         deterministic_result["warnings"].append(_LLM_DISABLED_WARNING)
         return normalize_cleaning_reviewer_result(deterministic_result), "LLM_DISABLED", "deterministic"
 
@@ -276,18 +274,26 @@ def _review_cleaning_impl(
         deterministic_gate_results=deterministic["gate_results"],
         contract_source_used=contract_source_used,
     )
-    print(f"DEBUG: Cleaning Reviewer calling MIMO ({model_name})...")
+    if provider == "gemini":
+        print(f"DEBUG: Cleaning Reviewer calling Gemini ({model_name})...")
+    else:
+        print(f"DEBUG: Cleaning Reviewer calling MIMO ({model_name})...")
     try:
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.2,
-        )
-        content = response.choices[0].message.content
+        if provider == "gemini":
+            full_prompt = prompt + "\n\nINPUT_JSON:\n" + json.dumps(payload, ensure_ascii=True)
+            response = client.generate_content(full_prompt)
+            content = response.text
+        else:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=True)},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.2,
+            )
+            content = response.choices[0].message.content
     except Exception as exc:
         deterministic_result["warnings"].append(f"{_LLM_CALL_WARNING}: {exc}")
         return normalize_cleaning_reviewer_result(deterministic_result), prompt, str(exc)
@@ -880,6 +886,12 @@ def _build_llm_prompt(
         "If only SOFT gates fail, status must be APPROVE_WITH_WARNINGS.\n"
         "If no gates fail, status must be APPROVED.\n"
         "When evidence is insufficient, mark the gate as not failed and add a warning.\n"
+        "EVIDENCE REQUIREMENT:\n"
+        "- Any REJECT or warning must cite evidence in gate_results.evidence.\n"
+        "- Format: EVIDENCE: <artifact_path>#<key> -> <short snippet>\n"
+        "- If you cannot find evidence, do NOT reject; downgrade and note NO_EVIDENCE_FOUND.\n"
+        "SELF-CHECK BEFORE REJECT:\n"
+        "- If you cannot cite at least one concrete evidence item, you must not reject.\n"
         "Return JSON only with the specified schema.\n"
         "\n"
         "Required JSON schema:\n"
