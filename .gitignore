@@ -74,6 +74,7 @@ data/plan.json
 data/qa_static_facts.json
 data/strategy_spec.json
 data/contract_min.json
+data/run_facts_pack.json
 
 # Contract views (generated)
 data/contracts/
