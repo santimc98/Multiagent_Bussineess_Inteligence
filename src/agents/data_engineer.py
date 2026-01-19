@@ -142,6 +142,9 @@ class DataEngineerAgent:
         - MUST NOT: compute scores, case assignment, weight fitting, regression/optimization, correlations, rank checks.
         - MUST: parse types, normalize numeric formats, preserve canonical column names.
         - Manifest MUST include: output_dialect, row_counts, conversions.
+        - Do NOT impute outcome/target columns. If a target is partially missing, preserve missingness.
+        - Preserve partition/split columns if they exist or are detected in the Dataset Semantics Summary.
+        - If you create a partition column (split/fold/bucket), document it in the manifest and do not drop it.
 
         *** PYTHON SYNTAX GOTCHAS (CRITICAL) ***
         - Column names starting with a digit (e.g., '1stYearAmount') are NOT valid Python identifiers.

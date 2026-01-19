@@ -192,6 +192,7 @@ def _review_cleaning_impl(
     provider: str,
 ) -> Tuple[Dict[str, Any], str, str]:
     view = cleaning_view if isinstance(cleaning_view, dict) else {}
+    context_pack = view.get("context_pack") if isinstance(view, dict) else None
     gates, contract_source_used, warnings = _merge_cleaning_gates(view)
     gate_names = [gate["name"] for gate in gates]
 
@@ -273,6 +274,7 @@ def _review_cleaning_impl(
         facts=facts,
         deterministic_gate_results=deterministic["gate_results"],
         contract_source_used=contract_source_used,
+        context_pack=context_pack,
     )
     if provider == "gemini":
         print(f"DEBUG: Cleaning Reviewer calling Gemini ({model_name})...")
@@ -877,6 +879,7 @@ def _build_llm_prompt(
     facts: Dict[str, Any],
     deterministic_gate_results: List[Dict[str, Any]],
     contract_source_used: str,
+    context_pack: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     system_prompt = (
         "You are a Senior Data Cleaning Reviewer.\n"
@@ -925,6 +928,8 @@ def _build_llm_prompt(
         "deterministic_gate_results": deterministic_gate_results,
         "contract_source_used": contract_source_used,
     }
+    if context_pack:
+        payload["context_pack"] = context_pack
     return system_prompt, payload
 
 

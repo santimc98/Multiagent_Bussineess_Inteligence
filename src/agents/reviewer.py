@@ -5,6 +5,7 @@ from typing import Dict, Any, List
 from dotenv import load_dotenv
 from openai import OpenAI
 from src.utils.reviewer_llm import init_reviewer_llm
+from src.utils.senior_protocol import SENIOR_EVIDENCE_RULE
 
 load_dotenv()
 
@@ -50,7 +51,10 @@ class ReviewerAgent:
             "status": "APPROVED" | "APPROVE_WITH_WARNINGS" | "REJECTED",
             "feedback": "Detailed explanation of what to fix if rejected, or 'Looks good' if approved.",
             "failed_gates": ["List", "of", "failed", "principles"],
-            "required_fixes": ["List", "of", "specific", "instructions", "for", "the", "engineer"]
+            "required_fixes": ["List", "of", "specific", "instructions", "for", "the", "engineer"],
+            "evidence": [
+                {"claim": "Short claim", "source": "artifact_path#key_or_script_path:line or missing"}
+            ]
         }
         """
 
@@ -79,6 +83,9 @@ class ReviewerAgent:
 
         SYSTEM_PROMPT_TEMPLATE = """
         You are a Senior Technical Lead and Security Auditor.
+
+        === EVIDENCE RULE ===
+        $senior_evidence_rule
         
         CONTEXT: 
         - Objective Type: "$analysis_type"
@@ -130,6 +137,8 @@ class ReviewerAgent:
         - Include evidence in feedback using: EVIDENCE: <artifact_path>#<key> -> <short snippet>
         - If you cannot find evidence, downgrade to APPROVE_WITH_WARNINGS and state NO_EVIDENCE_FOUND.
         - SELF-CHECK BEFORE REJECT: without at least one concrete evidence item, you must not reject.
+        - Populate the "evidence" list with 3-8 items. If evidence is missing, use source="missing".
+        - Evidence sources must be artifact paths or script paths; otherwise use source="missing".
 
         ### OUTPUT FORMAT
         $output_format_instructions
@@ -146,6 +155,7 @@ class ReviewerAgent:
             allowed_columns_json=json.dumps(allowed_columns, indent=2),
             expected_metrics_json=json.dumps(expected_metrics, indent=2),
             output_format_instructions=output_format_instructions,
+            senior_evidence_rule=SENIOR_EVIDENCE_RULE,
         )
         
         USER_PROMPT_TEMPLATE = "REVIEW THIS CODE:\n\n$code"
@@ -263,7 +273,10 @@ class ReviewerAgent:
             "feedback": "Specific instructions for the ML Engineer.",
             "failed_gates": [],
             "required_fixes": [],
-            "retry_worth_it": true | false
+            "retry_worth_it": true | false,
+            "evidence": [
+                {"claim": "Short claim", "source": "artifact_path#key_or_script_path:line or missing"}
+            ]
         }
         """
 
@@ -277,6 +290,9 @@ class ReviewerAgent:
         SYSTEM_PROMPT_TEMPLATE = """
         You are a Senior Data Science Lead.
         Your goal is to evaluate the RESULTS of an analysis against the Business Objective.
+
+        === EVIDENCE RULE ===
+        $senior_evidence_rule
         
         *** BUSINESS OBJECTIVE ***
         "$business_objective"
@@ -307,6 +323,8 @@ class ReviewerAgent:
         - Include evidence in feedback using: EVIDENCE: <artifact_path>#<key> -> <short snippet>
         - If you cannot find evidence, downgrade to APPROVE_WITH_WARNINGS and state NO_EVIDENCE_FOUND.
         - SELF-CHECK BEFORE REJECT: without at least one concrete evidence item, you must not reject.
+        - Populate the "evidence" list with 3-8 items. If evidence is missing, use source="missing".
+        - Evidence sources must be artifact paths or script paths; otherwise use source="missing".
 
         OUTPUT FORMAT (JSON):
         $output_format_instructions
@@ -318,7 +336,8 @@ class ReviewerAgent:
             strategy_context=strategy_context,
             truncated_output=truncated_output,
             evaluation_spec_json=eval_spec_json,
-            output_format_instructions=output_format_instructions
+            output_format_instructions=output_format_instructions,
+            senior_evidence_rule=SENIOR_EVIDENCE_RULE,
         )
         self.last_prompt = system_prompt + "\n\nEvaluate results."
 

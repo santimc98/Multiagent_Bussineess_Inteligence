@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from src.utils.run_logger import register_run_log
 from src.utils.contract_v41 import get_required_outputs
+from src.utils.review_status import normalize_status as normalize_review_status
 
 RUNS_DIR = "runs"
 
@@ -406,7 +407,8 @@ def write_run_manifest(
     existing = _safe_load_json(manifest_path)
     existing_dict = existing if isinstance(existing, dict) else {}
 
-    normalized_status = state.get("review_verdict_normalized") or run_summary.get("status") or state.get("review_verdict")
+    raw_status = state.get("review_verdict_normalized") or run_summary.get("status") or state.get("review_verdict")
+    normalized_status = normalize_review_status(raw_status)
     normalized_reason = state.get("review_feedback_normalized") or (state.get("last_gate_context") or {}).get("feedback")
     gates_summary = {
         "status": normalized_status,

@@ -52,6 +52,22 @@ INPUTS YOU WILL RECEIVE
 * output_dialect: {sep, decimal, encoding}
 * env_constraints: (Optional) {forbid_inplace_column_creation, memory_limit, ...}
 * domain_expert_critique: (Optional) Expert guidance/risks detected during strategy selection. USE THIS to identify leakage, semantic types, and critical constraints.
+* Dataset Semantics Summary (included in data_summary): target candidates, partial labels, partition columns, and recommended training/scoring rules.
+
+DATASET UNDERSTANDING (MANDATORY)
+Before generating the contract:
+
+* Read the Dataset Semantics Summary from data_summary.
+* Explicitly declare:
+  - Which column(s) are treated as outcome/target (or unknown if none).
+  - Whether partial labels are present (labeled vs unlabeled rows).
+  - The training_rows_rule and scoring_rows_rule you will apply.
+  - data_partitioning_notes as a short list of any partitioning assumptions.
+* Include the optional fields below ONLY if partial labels are detected or partition columns exist:
+  - training_rows_rule (string)
+  - scoring_rows_rule (string)
+  - data_partitioning_notes (list of strings)
+* If partial labels are NOT detected and no partition columns exist, omit these fields.
 
 SAFE DEFAULTS (UNIVERSAL)
 When semantics are unknown, prefer defaults that minimize distortion and maximize executability:

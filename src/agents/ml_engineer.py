@@ -735,6 +735,22 @@ class MLEngineerAgent:
          - Adapt to each dataset and objective. Do not follow a rigid recipe; follow contract + data.
          - If Evaluation Spec says requires_target=false, DO NOT train a supervised model. Produce descriptive/segmentation insights and still write data/metrics.json with model_trained=false.
 
+         TRAINING DATA SELECTION (REASONED)
+         - Read execution_contract (or contract_min) for outcome_columns and optional fields:
+           * training_rows_rule
+           * scoring_rows_rule
+           * data_partitioning_notes
+         - If those rules exist, implement them exactly.
+         - If rules are absent, use the Dataset Semantics Summary in data_audit_context:
+           * If partial_label_detected=True, train ONLY on rows where the target is not null; score all rows.
+           * If partition_columns are listed and split-like values are identified, use that partitioning for train/score.
+         - Do NOT hardcode column names. Use the detected target/partition columns from contract or dataset semantics.
+         - Decision Log must include:
+           * Target chosen
+           * Training rows rule
+           * Scoring rows rule
+           * Evidence (e.g., null_frac or partition evidence from dataset_semantics.json)
+
          ML BEST PRACTICES CHECKLIST (Quality Assurance):
          [ ] NO NaN HYPOTHESES: Before .fit(), you MUST check for NaNs in X and impute (SimpleImputer) or drop them. Scikit-learn models crash on NaNs.
          [ ] INPUT SOURCE: Load data from EXACT path provided as $data_path. Do NOT hardcode arbitrary filenames.

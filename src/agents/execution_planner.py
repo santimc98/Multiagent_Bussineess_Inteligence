@@ -1388,8 +1388,13 @@ def build_contract_min(
         contract,
     )
     cleaning_gates = _apply_cleaning_gate_policy(contract.get("cleaning_gates"))
+    training_rows_rule = contract.get("training_rows_rule")
+    scoring_rows_rule = contract.get("scoring_rows_rule")
+    data_partitioning_notes = contract.get("data_partitioning_notes")
+    if not isinstance(data_partitioning_notes, list):
+        data_partitioning_notes = []
 
-    return {
+    contract_min = {
         "contract_version": contract.get("contract_version", 2),
         "strategy_title": contract.get("strategy_title") or strategy_dict.get("title", ""),
         "business_objective": business_objective,
@@ -1419,6 +1424,13 @@ def build_contract_min(
         "reporting_policy": reporting_policy or {},
         "decisioning_requirements": contract.get("decisioning_requirements", {}),
     }
+    if training_rows_rule:
+        contract_min["training_rows_rule"] = training_rows_rule
+    if scoring_rows_rule:
+        contract_min["scoring_rows_rule"] = scoring_rows_rule
+    if data_partitioning_notes:
+        contract_min["data_partitioning_notes"] = data_partitioning_notes
+    return contract_min
 
 
 def ensure_v41_schema(contract: Dict[str, Any], strict: bool = False) -> Dict[str, Any]:

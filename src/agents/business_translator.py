@@ -10,7 +10,7 @@ from string import Template
 import json
 from typing import Dict, Any, Optional, List
 from src.utils.prompting import render_prompt
-from src.utils.senior_protocol import SENIOR_TRANSLATION_PROTOCOL
+from src.utils.senior_protocol import SENIOR_TRANSLATION_PROTOCOL, SENIOR_EVIDENCE_RULE
 from src.utils.csv_dialect import (
     load_output_dialect,
     sniff_csv_dialect,
@@ -384,6 +384,86 @@ def _sanitize_report_text(text: str) -> str:
     while "..." in text:
         text = text.replace("...", ".")
     return text
+
+def _sanitize_evidence_value(value: str) -> str:
+    text = str(value).replace("\n", " ").replace("\r", " ").strip()
+    return text.replace('"', "'")
+
+def _build_evidence_items(evidence_paths: List[str], min_items: int = 3, max_items: int = 6):
+    items = []
+    for path in evidence_paths or []:
+        if not path:
+            continue
+        if len(items) >= max_items:
+            break
+        clean_path = _sanitize_evidence_value(path)
+        items.append({"claim": f"Artifact available: {clean_path}", "source": clean_path})
+    while len(items) < min_items:
+        items.append({"claim": "No verificable con artifacts actuales", "source": "missing"})
+    return items
+
+def _is_valid_evidence_source(source: str) -> bool:
+    if not source:
+        return False
+    normalized = str(source).strip()
+    if not normalized:
+        return False
+    lower = normalized.lower()
+    if lower == "missing":
+        return True
+    if lower.startswith("script:"):
+        return True
+    if "/" in normalized or "\\" in normalized:
+        return True
+    for ext in (".json", ".csv", ".md", ".txt", ".py"):
+        if ext in lower:
+            return True
+    return False
+
+def _normalize_evidence_sources(report: str) -> str:
+    if not report:
+        return report
+    lines = report.splitlines()
+    out = []
+    for line in lines:
+        if "{claim" not in line or "source" not in line:
+            out.append(line)
+            continue
+        match = re.search(r'source\s*:\s*\"([^\"]*)\"', line)
+        if not match:
+            match = re.search(r"source\s*:\s*'([^']*)'", line)
+        if not match:
+            out.append(line)
+            continue
+        source = match.group(1)
+        if _is_valid_evidence_source(source):
+            out.append(line)
+            continue
+        updated = line[: match.start(1)] + "missing" + line[match.end(1):]
+        out.append(updated)
+    return "\n".join(out)
+
+def _ensure_evidence_section(report: str, evidence_paths: List[str]) -> str:
+    if not report:
+        return report
+    if re.search(r"(?im)^\s*evidence\s*:?", report) and "{claim" in report.lower():
+        return _normalize_evidence_sources(report)
+    header_match = re.search(r"(?im)^\s*##\s+evidencia usada\s*$", report)
+    items = _build_evidence_items(evidence_paths)
+    evidence_lines = ["evidence:"]
+    for item in items:
+        claim = _sanitize_evidence_value(item.get("claim", ""))
+        source = _sanitize_evidence_value(item.get("source", "missing")) or "missing"
+        evidence_lines.append(f'{{claim: "{claim}", source: "{source}"}}')
+    path_lines = [f"- {_sanitize_evidence_value(path)}" for path in (evidence_paths or [])[:8]]
+    if not path_lines:
+        path_lines = ["- missing"]
+    evidence_block = "\n".join(evidence_lines + ["", "Artifacts:"] + path_lines)
+    if header_match:
+        prefix = report[: header_match.end()]
+        suffix = report[header_match.end():].lstrip("\n")
+        return _normalize_evidence_sources(f"{prefix}\n\n{evidence_block}\n\n{suffix}")
+    return _normalize_evidence_sources(report.rstrip() + "\n\n## Evidencia usada\n\n" + evidence_block + "\n")
 
 def _extract_numeric_metrics(metrics: Dict[str, Any], max_items: int = 8):
     if not isinstance(metrics, dict):
@@ -895,6 +975,9 @@ class BusinessTranslatorAgent:
 
         === SENIOR TRANSLATION PROTOCOL ===
         $senior_translation_protocol
+
+        === EVIDENCE RULE ===
+        $senior_evidence_rule
         
         *** FORMATTING CONSTRAINTS (CRITICAL) ***
         1. **LANGUAGE:** DETECT the language of the 'Business Objective' in the state. GENERATE THE REPORT IN THAT SAME LANGUAGE. (If objective is Spanish, output Spanish).
@@ -1068,7 +1151,10 @@ class BusinessTranslatorAgent:
         If Alignment Check is WARN or FAIL, explicitly state the limitation and whether it is data-limited
         or method-choice, and reflect it in Risks & Limitations.
 
-        End the report with a final section titled "Evidencia usada" listing up to 8 artifact paths from Evidence Paths.
+        End the report with a final section titled "Evidencia usada" that includes:
+        - A mini-section labeled "evidence" (use the literal word "evidence", do NOT translate) with 3-8 items formatted as {claim: "...", source: "..."}.
+          If evidence is missing, set source="missing". Sources must be artifact paths or script paths; otherwise use source="missing".
+        - A bullet list of up to 8 artifact paths from Evidence Paths.
                 OUTPUT: Markdown format (NO TABLES).
         """)
         
@@ -1082,6 +1168,7 @@ class BusinessTranslatorAgent:
             executive_decision_label=executive_decision_label,
             error_condition=error_condition_str,
             senior_translation_protocol=SENIOR_TRANSLATION_PROTOCOL,
+            senior_evidence_rule=SENIOR_EVIDENCE_RULE,
             visuals_context_json=visuals_context_json,
             analysis_type=analysis_type,
             contract_context=json.dumps(contract_context, ensure_ascii=False),
@@ -1133,6 +1220,7 @@ class BusinessTranslatorAgent:
         Do NOT invent numbers or claims not supported by the artifacts.
         Follow reporting_policy.slots. If a required slot is missing, write "No disponible" and cite missing sources.
         Cite source artifact names for all metrics (e.g., "Fuente: metrics.json").
+        Include the "Evidencia usada" section with the required mini-section labeled "evidence" and {claim, source} items.
         """
 
         user_message = render_prompt(
@@ -1147,6 +1235,7 @@ class BusinessTranslatorAgent:
             response = self.model.generate_content(full_prompt)
             content = (getattr(response, "text", "") or "").strip()
             content = _sanitize_report_text(content)
+            content = _ensure_evidence_section(content, evidence_paths)
             self.last_response = content
             return content
         except Exception as e:

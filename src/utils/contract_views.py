@@ -874,6 +874,15 @@ def build_ml_view(
         "required_outputs": required_outputs,
         "validation_requirements": validation,
     }
+    training_rows_rule = contract_min.get("training_rows_rule") or contract_full.get("training_rows_rule")
+    scoring_rows_rule = contract_min.get("scoring_rows_rule") or contract_full.get("scoring_rows_rule")
+    data_partitioning_notes = contract_min.get("data_partitioning_notes") or contract_full.get("data_partitioning_notes")
+    if training_rows_rule:
+        view["training_rows_rule"] = training_rows_rule
+    if scoring_rows_rule:
+        view["scoring_rows_rule"] = scoring_rows_rule
+    if isinstance(data_partitioning_notes, list) and data_partitioning_notes:
+        view["data_partitioning_notes"] = data_partitioning_notes
     identifier_policy = {
         "strict_forbidden": strict_forbidden,
         "candidates": candidate_ids,

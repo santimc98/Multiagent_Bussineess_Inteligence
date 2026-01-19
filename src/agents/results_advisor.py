@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from src.utils.retries import call_with_retries
+from src.utils.senior_protocol import SENIOR_EVIDENCE_RULE
 
 load_dotenv()
 
@@ -45,12 +46,20 @@ class ResultsAdvisorAgent:
         context_snippet = self._truncate(json.dumps(context, ensure_ascii=True), 4000)
         system_prompt = (
             "You are a senior ML reviewer focused on business alignment. "
+            "=== EVIDENCE RULE ===\n"
+            + SENIOR_EVIDENCE_RULE
+            + "\n"
             "Given evaluation artifacts and business alignment, produce improvement guidance. "
             "Prioritize structural changes when alignment metrics fail (objective/constraints/penalties) "
             "before tuning hyperparameters. Compare current vs previous iteration if provided. "
             "Return 3-6 short lines. Format each line as: "
             "ISSUE: <what failed>; WHY: <root cause>; FIX: <specific change>. "
-            "Do NOT include code. Do NOT restate the full metrics dump."
+            "Do NOT include code. Do NOT restate the full metrics dump. "
+            "Then add a mini-section:\n"
+            "evidence:\n"
+            "- claim: <short claim>; source: <artifact_path#key_or_script_path:line or missing>\n"
+            "Provide 3-8 evidence items; if evidence is missing, use source=missing. "
+            "Evidence sources must be artifact paths or script paths; otherwise use source=missing."
         )
         user_prompt = "CONTEXT:\n" + context_snippet + "\n"
         self.last_prompt = system_prompt + "\n\n" + user_prompt
@@ -814,4 +823,7 @@ class ResultsAdvisorAgent:
             lines.append(
                 "ISSUE: limited insights; WHY: insufficient artifacts; FIX: produce metrics, predictions, and error analysis."
             )
-        return "\n".join(lines)
+        evidence_lines = ["evidence:"]
+        for line in lines[:3]:
+            evidence_lines.append(f"- claim: {line}; source: missing")
+        return "\n".join(lines + evidence_lines)

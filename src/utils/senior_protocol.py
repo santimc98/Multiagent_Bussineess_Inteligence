@@ -63,3 +63,11 @@ Translation guardrails
 - Preserve a clear story arc: objective -> evidence -> decision -> risks -> actions.
 - If evidence is missing, state it and avoid over-claiming.
 """.strip()
+
+
+SENIOR_EVIDENCE_RULE = """
+EVIDENCE RULE
+- Any material claim must cite the exact source: (artifact path + field/key) or (script path + approximate line).
+- If evidence is not available in context, say: "No verificable con artifacts actuales" and do not invent it.
+- Recommended citation format: [source: data/metrics.json -> cv_accuracy_mean]
+""".strip()
