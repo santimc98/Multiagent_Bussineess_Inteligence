@@ -14,6 +14,27 @@ _DATETIME_TOKENS = {"date", "time", "timestamp", "datetime"}
 _TEXT_TOKENS = {"text", "description", "comment", "note", "message", "summary"}
 _ID_TOKENS = {"id", "uuid", "guid", "key", "identifier"}
 _SUSPECT_TOKENS = {"target", "label", "outcome", "response", "gt", "groundtruth", "leak"}
+_GENERIC_BOOLEAN_TOKENS = {"flag", "is", "has", "active", "enabled", "ok", "valid", "approved", "closed", "binary", "confirmed"}
+_CONFIDENCE_THRESHOLDS = {"high": 4.0, "medium": 2.0}
+_TEXT_OBJECTIVE_TOKENS = {"text", "nlp", "language", "sentiment", "topic", "document", "comment", "message", "description", "summary"}
+_GENERIC_BINARY_VALUE_SETS = [
+    {"0", "1"},
+    {"1", "0"},
+    {"true", "false"},
+    {"false", "true"},
+    {"yes", "no"},
+    {"no", "yes"},
+    {"y", "n"},
+    {"n", "y"},
+    {"m", "f"},
+    {"f", "m"},
+    {"male", "female"},
+    {"female", "male"},
+    {"on", "off"},
+    {"off", "on"},
+    {"t", "f"},
+    {"f", "t"},
+]
 
 
 def _normalize_name(name: str) -> str:
@@ -109,14 +130,19 @@ def infer_dataset_semantics(
     csv_path: str,
     dialect: Dict[str, Any],
     contract_min: Optional[Dict[str, Any]],
+    text_context: str | None = None,
     max_sample_rows: int = 2000,
 ) -> Dict[str, Any]:
     result = {
         "column_roles": {},
         "target_analysis": {
             "target_candidates": [],
+            "alternative_candidates": [],
             "partial_label_detected": False,
             "labeled_row_heuristic": "no_target_detected",
+            "primary_target": None,
+            "target_unclear": False,
+            "target_unclear_reason": "",
         },
         "partition_analysis": {"partition_columns": [], "per_partition_counts": {}},
         "leakage_risks": {"correlated_with_target": [], "suspicious_name_columns": []},
@@ -151,48 +177,172 @@ def infer_dataset_semantics(
         column_stats[col] = _analyze_column(df_sample[col], decimal)
 
     contract_min = contract_min if isinstance(contract_min, dict) else {}
-    contract_targets = [
-        str(col)
-        for col in (contract_min.get("outcome_columns") or [])
-        if col in columns
-    ]
+    contract_targets = [str(col) for col in (contract_min.get("outcome_columns") or []) if col]
+    contract_targets_present = [col for col in contract_targets if col in columns]
     target_candidates: List[Dict[str, Any]] = []
-    for col in contract_targets:
-        stats = column_stats.get(col, {})
-        target_candidates.append(
-            {
-                "column": col,
-                "null_frac": float(stats.get("null_frac", 1.0)),
-                "n_unique": int(stats.get("n_unique", 0)),
-                "is_binary_like": bool(stats.get("is_binary_like", False)),
-                "is_numeric_like": bool(stats.get("is_numeric_like", False)),
-                "source": "contract",
-            }
-        )
+    alternative_candidates: List[Dict[str, Any]] = []
 
-    for col in columns:
-        if col in contract_targets:
-            continue
+    def _build_contract_candidate(column: str) -> Dict[str, Any]:
+        stats = column_stats.get(column, {})
+        present = column in columns and column in column_stats
+        why = ["Declared as outcome in contract", "Contract-defined outcomes take precedence over heuristics"]
+        if not present:
+            why.append("Outcome column missing from sample/header")
+        return {
+            "column": column,
+            "null_frac": float(stats.get("null_frac", 1.0)),
+            "n_unique": int(stats.get("n_unique", 0)),
+            "is_binary_like": bool(stats.get("is_binary_like", False)),
+            "is_numeric_like": bool(stats.get("is_numeric_like", False)),
+            "source": "contract",
+            "confidence": "high",
+            "why_candidate": why[:5],
+        }
+
+    def _is_text_objective(text: str | None) -> bool:
+        if not text:
+            return False
+        normalized = _normalize_name(text)
+        if not normalized:
+            return False
+        return any(tok in normalized for tok in _TEXT_OBJECTIVE_TOKENS)
+
+    text_objective = _is_text_objective(text_context)
+    text_context_value = text_context or ""
+    text_context_lower = text_context_value.lower() if isinstance(text_context_value, str) else ""
+    text_context_norm = _normalize_name(text_context_value)
+
+    def _is_generic_binary_column(name: str) -> bool:
+        if not name:
+            return False
+        norm = _normalize_name(name)
+        for tok in _GENERIC_BOOLEAN_TOKENS:
+            if norm == tok or norm.startswith(f"{tok}"):
+                return True
+        return False
+
+    def _is_generic_binary_values(series: pd.Series) -> bool:
+        if series is None or series.empty:
+            return False
+        mask = _null_mask(series)
+        values = series[~mask].astype(str).str.strip().str.lower()
+        if values.empty:
+            return False
+        unique_vals = {val for val in values if val}
+        if len(unique_vals) < 2 or len(unique_vals) > 4:
+            return False
+        return any(unique_vals <= expected for expected in _GENERIC_BINARY_VALUE_SETS)
+
+    def _score_heuristic_candidate(col: str, source_tag: str = "heuristic") -> Optional[Dict[str, Any]]:
         stats = column_stats.get(col, {})
         if not stats:
-            continue
-        is_target_like = _has_token(col, _TARGET_TOKENS) or (
-            stats.get("is_binary_like")
-            and not _has_token(col, _ID_TOKENS)
-            and not _has_token(col, _PARTITION_NAME_TOKENS)
-        )
-        if not is_target_like:
-            continue
-        target_candidates.append(
-            {
-                "column": col,
-                "null_frac": float(stats.get("null_frac", 1.0)),
-                "n_unique": int(stats.get("n_unique", 0)),
-                "is_binary_like": bool(stats.get("is_binary_like", False)),
-                "is_numeric_like": bool(stats.get("is_numeric_like", False)),
-                "source": "heuristic",
-            }
-        )
+            return None
+        score = 0.0
+        reasons: List[str] = []
+        signals = {"target_token": False, "null_frac": False, "correlation": False, "text_context": False}
+        if _has_token(col, _TARGET_TOKENS):
+            score += 2.0
+            reasons.append("name contains target token")
+            signals["target_token"] = True
+        null_frac = float(stats.get("null_frac", 1.0))
+        if 0.0 < null_frac < 0.9:
+            score += 1.0
+            reasons.append("moderate null fraction suggests label partiality")
+            signals["null_frac"] = True
+        if stats.get("is_binary_like"):
+            reasons.append("binary signature present")
+        if stats.get("is_numeric_like") and stats.get("n_unique", 0) > 1:
+            col_series = _numeric_series(df_sample[col], decimal)
+            corr_bonus = False
+            for other_col in columns:
+                if other_col == col or other_col not in df_sample.columns:
+                    continue
+                other_stats = column_stats.get(other_col, {})
+                if not other_stats or not other_stats.get("is_numeric_like"):
+                    continue
+                other_series = _numeric_series(df_sample[other_col], decimal)
+                valid = col_series.notna() & other_series.notna()
+                if int(valid.sum()) < 30:
+                    continue
+                corr = float(col_series[valid].corr(other_series[valid]))
+                if pd.isna(corr):
+                    continue
+                if abs(corr) >= 0.4:
+                    score += 1.0
+                    corr_bonus = True
+                    reasons.append(f"correlation found with {other_col}")
+                    signals["correlation"] = True
+                    break
+            if not corr_bonus:
+                reasons.append("numeric column without strong correlation")
+        if text_context_lower and (col.lower() in text_context_lower or _normalize_name(col) in text_context_norm):
+            score += 1.0
+            reasons.append("column referenced in contract/business text")
+            signals["text_context"] = True
+        if _has_token(col, _ID_TOKENS) or (
+            stats.get("unique_ratio", 0.0) >= 0.95 and stats.get("n_unique", 0) >= 20
+        ):
+            score -= 4.0
+            reasons.append("identifier-like signature detected (penalized)")
+        if stats.get("is_binary_like"):
+            generic_binary = _is_generic_binary_column(col) or _is_generic_binary_values(df_sample[col])
+            if generic_binary and not any(signals.values()):
+                score -= 1.0
+                reasons.append("generic binary indicator without target signals (penalized)")
+        value_hits = _detect_partition_values(df_sample[col])
+        if value_hits.get("train_like") or value_hits.get("test_like") or _has_token(col, _PARTITION_NAME_TOKENS):
+            score -= 4.0
+            reasons.append("partition signature detected (penalized)")
+        if stats.get("avg_len", 0.0) >= 20 and stats.get("unique_ratio", 0.0) >= 0.3:
+            if text_objective:
+                reasons.append("text-like column allowed by objective")
+            else:
+                score -= 2.0
+                reasons.append("long text-like column (penalized)")
+        if stats.get("n_unique", 0) <= 1:
+            score -= 5.0
+            reasons.append("constant-like column (penalized)")
+        datetime_ratio = _parse_datetime_ratio(df_sample[col])
+        if _has_token(col, _DATETIME_TOKENS) or datetime_ratio >= 0.7:
+            score -= 2.0
+            reasons.append("datetime feature detected (deprioritized)")
+
+        if score <= 0:
+            return None
+        confidence = "high" if score >= _CONFIDENCE_THRESHOLDS["high"] else "medium" if score >= _CONFIDENCE_THRESHOLDS["medium"] else "low"
+        if len(reasons) < 2:
+            reasons.append("limited signals; treat as tentative")
+        return {
+            "column": col,
+            "null_frac": float(stats.get("null_frac", 1.0)),
+            "n_unique": int(stats.get("n_unique", 0)),
+            "is_binary_like": bool(stats.get("is_binary_like", False)),
+            "is_numeric_like": bool(stats.get("is_numeric_like", False)),
+            "source": source_tag,
+            "confidence": confidence,
+            "why_candidate": reasons[:5],
+            "score": score,
+        }
+
+    for col in contract_targets:
+        target_candidates.append(_build_contract_candidate(col))
+
+    if contract_targets:
+        for col in columns:
+            if col in contract_targets:
+                continue
+            candidate = _score_heuristic_candidate(col, source_tag="heuristic_hint")
+            if candidate:
+                alternative_candidates.append(candidate)
+        alternative_candidates.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+        alternative_candidates = alternative_candidates[:3]
+        if alternative_candidates:
+            result["target_analysis"]["alternative_candidates"] = alternative_candidates
+    else:
+        for col in columns:
+            candidate = _score_heuristic_candidate(col)
+            if candidate:
+                target_candidates.append(candidate)
 
     seen_targets = set()
     deduped_targets = []
@@ -201,23 +351,31 @@ def infer_dataset_semantics(
         if name and name not in seen_targets:
             seen_targets.add(name)
             deduped_targets.append(item)
-    target_candidates = deduped_targets[:8]
+    if contract_targets:
+        target_candidates = deduped_targets
+    else:
+        deduped_targets.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+        target_candidates = deduped_targets[:3]
+
     result["target_analysis"]["target_candidates"] = target_candidates
 
     primary_target = None
     if contract_targets:
         primary_target = contract_targets[0]
-    else:
-        scored = []
-        for item in target_candidates:
-            col = item.get("column")
-            if not col:
-                continue
-            stats = column_stats.get(col, {})
-            scored.append((_score_target_candidate(col, stats), col))
-        if scored:
-            scored.sort(reverse=True)
-            primary_target = scored[0][1]
+    elif target_candidates:
+        highest_score = max((item.get("score", 0.0) for item in target_candidates), default=0.0)
+        if highest_score >= _CONFIDENCE_THRESHOLDS["medium"]:
+            primary_target = target_candidates[0].get("column")
+
+    if not contract_targets:
+        if not target_candidates:
+            result["target_analysis"]["target_unclear"] = True
+            result["target_analysis"]["target_unclear_reason"] = "no candidate exceeded heuristic threshold"
+        else:
+            highest_score = max((item.get("score", 0.0) for item in target_candidates), default=0.0)
+            if highest_score < _CONFIDENCE_THRESHOLDS["medium"]:
+                result["target_analysis"]["target_unclear"] = True
+                result["target_analysis"]["target_unclear_reason"] = "all heuristics scored below medium confidence"
 
     if primary_target and primary_target in column_stats:
         stats = column_stats[primary_target]
@@ -225,6 +383,7 @@ def infer_dataset_semantics(
         partial_labels = null_frac > 0.0 and null_frac < 1.0
         result["target_analysis"]["partial_label_detected"] = partial_labels
         result["target_analysis"]["labeled_row_heuristic"] = f"target_notnull:{primary_target}"
+        result["target_analysis"]["primary_target"] = primary_target
     elif target_candidates:
         result["target_analysis"]["labeled_row_heuristic"] = "target_detected_but_not_in_sample"
 
@@ -252,6 +411,12 @@ def infer_dataset_semantics(
 
     column_roles: Dict[str, str] = {}
     dropped_high_card = []
+    target_role_cols = set()
+    for item in target_candidates:
+        if item.get("source") == "contract" or item.get("confidence") in {"medium", "high"}:
+            if item.get("column"):
+                target_role_cols.add(item.get("column"))
+
     for col in columns:
         stats = column_stats.get(col, {})
         if not stats:
@@ -259,7 +424,7 @@ def infer_dataset_semantics(
         if stats.get("n_unique", 0) <= 1:
             column_roles[col] = "constant_like"
             continue
-        if col in [item.get("column") for item in target_candidates]:
+        if col in target_role_cols:
             column_roles[col] = "target_candidate"
             continue
         if col in partition_columns:
@@ -323,6 +488,9 @@ def infer_dataset_semantics(
     notes = []
     if contract_targets:
         notes.append(f"Contract outcome columns present: {contract_targets}")
+        missing_contract = [col for col in contract_targets if col not in contract_targets_present]
+        if missing_contract:
+            notes.append(f"Contract outcomes missing from sample/header: {missing_contract[:5]}")
     if target_candidates:
         notes.append("Target candidates inferred from contract/heuristics.")
     else:
@@ -367,27 +535,26 @@ def choose_training_mask(
 ) -> Dict[str, Any]:
     contract_min = contract_min if isinstance(contract_min, dict) else {}
     target_candidates = semantics.get("target_analysis", {}).get("target_candidates") or []
-    contract_targets = contract_min.get("outcome_columns") or []
-    target_col = None
-    for col in contract_targets:
-        if not target_col and isinstance(col, str):
-            target_col = col
-    if not target_col and target_candidates:
-        target_col = target_candidates[0].get("column")
+    contract_targets = [str(col) for col in (contract_min.get("outcome_columns") or []) if col]
+    primary_target = contract_targets[0] if contract_targets else (target_candidates[0].get("column") if target_candidates else None)
+    target_unclear = bool(semantics.get("target_analysis", {}).get("target_unclear"))
+    if not contract_targets and target_unclear:
+        primary_target = None
 
     partial_labels = bool(semantics.get("target_analysis", {}).get("partial_label_detected"))
     partition_cols = semantics.get("partition_analysis", {}).get("partition_columns") or []
 
     training_rule = "use all rows"
-    scoring_rule = "use all rows"
-    rationale = []
+    scoring_primary = "use all rows"
+    scoring_secondary = None
+    rationale: List[str] = []
 
-    if target_col:
-        rationale.append(f"target_selected={target_col}")
-    if partial_labels and target_col:
-        training_rule = f"use rows where {target_col} is not null"
-        scoring_rule = "use all rows"
-        rationale.append("partial labels detected in sample; restrict training to labeled rows")
+    if primary_target:
+        rationale.append(f"primary target inferred: {primary_target}")
+        if partial_labels:
+            training_rule = f"use rows where {primary_target} is not null"
+            scoring_secondary = f"use rows where {primary_target} is null"
+            rationale.append("partial labels detected -> training limited to labeled rows")
 
     if df_sample is not None and partition_cols:
         for col in partition_cols:
@@ -398,20 +565,27 @@ def choose_training_mask(
             test_like = value_hits.get("test_like") or []
             if train_like or test_like:
                 if train_like:
-                    rule = f"use partition column {col} with values in {train_like}"
-                    if partial_labels and target_col:
-                        rule = f"use rows where {target_col} is not null and {col} in {train_like}"
-                    training_rule = rule
+                    base_rule = f"use partition column {col} with values in {train_like}"
+                    training_rule = (
+                        f"{base_rule} and {primary_target} not null"
+                        if partial_labels and primary_target
+                        else base_rule
+                    )
+                    rationale.append(f"partition {col} has train-like values {train_like}")
                 if test_like:
-                    scoring_rule = f"use partition column {col} with values in {test_like}"
-                rationale.append(f"partition column {col} has split-like values")
+                    if partial_labels:
+                        rationale.append(f"partition {col} has scoring subset {test_like} (kept as secondary hint)")
+                    else:
+                        scoring_primary = f"use partition column {col} with values in {test_like}"
+                        rationale.append(f"partition {col} has scoring subset {test_like}")
                 break
-        if partition_cols and "partition column" not in " ".join(rationale):
-            rationale.append("partition column detected but no clear split labels in sample")
+        if partition_cols and not any("partition column" in note for note in rationale):
+            rationale.append("partition columns detected but no clear split labels")
 
     return {
         "training_rows_rule": training_rule,
-        "scoring_rows_rule": scoring_rule,
+        "scoring_rows_rule_primary": scoring_primary,
+        "scoring_rows_rule_secondary": scoring_secondary,
         "rationale": rationale[:6],
     }
 
@@ -423,7 +597,17 @@ def summarize_dataset_semantics(
 ) -> str:
     training_mask = training_mask if isinstance(training_mask, dict) else {}
     target_candidates = semantics.get("target_analysis", {}).get("target_candidates") or []
-    target_cols = [item.get("column") for item in target_candidates if item.get("column")]
+    target_details = [
+        f"{item.get('column')}({item.get('confidence', 'low')})"
+        for item in target_candidates
+        if item.get("column")
+    ]
+    alt_candidates = semantics.get("target_analysis", {}).get("alternative_candidates") or []
+    alt_details = [
+        f"{item.get('column')}({item.get('confidence', 'low')})"
+        for item in alt_candidates
+        if item.get("column")
+    ]
     partition_cols = semantics.get("partition_analysis", {}).get("partition_columns") or []
     column_roles = semantics.get("column_roles") or {}
     id_like = [col for col, role in column_roles.items() if role == "id_like"]
@@ -439,12 +623,17 @@ def summarize_dataset_semantics(
 
     lines = []
     lines.append("DATASET_SEMANTICS_SUMMARY:")
-    lines.append(f"- target_candidates: {target_cols[:5] if target_cols else 'none'}")
+    lines.append(f"- target_candidates: {target_details[:5] if target_details else 'none'}")
     lines.append(f"- partial_label_detected: {bool(partial_labels)}")
     lines.append(f"- labeled_row_heuristic: {labeled_heuristic}")
     lines.append(f"- partition_columns: {partition_cols[:5] if partition_cols else 'none'}")
     lines.append(f"- training_rows_rule: {training_mask.get('training_rows_rule', 'use all rows')}")
-    lines.append(f"- scoring_rows_rule: {training_mask.get('scoring_rows_rule', 'use all rows')}")
+    lines.append(
+        f"- scoring_rows_rule_primary: {training_mask.get('scoring_rows_rule_primary', 'use all rows')}"
+    )
+    secondary = training_mask.get("scoring_rows_rule_secondary")
+    if secondary:
+        lines.append(f"- scoring_rows_rule_secondary: {secondary}")
     rationale = training_mask.get("rationale") or []
     if rationale:
         lines.append(f"- rationale: {rationale[:3]}")
@@ -454,6 +643,8 @@ def summarize_dataset_semantics(
     lines.append(f"- high_cardinality: {high_card[:5] if high_card else 'none'}")
     lines.append(f"- constant_like: {constant_like[:5] if constant_like else 'none'}")
     lines.append(f"- leakage_name_suspects: {leakage_names[:5] if leakage_names else 'none'}")
+    if alt_details:
+        lines.append(f"- target_candidate_alternatives: {alt_details[:3]}")
     lines.append(f"- leakage_top_correlations: {corr_cols[:5] if corr_cols else 'none'}")
 
     return "\n".join(lines[:max_lines])

@@ -738,18 +738,37 @@ class MLEngineerAgent:
          TRAINING DATA SELECTION (REASONED)
          - Read execution_contract (or contract_min) for outcome_columns and optional fields:
            * training_rows_rule
-           * scoring_rows_rule
+           * scoring_rows_rule (primary)
+           * secondary_scoring_subset (optional)
            * data_partitioning_notes
          - If those rules exist, implement them exactly.
+         - Scoring guidance:
+           * Always produce scored_rows.csv for the primary scoring_rows_rule.
+           * If scoring_rows_rule says "use all rows", score all rows.
+           * If secondary_scoring_subset exists, keep scored_rows.csv for the primary rule and either:
+             - add a labeled/unlabeled flag column (only if allowed by the contract schema), or
+             - emit a separate artifact and document it.
          - If rules are absent, use the Dataset Semantics Summary in data_audit_context:
            * If partial_label_detected=True, train ONLY on rows where the target is not null; score all rows.
-           * If partition_columns are listed and split-like values are identified, use that partitioning for train/score.
+           * If partition_columns are listed and split-like values are identified, use that partitioning for training, but keep scoring all rows unless the contract says otherwise.
          - Do NOT hardcode column names. Use the detected target/partition columns from contract or dataset semantics.
          - Decision Log must include:
            * Target chosen
            * Training rows rule
            * Scoring rows rule
+           * Secondary scoring subset (if any)
            * Evidence (e.g., null_frac or partition evidence from dataset_semantics.json)
+
+         ROW-LEVEL EXPLANATIONS (MANDATORY IF CONTRACT REQUIRES DRIVERS/EXPLANATIONS)
+         - Each row must have top_drivers with 2-3 drivers and direction (e.g., "Age low (down), Income high (up)").
+         - Allowed methods (choose ONE, justify in comments):
+           A) Linear/logistic model: rank by coefficient * feature_value (post-processing space).
+           B) Tree/boosting: use global feature_importances and adjust by row deviation vs median.
+           C) Simple rule-based: use z-scores of key features when no interpretable model is available.
+         - Record in metrics.json (or a small artifact):
+           * explanation_method
+           * features_used_for_explanations (max 10)
+         - If the method yields identical drivers for all rows, add context-by-values so row-level drivers differ.
 
          ML BEST PRACTICES CHECKLIST (Quality Assurance):
          [ ] NO NaN HYPOTHESES: Before .fit(), you MUST check for NaNs in X and impute (SimpleImputer) or drop them. Scikit-learn models crash on NaNs.

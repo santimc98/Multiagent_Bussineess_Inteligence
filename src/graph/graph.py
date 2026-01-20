@@ -22,6 +22,7 @@ except Exception:
 Sandbox = CodeSandbox
 from dotenv import load_dotenv
 import base64
+import pandas as pd
 
 # Add src to path to allow imports if running from root
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
@@ -1108,12 +1109,55 @@ def _estimate_row_count(csv_path: str, encoding: str = "utf-8") -> int | None:
     except Exception:
         return None
 
+def _compute_exact_non_null_ratio(
+    csv_path: str,
+    dialect: Dict[str, Any],
+    column_name: str,
+    chunk_size: int = 50000,
+) -> float | None:
+    if not csv_path or not column_name or not os.path.exists(csv_path):
+        return None
+    sep = dialect.get("sep") or ","
+    decimal = dialect.get("decimal") or "."
+    encoding = dialect.get("encoding") or "utf-8"
+    total = 0
+    non_null = 0
+    null_tokens = {"", "na", "n/a", "nan", "null", "none", "nat"}
+    try:
+        for chunk in pd.read_csv(
+            csv_path,
+            sep=sep,
+            decimal=decimal,
+            encoding=encoding,
+            usecols=[column_name],
+            chunksize=chunk_size,
+            dtype=str,
+            low_memory=False,
+        ):
+            if column_name not in chunk.columns:
+                continue
+            series = chunk[column_name]
+            mask = series.isna()
+            try:
+                lowered = series.astype(str).str.strip().str.lower()
+                mask = mask | lowered.isin(null_tokens)
+            except Exception:
+                pass
+            total += int(series.shape[0])
+            non_null += int((~mask).sum())
+    except Exception:
+        return None
+    if total <= 0:
+        return None
+    return float(non_null / total)
+
 def _build_signal_summary_context(
     csv_path: str,
     dialect: Dict[str, Any],
     required_cols: List[str],
     norm_map: Dict[str, str],
     header_cols: List[str],
+    dataset_semantics: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     summary: Dict[str, Any] = {}
     manifest = _load_json_safe("data/cleaning_manifest.json")
@@ -1122,6 +1166,15 @@ def _build_signal_summary_context(
         summary["row_count"] = row_count
     if header_cols:
         summary["column_count"] = len(header_cols)
+    target_canon = None
+    target_raw = None
+    if isinstance(dataset_semantics, dict):
+        target_analysis = dataset_semantics.get("target_analysis") or {}
+        if target_analysis.get("partial_label_detected"):
+            target_canon = target_analysis.get("primary_target")
+            if target_canon:
+                target_norm = _norm_name(str(target_canon))
+                target_raw = norm_map.get(target_norm, target_canon if target_canon in header_cols else None)
     if required_cols:
         summary["required_columns"] = required_cols
         summary["required_feature_count"] = len(required_cols)
@@ -1158,6 +1211,20 @@ def _build_signal_summary_context(
                     "sample_examples": examples,
                 }
             if stats:
+                if target_raw and target_canon:
+                    exact_ratio = _compute_exact_non_null_ratio(csv_path, dialect, target_raw)
+                    if exact_ratio is not None:
+                        for canon, payload in stats.items():
+                            if payload.get("raw_column") == target_raw or canon == target_canon:
+                                payload.pop("sample_non_null_ratio", None)
+                                payload["exact_non_null_ratio"] = exact_ratio
+                                break
+                        else:
+                            summary["target_column_stats"] = {
+                                "column": target_canon,
+                                "raw_column": target_raw,
+                                "exact_non_null_ratio": exact_ratio,
+                            }
                 summary["required_column_sample_stats"] = stats
         required_raw = set(canon_to_raw.values())
         candidate_cols = [col for col in header_cols if col not in required_raw]
@@ -1198,6 +1265,22 @@ def _build_signal_summary_context(
                     )
                 if candidate_stats:
                     summary["candidate_columns"] = candidate_stats
+    if target_raw and target_canon:
+        has_exact = False
+        stats_payload = summary.get("required_column_sample_stats")
+        if isinstance(stats_payload, dict):
+            for payload in stats_payload.values():
+                if isinstance(payload, dict) and "exact_non_null_ratio" in payload:
+                    has_exact = True
+                    break
+        if not has_exact and "target_column_stats" not in summary:
+            exact_ratio = _compute_exact_non_null_ratio(csv_path, dialect, target_raw)
+            if exact_ratio is not None:
+                summary["target_column_stats"] = {
+                    "column": target_canon,
+                    "raw_column": target_raw,
+                    "exact_non_null_ratio": exact_ratio,
+                }
     return summary
 
 def _build_required_raw_map(
@@ -6243,10 +6326,14 @@ def run_steward(state: AgentState) -> AgentState:
     try:
         dialect_payload = {"encoding": encoding, "sep": sep, "decimal": decimal}
         contract_min = state.get("execution_contract_min") or _load_json_safe("data/contract_min.json") or {}
+        text_context = state.get("business_objective") if isinstance(state, dict) else ""
+        if not text_context and isinstance(contract_min, dict):
+            text_context = contract_min.get("business_objective") or ""
         dataset_semantics = infer_dataset_semantics(
             csv_path=csv_path,
             dialect=dialect_payload,
             contract_min=contract_min,
+            text_context=text_context,
             max_sample_rows=2000,
         )
         df_sample = None
@@ -6640,6 +6727,32 @@ def run_execution_planner(state: AgentState) -> AgentState:
             )
         except Exception:
             contract_min = None
+    dataset_semantics = state.get("dataset_semantics") if isinstance(state, dict) else {}
+    dataset_training_mask = state.get("dataset_training_mask") if isinstance(state, dict) else {}
+    partial_labels = bool(
+        isinstance(dataset_semantics, dict)
+        and isinstance(dataset_semantics.get("target_analysis"), dict)
+        and dataset_semantics.get("target_analysis", {}).get("partial_label_detected")
+    )
+    if partial_labels and isinstance(contract, dict):
+        training_rule = dataset_training_mask.get("training_rows_rule") if isinstance(dataset_training_mask, dict) else None
+        scoring_primary = dataset_training_mask.get("scoring_rows_rule_primary") if isinstance(dataset_training_mask, dict) else None
+        scoring_secondary = dataset_training_mask.get("scoring_rows_rule_secondary") if isinstance(dataset_training_mask, dict) else None
+        if training_rule and not contract.get("training_rows_rule"):
+            contract["training_rows_rule"] = training_rule
+        if not scoring_primary:
+            scoring_primary = "use all rows"
+        if scoring_primary and not contract.get("scoring_rows_rule"):
+            contract["scoring_rows_rule"] = scoring_primary
+        if scoring_secondary and not contract.get("secondary_scoring_subset"):
+            contract["secondary_scoring_subset"] = scoring_secondary
+        if isinstance(contract_min, dict):
+            if training_rule and not contract_min.get("training_rows_rule"):
+                contract_min["training_rows_rule"] = training_rule
+            if scoring_primary and not contract_min.get("scoring_rows_rule"):
+                contract_min["scoring_rows_rule"] = scoring_primary
+            if scoring_secondary and not contract_min.get("secondary_scoring_subset"):
+                contract_min["secondary_scoring_subset"] = scoring_secondary
     contract_for_eval = dict(contract) if isinstance(contract, dict) else {}
     if isinstance(contract_min, dict) and contract_min:
         artifact_requirements = contract_min.get(
@@ -8813,6 +8926,7 @@ def run_engineer(state: AgentState) -> AgentState:
                 required_input_cols,
                 norm_map,
                 header_cols,
+                state.get("dataset_semantics") if isinstance(state, dict) else None,
             )
             if signal_summary:
                 context_ops_blocks.append(

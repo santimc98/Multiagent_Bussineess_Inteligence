@@ -61,11 +61,12 @@ Before generating the contract:
 * Explicitly declare:
   - Which column(s) are treated as outcome/target (or unknown if none).
   - Whether partial labels are present (labeled vs unlabeled rows).
-  - The training_rows_rule and scoring_rows_rule you will apply.
+  - The training_rows_rule, scoring_rows_rule, and any secondary_scoring_subset you will apply.
   - data_partitioning_notes as a short list of any partitioning assumptions.
 * Include the optional fields below ONLY if partial labels are detected or partition columns exist:
   - training_rows_rule (string)
   - scoring_rows_rule (string)
+  - secondary_scoring_subset (string)
   - data_partitioning_notes (list of strings)
 * If partial labels are NOT detected and no partition columns exist, omit these fields.
 

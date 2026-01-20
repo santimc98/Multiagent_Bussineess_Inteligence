@@ -1390,6 +1390,7 @@ def build_contract_min(
     cleaning_gates = _apply_cleaning_gate_policy(contract.get("cleaning_gates"))
     training_rows_rule = contract.get("training_rows_rule")
     scoring_rows_rule = contract.get("scoring_rows_rule")
+    secondary_scoring_subset = contract.get("secondary_scoring_subset")
     data_partitioning_notes = contract.get("data_partitioning_notes")
     if not isinstance(data_partitioning_notes, list):
         data_partitioning_notes = []
@@ -1428,6 +1429,8 @@ def build_contract_min(
         contract_min["training_rows_rule"] = training_rows_rule
     if scoring_rows_rule:
         contract_min["scoring_rows_rule"] = scoring_rows_rule
+    if secondary_scoring_subset:
+        contract_min["secondary_scoring_subset"] = secondary_scoring_subset
     if data_partitioning_notes:
         contract_min["data_partitioning_notes"] = data_partitioning_notes
     return contract_min

@@ -876,11 +876,14 @@ def build_ml_view(
     }
     training_rows_rule = contract_min.get("training_rows_rule") or contract_full.get("training_rows_rule")
     scoring_rows_rule = contract_min.get("scoring_rows_rule") or contract_full.get("scoring_rows_rule")
+    secondary_scoring_subset = contract_min.get("secondary_scoring_subset") or contract_full.get("secondary_scoring_subset")
     data_partitioning_notes = contract_min.get("data_partitioning_notes") or contract_full.get("data_partitioning_notes")
     if training_rows_rule:
         view["training_rows_rule"] = training_rows_rule
     if scoring_rows_rule:
         view["scoring_rows_rule"] = scoring_rows_rule
+    if secondary_scoring_subset:
+        view["secondary_scoring_subset"] = secondary_scoring_subset
     if isinstance(data_partitioning_notes, list) and data_partitioning_notes:
         view["data_partitioning_notes"] = data_partitioning_notes
     identifier_policy = {
