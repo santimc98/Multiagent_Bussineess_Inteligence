@@ -168,7 +168,8 @@ def summarize_column_sets(column_sets: Dict[str, Any], max_sets: int = 5) -> str
                 detail = selector.get("pattern")
             else:
                 detail = selector_type
-            set_summaries.append(f"{name}({detail}, count={count})")
+            count_text = count if isinstance(count, int) else "unknown"
+            set_summaries.append(f"{name}({detail}, count={count_text})")
         lines.append(f"- sets: {set_summaries}")
     else:
         lines.append("- sets: none")

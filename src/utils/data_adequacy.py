@@ -319,20 +319,20 @@ def _align_quality_gates(
 
 def _find_target_column(contract: Dict[str, Any], df: pd.DataFrame | None) -> str | None:
     # V4.1: Use get_outcome_columns first
-    target_candidates = get_outcome_columns(contract)
+    target_columns = get_outcome_columns(contract)
     
     # Fallback: check column_roles for target-like roles
-    if not target_candidates:
+    if not target_columns:
         roles = get_column_roles(contract)
         target_roles = {"target", "outcome", "target_label", "derived_label"}
         for role in target_roles:
             if role in roles:
-                target_candidates.extend(roles[role])
+                target_columns.extend(roles[role])
     
-    for candidate in target_candidates:
+    for candidate in target_columns:
         if df is not None and candidate in df.columns:
             return candidate
-    return target_candidates[0] if target_candidates else None
+    return target_columns[0] if target_columns else None
 
 
 def _infer_target_kind(series: pd.Series | None) -> str:

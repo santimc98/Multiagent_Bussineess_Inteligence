@@ -147,12 +147,9 @@ from src.utils.ml_validation import validate_model_metrics_consistency, validate
 from src.utils.json_sanitize import dump_json
 from src.utils.run_facts_pack import build_run_facts_pack, format_run_facts_block
 from src.utils.context_pack import build_context_pack, compress_long_lists, summarize_long_list, COLUMN_LIST_POINTER
-from src.utils.dataset_semantics import (
-    infer_dataset_semantics,
-    choose_training_mask,
-    summarize_dataset_semantics,
-)
-from src.utils.column_sets import build_column_sets, summarize_column_sets
+from src.utils.dataset_semantics import summarize_dataset_semantics
+from src.utils.column_sets import summarize_column_sets
+from src.utils.dataset_evidence import read_header, scan_missingness, scan_uniques, sample_rows
 from src.utils.sandbox_paths import (
     CANONICAL_RAW_REL,
     CANONICAL_CLEANED_REL,
@@ -6557,13 +6554,7 @@ def run_steward(state: AgentState) -> AgentState:
     column_sets_summary = ""
     try:
         dialect_payload = {"encoding": encoding, "sep": sep, "decimal": decimal}
-        header_cols = []
-        try:
-            import pandas as pd
-            header_df = pd.read_csv(csv_path, nrows=0, sep=sep, decimal=decimal, encoding=encoding)
-            header_cols = header_df.columns.tolist()
-        except Exception as header_err:
-            print(f"Warning: failed to read CSV header: {header_err}")
+        header_cols = read_header(csv_path, dialect_payload)
         if header_cols:
             try:
                 column_inventory_payload = {
@@ -6581,45 +6572,73 @@ def run_steward(state: AgentState) -> AgentState:
                     "columns": header_cols,
                 }
                 state["column_inventory_columns"] = header_cols
-        contract_min = state.get("execution_contract_min") or _load_json_safe("data/contract_min.json") or {}
-        text_context = state.get("business_objective") if isinstance(state, dict) else ""
-        if not text_context and isinstance(contract_min, dict):
-            text_context = contract_min.get("business_objective") or ""
-        dataset_semantics = infer_dataset_semantics(
-            csv_path=csv_path,
-            dialect=dialect_payload,
-            contract_min=contract_min,
-            text_context=text_context,
-            max_sample_rows=2000,
-        )
-        df_sample = None
-        try:
-            import pandas as pd
-            df_sample = pd.read_csv(
-                csv_path,
-                nrows=2000,
-                sep=sep,
-                decimal=decimal,
-                encoding=encoding,
-                low_memory=False,
-                dtype=str,
+
+        header_preview = summarize_long_list(header_cols, head=12, tail=6) if header_cols else {"count": 0, "head": [], "tail": []}
+        sample_payload = sample_rows(csv_path, dialect_payload, head_n=50, tail_n=50, random_n=50, seed=42)
+        steward_pass1_input = {
+            "business_objective": state.get("business_objective") if isinstance(state, dict) else "",
+            "column_inventory_path": "data/column_inventory.json",
+            "column_inventory_preview": header_preview,
+            "sample_rows": sample_payload,
+        }
+        pass1_result = steward.decide_semantics_pass1(steward_pass1_input)
+        if not isinstance(pass1_result, dict) or not pass1_result.get("primary_target"):
+            pass1_result = steward.decide_semantics_pass1(
+                {**steward_pass1_input, "retry_reason": "primary_target_missing"}
             )
-        except Exception as sample_err:
-            print(f"Warning: failed to load dataset sample for training mask: {sample_err}")
-        dataset_training_mask = choose_training_mask(df_sample, dataset_semantics, contract_min)
+
+        primary_target = pass1_result.get("primary_target") if isinstance(pass1_result, dict) else None
+        split_candidates = pass1_result.get("split_candidates") if isinstance(pass1_result, dict) else []
+        id_candidates = pass1_result.get("id_candidates") if isinstance(pass1_result, dict) else []
+        if not isinstance(split_candidates, list):
+            split_candidates = []
+        if not isinstance(id_candidates, list):
+            id_candidates = []
+
+        target_missingness = {}
+        if primary_target:
+            target_missingness = scan_missingness(csv_path, dialect_payload, str(primary_target))
+        split_evidence = []
+        for col in split_candidates[:5]:
+            if not col:
+                continue
+            split_evidence.append(scan_uniques(csv_path, dialect_payload, str(col), max_unique=20))
+
+        steward_pass2_input = {
+            "business_objective": state.get("business_objective") if isinstance(state, dict) else "",
+            "primary_target": primary_target,
+            "split_candidates": split_candidates,
+            "id_candidates": id_candidates,
+            "target_missingness": target_missingness,
+            "split_candidates_uniques": split_evidence,
+            "column_inventory_path": "data/column_inventory.json",
+            "column_inventory_preview": header_preview,
+        }
+        pass2_result = steward.decide_semantics_pass2(steward_pass2_input)
+        if not isinstance(pass2_result, dict):
+            pass2_result = {}
+        dataset_semantics = pass2_result.get("dataset_semantics") if isinstance(pass2_result, dict) else {}
+        dataset_training_mask = pass2_result.get("dataset_training_mask") if isinstance(pass2_result, dict) else {}
+        column_sets = pass2_result.get("column_sets") if isinstance(pass2_result, dict) else {}
+
+        if not isinstance(dataset_semantics, dict):
+            dataset_semantics = {}
+        if not isinstance(dataset_training_mask, dict):
+            dataset_training_mask = {}
+        if not isinstance(column_sets, dict):
+            column_sets = {}
+
         dataset_semantics_summary = summarize_dataset_semantics(dataset_semantics, dataset_training_mask)
-        if header_cols:
-            column_sets = build_column_sets(header_cols, roles=dataset_semantics.get("column_roles"))
-            column_sets_summary = summarize_column_sets(column_sets)
+        column_sets_summary = summarize_column_sets(column_sets) if column_sets else ""
         try:
             os.makedirs("data", exist_ok=True)
             dump_json("data/dataset_semantics.json", dataset_semantics)
-            if column_sets:
-                dump_json("data/column_sets.json", column_sets)
+            dump_json("data/dataset_training_mask.json", dataset_training_mask)
+            dump_json("data/column_sets.json", column_sets)
         except Exception as sem_write_err:
-            print(f"Warning: failed to persist dataset_semantics.json: {sem_write_err}")
+            print(f"Warning: failed to persist dataset semantics artifacts: {sem_write_err}")
     except Exception as sem_err:
-        print(f"Warning: dataset semantics inference failed: {sem_err}")
+        print(f"Warning: dataset semantics extraction failed: {sem_err}")
     if isinstance(state, dict):
         state["dataset_semantics"] = dataset_semantics
         state["dataset_training_mask"] = dataset_training_mask
@@ -7025,10 +7044,22 @@ def run_execution_planner(state: AgentState) -> AgentState:
         and isinstance(dataset_semantics.get("target_analysis"), dict)
         and dataset_semantics.get("target_analysis", {}).get("partial_label_detected")
     )
-    if partial_labels and isinstance(contract, dict):
-        training_rule = dataset_training_mask.get("training_rows_rule") if isinstance(dataset_training_mask, dict) else None
-        scoring_primary = dataset_training_mask.get("scoring_rows_rule_primary") if isinstance(dataset_training_mask, dict) else None
-        scoring_secondary = dataset_training_mask.get("scoring_rows_rule_secondary") if isinstance(dataset_training_mask, dict) else None
+    partition_cols = []
+    if isinstance(dataset_semantics, dict):
+        split_candidates = dataset_semantics.get("split_candidates")
+        if isinstance(split_candidates, list):
+            partition_cols = [str(col) for col in split_candidates if col]
+        elif isinstance(dataset_semantics.get("partition_analysis"), dict):
+            partition_cols = [
+                str(col)
+                for col in (dataset_semantics.get("partition_analysis", {}).get("partition_columns") or [])
+                if col
+            ]
+    training_rule = dataset_training_mask.get("training_rows_rule") if isinstance(dataset_training_mask, dict) else None
+    scoring_primary = dataset_training_mask.get("scoring_rows_rule_primary") if isinstance(dataset_training_mask, dict) else None
+    scoring_secondary = dataset_training_mask.get("scoring_rows_rule_secondary") if isinstance(dataset_training_mask, dict) else None
+    apply_training_rules = bool(training_rule or scoring_primary or scoring_secondary) and (partial_labels or partition_cols)
+    if apply_training_rules and isinstance(contract, dict):
         if training_rule and not contract.get("training_rows_rule"):
             contract["training_rows_rule"] = training_rule
         if not scoring_primary:

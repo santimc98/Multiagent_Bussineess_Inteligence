@@ -5,6 +5,7 @@ import csv
 import re
 import io
 import warnings
+import json
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
@@ -119,10 +120,6 @@ class StewardAgent:
             
             {profile['alerts']}
             
-            Potential IDs: {profile['ids']}
-            Potential Dates: {profile['dates']}
-            Target Candidates: {profile['targets']}
-            
             Example Rows (Random Sample):
             {profile['examples']}
             """
@@ -235,6 +232,164 @@ class StewardAgent:
                 "profile": {},
             }
 
+    def _clean_json(self, text: str) -> str:
+        text = re.sub(r"```json", "", text)
+        text = text.replace("```", "")
+        return text.strip()
+
+    def _parse_json_response(self, text: str) -> Dict[str, Any]:
+        cleaned = self._clean_json(text or "")
+        if not cleaned:
+            return {}
+        try:
+            parsed = json.loads(cleaned)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            pass
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            snippet = cleaned[start : end + 1]
+            try:
+                parsed = json.loads(snippet)
+                return parsed if isinstance(parsed, dict) else {}
+            except json.JSONDecodeError:
+                return {}
+        return {}
+
+    def decide_semantics_pass1(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        from src.utils.prompting import render_prompt
+
+        retry_note = ""
+        if isinstance(payload, dict) and payload.get("retry_reason"):
+            retry_note = f"Retry note: {payload.get('retry_reason')}"
+
+        SYSTEM_PROMPT_TEMPLATE = """
+You are the Senior Data Steward.
+
+TASK: Decide dataset semantics for modeling BEFORE computing metrics.
+
+Business objective:
+$business_objective
+
+Column inventory preview (head/tail + count):
+$column_inventory_preview
+
+Full column list path: $column_inventory_path
+
+Sample rows (head/tail/random):
+$sample_rows
+
+RULES:
+- Choose exactly one primary_target (string). Always decide, even if uncertain.
+- split_candidates and id_candidates are optional lists (use [] if none).
+- notes: 2-6 bullets explaining why (objective + column names). Do NOT invent metrics.
+- Output JSON only. No markdown, no extra text.
+
+$retry_note
+"""
+        prompt = render_prompt(
+            SYSTEM_PROMPT_TEMPLATE,
+            business_objective=payload.get("business_objective", ""),
+            column_inventory_preview=json.dumps(payload.get("column_inventory_preview", {}), ensure_ascii=True),
+            column_inventory_path=payload.get("column_inventory_path", "data/column_inventory.json"),
+            sample_rows=json.dumps(payload.get("sample_rows", {}), ensure_ascii=True),
+            retry_note=retry_note,
+        )
+        self.last_prompt = prompt
+        response = self.model.generate_content(prompt)
+        text = (getattr(response, "text", "") or "").strip()
+        self.last_response = text
+        return self._parse_json_response(text)
+
+    def decide_semantics_pass2(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        from src.utils.prompting import render_prompt
+
+        SYSTEM_PROMPT_TEMPLATE = """
+You are the Senior Data Steward.
+
+TASK: Finalize dataset semantics using measured evidence. You already selected the primary target.
+
+Business objective:
+$business_objective
+
+Primary target (chosen by you):
+$primary_target
+
+Measured target missingness:
+$target_missingness
+
+Split candidates (with unique values evidence):
+$split_candidates_uniques
+
+Column inventory preview (head/tail + count):
+$column_inventory_preview
+
+Full column list path: $column_inventory_path
+
+OUTPUT REQUIREMENTS (JSON ONLY):
+{
+  "dataset_semantics": {
+    "primary_target": "<col>",
+    "split_candidates": ["..."],
+    "id_candidates": ["..."],
+    "target_analysis": {
+      "primary_target": "<col>",
+      "target_null_frac_exact": <float|null>,
+      "target_missing_count_exact": <int|null>,
+      "target_total_count_exact": <int|null>,
+      "partial_label_detected": <true|false>,
+      "labeled_row_heuristic": "target_not_missing",
+      "notes": ["..."]
+    },
+    "partition_analysis": {
+      "partition_columns": ["..."],
+      "partition_values": {"col": ["v1", "v2"]}
+    },
+    "notes": ["..."]
+  },
+  "dataset_training_mask": {
+    "training_rows_rule": "...",
+    "scoring_rows_rule_primary": "...",
+    "scoring_rows_rule_secondary": "...",
+    "rationale": ["..."]
+  },
+  "column_sets": {
+    "explicit_columns": ["..."],
+    "sets": [
+      {"name": "SET_1", "selector": {"type": "prefix_numeric_range", "prefix": "...", "start": 0, "end": 783}},
+      {"name": "SET_2", "selector": {"type": "regex", "pattern": "^feature_\\\\d+$"}},
+      {"name": "SET_3", "selector": {"type": "all_numeric_except", "except_columns": ["..."]}},
+      {"name": "SET_4", "selector": {"type": "all_columns_except", "except_columns": ["..."]}}
+    ]
+  }
+}
+
+RULES:
+- Use the primary_target exactly as provided; do not change it.
+- If 0 < target_null_frac_exact < 1, set:
+  training_rows_rule: "rows where <target> is not missing"
+  scoring_rows_rule_primary: "all rows"
+  scoring_rows_rule_secondary: "rows where <target> is missing"
+- If no partial labels, training_rows_rule: "use all rows" and scoring_rows_rule_primary: "all rows".
+- column_sets: do NOT enumerate full column lists. Use selectors above and only list explicit_columns.
+- Output JSON only. No markdown, no extra text.
+"""
+        prompt = render_prompt(
+            SYSTEM_PROMPT_TEMPLATE,
+            business_objective=payload.get("business_objective", ""),
+            primary_target=payload.get("primary_target", ""),
+            target_missingness=json.dumps(payload.get("target_missingness", {}), ensure_ascii=True),
+            split_candidates_uniques=json.dumps(payload.get("split_candidates_uniques", []), ensure_ascii=True),
+            column_inventory_preview=json.dumps(payload.get("column_inventory_preview", {}), ensure_ascii=True),
+            column_inventory_path=payload.get("column_inventory_path", "data/column_inventory.json"),
+        )
+        self.last_prompt = prompt
+        response = self.model.generate_content(prompt)
+        text = (getattr(response, "text", "") or "").strip()
+        self.last_response = text
+        return self._parse_json_response(text)
+
     def _detect_csv_dialect(self, data_path: str, encoding: str) -> Dict[str, str]:
         """
         Robustly detects separator and decimal using csv.Sniffer and internal heuristics.
@@ -307,30 +462,10 @@ class StewardAgent:
         glossary = ""
         ids = []
         dates = []
-        targets = []
-        
-        # Keyword alignment
-        obj_tokens = set(re.sub(r'[^a-z0-9]', ' ', objective.lower()).split())
-        target_keywords = {'target', 'label', 'churn', 'class', 'outcome', 'y', 'status', 'revenue', 'sales'}
-        target_keywords.update(obj_tokens)
-        
-        # Sort columns by importance (heuristic: keyword match -> numeric -> other)
-        # We limit specific details to top 50
+
+        # Preserve original order; avoid heuristic target suggestions.
         all_cols = df.columns.tolist()
-        priority_cols = []
-        other_cols = []
-        
-        for col in all_cols:
-            if any(k in col.lower() for k in target_keywords):
-                priority_cols.append(col)
-                if 'id' not in col.lower():
-                    targets.append(col)
-            elif df[col].dtype in ['int64', 'float64']:
-                priority_cols.append(col)
-            else:
-                other_cols.append(col)
-                
-        sorted_cols = (priority_cols + other_cols)[:50]
+        sorted_cols = all_cols[:50]
 
         def _norm_header(name: str) -> str:
             cleaned = re.sub(r"[^0-9a-zA-Z]+", "_", str(name)).strip("_").lower()
@@ -371,24 +506,10 @@ class StewardAgent:
             
             card_tag = ""
             if unique_ratio > 0.98 and n_unique > 50:
-                card_tag = "[HIGH CARDINALITY/ID]"
-                if 'id' not in col.lower():
-                    ids.append(col)
+                card_tag = "[HIGH CARDINALITY]"
             elif n_unique <= 1:
                 card_tag = "[CONSTANT/USELESS]"
                 alerts += f"- ALERT: '{col}' is constant (Value: {df[col].dropna().unique()}).\n"
-            
-            # Date Check (Robust)
-            if df[col].dtype == 'object':
-                 try:
-                    # Sample Check for speed
-                    sample_series = df[col].dropna().sample(min(len(df), 100), random_state=42)
-                    parsed = pd.to_datetime(sample_series, errors='coerce', dayfirst=True)
-                    if parsed.notna().mean() > 0.7:
-                        dates.append(col)
-                        card_tag += " [DATE-LIKE]"
-                 except:
-                    pass
             
             col_details += f"- {col}: {dtype}, Unique={n_unique} {card_tag}, Nulls={null_pct:.1%}\n"
 
@@ -428,12 +549,6 @@ class StewardAgent:
                 sample_vals = df[col].dropna().astype(str).head(3).tolist()
                 glossary += f"- {col}: dtype={dtype}, hints={role_hints}, sample={sample_vals}\n"
             
-        # Target Validation
-        if targets:
-            main_target = targets[0] # Best guess
-            if df[main_target].nunique() <= 1:
-                alerts += f"\n*** CRITICAL: Potential Target '{main_target}' has NO VARIATION. Modeling impossible. ***\n"
-
         # Representative Examples
         try:
             examples = df.sample(min(len(df), 3), random_state=42).to_string(index=False)
@@ -447,7 +562,6 @@ class StewardAgent:
             "glossary": glossary or "None.",
             "ids": ids,
             "dates": dates,
-            "targets": targets,
             "examples": examples
         }
 
@@ -520,13 +634,6 @@ def build_dataset_profile(
     type_hints = {col: _infer_type_hint(df[col]) for col in columns}
     missing_frac: Dict[str, float] = {}
     cardinality: Dict[str, Any] = {}
-    suspected_ids: List[str] = []
-    suspected_dates: List[str] = []
-    suspected_targets: List[str] = []
-
-    obj_tokens = set(re.sub(r"[^a-z0-9]", " ", (objective or "").lower()).split())
-    target_keywords = {"target", "label", "churn", "class", "outcome", "y", "status", "revenue", "sales"}
-    target_keywords.update(obj_tokens)
 
     from src.utils.missing import is_effectively_missing_series
 
@@ -544,12 +651,6 @@ def build_dataset_profile(
         except Exception:
             top_values = []
         cardinality[col] = {"unique": n_unique, "top_values": top_values}
-        if "id" in col.lower() or (len(df) > 0 and n_unique / max(len(df), 1) > 0.98):
-            suspected_ids.append(col)
-        if type_hints.get(col) == "datetime":
-            suspected_dates.append(col)
-        if any(tok in col.lower() for tok in target_keywords):
-            suspected_targets.append(col)
 
     profile = {
         "rows": int(df.shape[0]),
@@ -558,9 +659,6 @@ def build_dataset_profile(
         "type_hints": type_hints,
         "missing_frac": missing_frac,
         "cardinality": cardinality,
-        "suspected_ids": sorted(set(suspected_ids)),
-        "suspected_dates": sorted(set(suspected_dates)),
-        "suspected_targets": sorted(set(suspected_targets)),
         "pii_findings": pii_findings or {"detected": False, "findings": []},
         "sampling": {
             "was_sampled": bool(was_sampled),

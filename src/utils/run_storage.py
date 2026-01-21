@@ -183,6 +183,10 @@ def clean_workspace_outputs() -> None:
         os.path.join("data", "cleaned_full.csv"),
         os.path.join("data", "cleaning_manifest.json"),
         os.path.join("data", "dataset_profile.json"),
+        os.path.join("data", "dataset_semantics.json"),
+        os.path.join("data", "dataset_training_mask.json"),
+        os.path.join("data", "column_sets.json"),
+        os.path.join("data", "column_inventory.json"),
         # P0 FIX: Additional files to prevent cross-run contamination
         os.path.join("data", "produced_artifact_index.json"),
         os.path.join("data", "plan.json"),

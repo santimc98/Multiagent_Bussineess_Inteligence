@@ -144,7 +144,7 @@ class DataEngineerAgent:
         - MUST NOT: compute scores, case assignment, weight fitting, regression/optimization, correlations, rank checks.
         - MUST: parse types, normalize numeric formats, preserve canonical column names.
         - Manifest MUST include: output_dialect, row_counts, conversions.
-        - Do NOT impute outcome/target columns. If dataset_semantics.json shows partial labels, preserve missingness.
+        - Do NOT impute outcome/target columns. Use data/dataset_semantics.json + data/dataset_training_mask.json (Steward-decided); if partial labels exist, preserve missingness. Do not invent targets.
         - Preserve partition/split columns if they exist or are detected in the Dataset Semantics Summary.
         - If you create a partition column (split/fold/bucket), document it in the manifest and do not drop it.
         - For wide datasets, avoid enumerating all columns in code comments or logic. If data/column_sets.json exists, use src.utils.column_sets.expand_column_sets to manage column lists; fall back gracefully if the file is missing.

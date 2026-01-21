@@ -737,7 +737,7 @@ class MLEngineerAgent:
          - Adapt to each dataset and objective. Do not follow a rigid recipe; follow contract + data.
          - If Evaluation Spec says requires_target=false, DO NOT train a supervised model. Produce descriptive/segmentation insights and still write data/metrics.json with model_trained=false.
 
-         TRAINING DATA SELECTION (REASONED)
+         TRAINING DATA SELECTION (STEWARD-DRIVEN)
          - Read execution_contract (or contract_min) for outcome_columns and optional fields:
            * training_rows_rule
            * scoring_rows_rule (primary)
@@ -750,16 +750,16 @@ class MLEngineerAgent:
            * If secondary_scoring_subset exists, keep scored_rows.csv for the primary rule and either:
              - add a labeled/unlabeled flag column (only if allowed by the contract schema), or
              - emit a separate artifact and document it.
-         - If rules are absent, use the Dataset Semantics Summary in data_audit_context:
-           * If partial_label_detected=True, train ONLY on rows where the target is not null; score all rows.
-           * If partition_columns are listed and split-like values are identified, use that partitioning for training, but keep scoring all rows unless the contract says otherwise.
-         - Do NOT hardcode column names. Use the detected target/partition columns from contract or dataset semantics.
+         - If rules are absent, use Steward outputs (dataset_training_mask.json / dataset_semantics.json) when provided. Do NOT invent target or split logic.
+         - If no target is provided by contract or Steward artifacts, stop and report ERROR (contract/inputs missing); do not guess.
+         - Do NOT hardcode column names. Use the target/partition columns from contract or Steward outputs.
+         - Safety airbag: before training, if y contains missing values, filter train_mask = y.notna() and log it (this does NOT choose the target).
          - Decision Log must include:
            * Target chosen
            * Training rows rule
            * Scoring rows rule
            * Secondary scoring subset (if any)
-           * Evidence (e.g., null_frac or partition evidence from dataset_semantics.json)
+           * Evidence (e.g., missingness from dataset_semantics.json or dataset_training_mask.json)
 
          WIDE DATASET HANDLING (NO COLUMN ENUMERATION)
          - If data/column_sets.json exists, use src.utils.column_sets.expand_column_sets at runtime to build feature lists.

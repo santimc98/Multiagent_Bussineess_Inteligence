@@ -1672,34 +1672,7 @@ def _is_identifier_like_name(name: str) -> bool:
 
 
 def _load_profile_identifier_candidates() -> set[str]:
-    profile_path = os.path.join("data", "dataset_profile.json")
-    if not os.path.exists(profile_path):
-        return set()
-    try:
-        with open(profile_path, "r", encoding="utf-8") as f_profile:
-            profile = json.load(f_profile)
-    except Exception:
-        return set()
-    if not isinstance(profile, dict):
-        return set()
-    candidates = set()
-    suspected = profile.get("suspected_ids")
-    if isinstance(suspected, list):
-        candidates.update([str(col) for col in suspected if col])
-    rows = profile.get("rows") or profile.get("row_count") or profile.get("n_rows")
-    cardinality = profile.get("cardinality")
-    if isinstance(rows, int) and rows > 0 and isinstance(cardinality, dict):
-        for col, stats in cardinality.items():
-            if not isinstance(stats, dict):
-                continue
-            unique = stats.get("unique")
-            try:
-                unique_count = int(unique)
-            except Exception:
-                continue
-            if unique_count / max(rows, 1) > 0.98:
-                candidates.add(str(col))
-    return candidates
+    return set()
 
 
 def _resolve_identifier_candidates(
@@ -1712,10 +1685,6 @@ def _resolve_identifier_candidates(
         role_ids = roles.get("identifiers")
         if isinstance(role_ids, list):
             candidates.update([str(col) for col in role_ids if col])
-    candidates.update(_load_profile_identifier_candidates())
-    for col in canonical_columns or []:
-        if _is_identifier_like_name(str(col)):
-            candidates.add(str(col))
     return candidates
 
 

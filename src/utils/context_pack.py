@@ -276,6 +276,7 @@ def build_context_pack(stage: str, state: Dict[str, Any]) -> str:
         "data/cleaned_data.csv",
         "data/output_contract_report.json",
         "data/dataset_semantics.json",
+        "data/dataset_training_mask.json",
         "data/column_sets.json",
         "data/column_inventory.json",
         "data/insights.json",

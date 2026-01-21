@@ -52,14 +52,15 @@ INPUTS YOU WILL RECEIVE
 * output_dialect: {sep, decimal, encoding}
 * env_constraints: (Optional) {forbid_inplace_column_creation, memory_limit, ...}
 * domain_expert_critique: (Optional) Expert guidance/risks detected during strategy selection. USE THIS to identify leakage, semantic types, and critical constraints.
-* Dataset Semantics Summary (included in data_summary): target candidates, partial labels, partition columns, and recommended training/scoring rules.
+* Dataset Semantics Summary (included in data_summary): Steward-selected primary_target, split/id candidates, partial labels, and training/scoring rules.
 
 DATASET UNDERSTANDING (MANDATORY)
 Before generating the contract:
 
-* Read the Dataset Semantics Summary from data_summary.
+* Read the Dataset Semantics Summary from data_summary (Steward-decided).
+* Do NOT invent target or split logic. Use the Steward's primary_target and training/scoring rules.
 * Explicitly declare:
-  - Which column(s) are treated as outcome/target (or unknown if none).
+  - Which column(s) are treated as outcome/target (must match Steward primary_target).
   - Whether partial labels are present (labeled vs unlabeled rows).
   - The training_rows_rule, scoring_rows_rule, and any secondary_scoring_subset you will apply.
   - data_partitioning_notes as a short list of any partitioning assumptions.
