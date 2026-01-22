@@ -6552,8 +6552,27 @@ def run_strategist(state: AgentState) -> AgentState:
             response=getattr(strategist, "last_response", None) or result,
             context={"data_summary": data_summary, "user_context": user_context, "context_pack": context_pack},
         )
-    strategies_list = result.get('strategies', [])
-    strategy_spec = result.get("strategy_spec", {})
+    # Defensive handling of strategist result types (Fix for potential crashes)
+    strategies_list = []
+    strategy_spec = {}
+    
+    if isinstance(result, list):
+         # Handle legacy list return directly
+         strategies_list = result
+    elif isinstance(result, dict):
+         strategies_list = result.get('strategies', [])
+         strategy_spec = result.get('strategy_spec', {})
+    else:
+         strategies_list = []
+
+    # Ensure strategies_list is actually a list of dicts
+    if not isinstance(strategies_list, list):
+         if isinstance(strategies_list, dict):
+             strategies_list = [strategies_list]
+         else:
+             strategies_list = []
+    
+    strategies_list = [s for s in strategies_list if isinstance(s, dict)]
 
     # Fallback if list is empty or malformed
     if not strategies_list:

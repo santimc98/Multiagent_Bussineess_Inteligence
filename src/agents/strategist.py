@@ -170,7 +170,7 @@ class StrategistAgent:
 
         *** CRITICAL OUTPUT RULES ***
         - RETURN ONLY RAW JSON. NO MARKDOWN. NO COMMENTS.
-        - The output must be a dictionary with a single key "strategies" containing a LIST of 1 object.
+        - The output must be a dictionary with a single key "strategies" containing a LIST of 3 objects.
         - The object must include these keys:
           {
             "title": "Strategy name",
@@ -204,13 +204,15 @@ class StrategistAgent:
             content = response.text
             self.last_response = content
             cleaned_content = self._clean_json(content)
-            single_strategy = json.loads(cleaned_content)
+            parsed = json.loads(cleaned_content)
+
+            # Normalization (Fix for crash 'list' object has no attribute 'get')
+            payload = self._normalize_strategist_output(parsed)
 
             # Build strategy_spec from LLM reasoning (not hardcoded inference)
-            strategy_spec = self._build_strategy_spec_from_llm(single_strategy, data_summary, user_request)
-            if isinstance(single_strategy, dict):
-                single_strategy["strategy_spec"] = strategy_spec
-            return single_strategy
+            strategy_spec = self._build_strategy_spec_from_llm(payload, data_summary, user_request)
+            payload["strategy_spec"] = strategy_spec
+            return payload
 
         except Exception as e:
             print(f"Strategist Error: {e}")
@@ -232,6 +234,41 @@ class StrategistAgent:
             strategy_spec = self._build_strategy_spec_from_llm(fallback, data_summary, user_request)
             fallback["strategy_spec"] = strategy_spec
             return fallback
+
+    def _normalize_strategist_output(self, parsed: Any) -> Dict[str, Any]:
+        """
+        Normalize the LLM output into a stable dictionary structure.
+        """
+        strategies = []
+        if isinstance(parsed, dict):
+            raw_strategies = parsed.get("strategies")
+            if isinstance(raw_strategies, list):
+                # Filter non-dict elements
+                strategies = [s for s in raw_strategies if isinstance(s, dict)]
+                parsed["strategies"] = strategies
+                return parsed
+            elif raw_strategies is None:
+                # Interpret the dict itself as a single strategy if explicit "strategies" key is missing
+                strategies = [parsed]
+            elif isinstance(raw_strategies, dict):
+                 strategies = [raw_strategies]
+            else:
+                 strategies = []
+            
+            # If parsed had 'strategies' but it wasn't a list, we just normalized it into 'strategies'.
+            # However, if parsed is the strategy itself, we wrap it.
+            if "strategies" not in parsed:
+                 return {"strategies": strategies}
+            # Update normalized strategies
+            parsed["strategies"] = strategies
+            return parsed
+        
+        elif isinstance(parsed, list):
+            strategies = [elem for elem in parsed if isinstance(elem, dict)]
+            return {"strategies": strategies}
+        
+        else:
+            return {"strategies": []}
 
     def _clean_json(self, text: str) -> str:
         text = re.sub(r'```json', '', text)
