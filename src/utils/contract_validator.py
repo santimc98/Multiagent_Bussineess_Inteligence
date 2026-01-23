@@ -15,6 +15,77 @@ FILE_EXTENSIONS = {
     ".parquet", ".pkl", ".pickle", ".txt", ".html", ".xlsx", ".xls"
 }
 
+# Universal set of metric-like tokens that should NOT appear as required columns in scored_rows_schema
+# (metrics belong in metrics.json, not per-row)
+METRIC_LIKE_TOKENS = {
+    "accuracy", "roc_auc", "auc", "f1", "precision", "recall", "log_loss",
+    "rmse", "mae", "mse", "r2", "rmsle", "gini", "normalized_gini",
+    "f1_score", "f1-score", "roc-auc", "roc auc", "logloss", "cross_entropy",
+    "balanced_accuracy", "cohen_kappa", "matthews_corrcoef", "mcc",
+    "mean_squared_error", "mean_absolute_error", "root_mean_squared_error",
+}
+
+
+def _normalize_metric_name(name: str) -> str:
+    """
+    Normalize a metric name to canonical form.
+    
+    Rules:
+      - lower()
+      - replace spaces/hyphens with underscores
+      - remove parentheses and common annotations
+      - normalize common variants (roc-auc -> roc_auc, rmsle/rmse_log1p -> same token)
+    
+    Args:
+        name: Raw metric name
+        
+    Returns:
+        Normalized metric name string
+    """
+    if not isinstance(name, str):
+        return str(name) if name is not None else ""
+    
+    # Lowercase
+    s = name.lower().strip()
+    
+    # Remove common parenthetical annotations
+    s = re.sub(r"\s*\([^)]*\)\s*", "", s)
+    
+    # Replace spaces and hyphens with underscores
+    s = re.sub(r"[\s\-]+", "_", s)
+    
+    # Collapse multiple underscores
+    s = re.sub(r"_+", "_", s)
+    s = s.strip("_")
+    
+    # Canonical normalizations
+    roc_auc_variants = {"rocauc", "roc_auc", "auc_roc", "auroc", "roc"}
+    if s in roc_auc_variants or s == "roc_auc":
+        return "roc_auc"
+    
+    # RMSE log variants
+    rmse_log_variants = {"rmsle", "rmse_log", "rmse_log1p", "rmsle_log1p", "log_rmse"}
+    if s in rmse_log_variants:
+        return "rmsle"
+    
+    return s
+
+
+def _is_metric_like_token(name: str) -> bool:
+    """
+    Check if a column name looks like a metric (should not be in required_columns).
+    
+    Args:
+        name: Column/metric name to check
+        
+    Returns:
+        True if the name looks like a metric
+    """
+    if not name:
+        return False
+    normalized = _normalize_metric_name(name)
+    return normalized in METRIC_LIKE_TOKENS
+
 
 def is_probably_path(value: str) -> bool:
     """
@@ -306,9 +377,286 @@ def normalize_artifact_requirements(
     return artifact_requirements, warnings
 
 
+def normalize_allowed_feature_sets(
+    contract: Dict[str, Any]
+) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Normalize allowed_feature_sets to canonical dict format.
+    
+    Handles:
+      - dict (preferred): normalizes values, unifies synonyms (forbidden, forbidden_features -> forbidden_for_modeling)
+      - list[str]: converts to {"model_features": list, ...}
+      - list[list[str]]: flattens and converts to dict
+      - Other types (None, str, int): returns empty dict with error note
+    
+    Args:
+        contract: The contract dictionary
+        
+    Returns:
+        (normalized_dict, notes) where notes contains repair messages
+    """
+    notes: List[str] = []
+    raw = contract.get("allowed_feature_sets")
+    
+    # Already a dict - normalize it
+    if isinstance(raw, dict):
+        normalized: Dict[str, Any] = {}
+        
+        # Synonym mapping for key unification
+        synonym_map = {
+            "forbidden": "forbidden_for_modeling",
+            "forbidden_features": "forbidden_for_modeling",
+        }
+        
+        for key, value in raw.items():
+            # Unify synonyms
+            canonical_key = synonym_map.get(key, key)
+            if canonical_key != key:
+                notes.append(f"Unified '{key}' to '{canonical_key}' in allowed_feature_sets")
+            
+            # Normalize values to list of unique strings
+            if canonical_key == "rationale":
+                # Rationale is always kept as a string
+                if isinstance(value, str):
+                    normalized[canonical_key] = value.strip() if value else ""
+                else:
+                    normalized[canonical_key] = str(value) if value else ""
+            elif isinstance(value, list):
+                cleaned = []
+                seen = set()
+                for item in value:
+                    if isinstance(item, str) and item.strip():
+                        s = item.strip()
+                        if s not in seen:
+                            cleaned.append(s)
+                            seen.add(s)
+                    elif isinstance(item, list):
+                        # Flatten nested lists
+                        for sub in item:
+                            if isinstance(sub, str) and sub.strip():
+                                s = sub.strip()
+                                if s not in seen:
+                                    cleaned.append(s)
+                                    seen.add(s)
+                normalized[canonical_key] = cleaned
+            elif isinstance(value, str):
+                # Single string value -> list
+                normalized[canonical_key] = [value.strip()] if value.strip() else []
+        
+        # Ensure required keys exist
+        for req_key in ("model_features", "segmentation_features", "audit_only_features", "forbidden_for_modeling"):
+            if req_key not in normalized:
+                normalized[req_key] = []
+        if "rationale" not in normalized:
+            normalized["rationale"] = ""
+        
+        return normalized, notes
+    
+    # list[str] -> dict
+    if isinstance(raw, list):
+        flat_features: List[str] = []
+        seen = set()
+        
+        for item in raw:
+            if isinstance(item, str) and item.strip():
+                s = item.strip()
+                if s not in seen:
+                    flat_features.append(s)
+                    seen.add(s)
+            elif isinstance(item, list):
+                # list[list[str]] - flatten
+                for sub in item:
+                    if isinstance(sub, str) and sub.strip():
+                        s = sub.strip()
+                        if s not in seen:
+                            flat_features.append(s)
+                            seen.add(s)
+        
+        if flat_features:
+            notes.append(
+                f"Normalized allowed_feature_sets from list to dict (model_features={len(flat_features)} features)"
+            )
+            return {
+                "model_features": flat_features,
+                "segmentation_features": [],
+                "audit_only_features": [],
+                "forbidden_for_modeling": [],
+                "rationale": "normalized_from_list",
+            }, notes
+        else:
+            notes.append("allowed_feature_sets was an empty list; normalized to empty dict")
+            return {
+                "model_features": [],
+                "segmentation_features": [],
+                "audit_only_features": [],
+                "forbidden_for_modeling": [],
+                "rationale": "normalized_from_empty_list",
+            }, notes
+    
+    # None or unrecognized type
+    if raw is None:
+        return {
+            "model_features": [],
+            "segmentation_features": [],
+            "audit_only_features": [],
+            "forbidden_for_modeling": [],
+            "rationale": "",
+        }, []
+    
+    # Invalid type (str, int, etc.)
+    notes.append(
+        f"allowed_feature_sets had invalid type '{type(raw).__name__}'; cannot normalize"
+    )
+    return {
+        "model_features": [],
+        "segmentation_features": [],
+        "audit_only_features": [],
+        "forbidden_for_modeling": [],
+        "rationale": "ERROR: invalid_type_in_source",
+    }, notes
+
+
+def normalize_validation_requirements(
+    contract: Dict[str, Any]
+) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Normalize validation_requirements to canonical format.
+    
+    Rules:
+      - Ensure dict type
+      - Canonicalize metric names with _normalize_metric_name()
+      - Move validation_requirements.metrics to metrics_to_report if latter missing
+      - Ensure primary_metric is in metrics_to_report
+      - If primary_metric missing, try to extract from qa_gates benchmark_kpi_report
+    
+    Args:
+        contract: The contract dictionary
+        
+    Returns:
+        (normalized_validation_requirements, notes)
+    """
+    notes: List[str] = []
+    raw = contract.get("validation_requirements")
+    
+    if not isinstance(raw, dict):
+        raw = {}
+    
+    # Deep copy to avoid mutation
+    normalized = dict(raw)
+    
+    # Get or initialize metrics_to_report
+    metrics_to_report = normalized.get("metrics_to_report")
+    if not isinstance(metrics_to_report, list):
+        metrics_to_report = []
+    
+    # Migration: validation_requirements.metrics -> metrics_to_report
+    legacy_metrics = normalized.pop("metrics", None)
+    if isinstance(legacy_metrics, list) and legacy_metrics:
+        for m in legacy_metrics:
+            if isinstance(m, str) and m.strip():
+                canonical = _normalize_metric_name(m)
+                if canonical not in [_normalize_metric_name(x) for x in metrics_to_report]:
+                    metrics_to_report.append(canonical)
+        notes.append(
+            f"Migrated validation_requirements.metrics ({len(legacy_metrics)} items) to metrics_to_report"
+        )
+    
+    # Canonicalize all metrics in metrics_to_report
+    canonical_metrics = []
+    seen = set()
+    for m in metrics_to_report:
+        if isinstance(m, str):
+            c = _normalize_metric_name(m)
+            if c and c not in seen:
+                canonical_metrics.append(c)
+                seen.add(c)
+    normalized["metrics_to_report"] = canonical_metrics
+    
+    # Handle primary_metric
+    primary_metric = normalized.get("primary_metric")
+    if isinstance(primary_metric, str) and primary_metric.strip():
+        primary_canonical = _normalize_metric_name(primary_metric)
+        normalized["primary_metric"] = primary_canonical
+        # Ensure it's in metrics_to_report
+        if primary_canonical not in seen:
+            canonical_metrics.insert(0, primary_canonical)
+            notes.append(f"Added primary_metric '{primary_canonical}' to metrics_to_report")
+    else:
+        # Try to infer from qa_gates
+        qa_gates = contract.get("qa_gates")
+        if isinstance(qa_gates, list):
+            for gate in qa_gates:
+                if isinstance(gate, dict):
+                    gate_name = gate.get("name", "").lower()
+                    if "benchmark" in gate_name or "kpi" in gate_name or "metric" in gate_name:
+                        params = gate.get("params", {})
+                        if isinstance(params, dict):
+                            metric = params.get("metric") or params.get("primary_metric")
+                            if isinstance(metric, str) and metric.strip():
+                                inferred = _normalize_metric_name(metric)
+                                normalized["primary_metric"] = inferred
+                                if inferred not in seen:
+                                    canonical_metrics.insert(0, inferred)
+                                notes.append(
+                                    f"Inferred primary_metric '{inferred}' from qa_gates benchmark/kpi gate"
+                                )
+                                break
+    
+    normalized["metrics_to_report"] = canonical_metrics
+    return normalized, notes
+
+
+def lint_scored_rows_schema(
+    contract: Dict[str, Any]
+) -> Tuple[List[str], List[str], List[str]]:
+    """
+    Lint scored_rows_schema.required_columns to remove metric-like tokens.
+    
+    Metrics (accuracy, roc_auc, f1, etc.) belong in metrics.json, not per-row columns.
+    
+    Args:
+        contract: The contract dictionary
+        
+    Returns:
+        (clean_required_columns, removed_metric_like, notes)
+    """
+    notes: List[str] = []
+    removed: List[str] = []
+    
+    artifact_req = contract.get("artifact_requirements")
+    if not isinstance(artifact_req, dict):
+        return [], [], []
+    
+    scored_schema = artifact_req.get("scored_rows_schema")
+    if not isinstance(scored_schema, dict):
+        return [], [], []
+    
+    required_columns = scored_schema.get("required_columns")
+    if not isinstance(required_columns, list):
+        return [], [], []
+    
+    clean_columns: List[str] = []
+    for col in required_columns:
+        col_name = col.get("name") if isinstance(col, dict) else str(col) if col else ""
+        if not col_name:
+            continue
+        
+        if _is_metric_like_token(col_name):
+            removed.append(col_name)
+            notes.append(
+                f"Removed metric-like required column '{col_name}' from scored_rows_schema; "
+                "metrics belong in metrics.json"
+            )
+        else:
+            # Preserve original format (str or dict)
+            clean_columns.append(col if isinstance(col, dict) else col_name)
+    
+    return clean_columns, removed, notes
+
+
 def validate_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Validate contract for self-consistency.
+    Validate contract for self-consistency and apply strict normalization.
 
     Rules:
     1) allowed_feature_sets must be subset of (canonical_columns ∪ derived_columns ∪ expandable)
@@ -334,6 +682,93 @@ def validate_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
             "normalized_artifact_requirements": None
         }
 
+    # =========================================================================
+    # STRICT NORMALIZATION (auto-repair)
+    # =========================================================================
+    
+    # 1) Normalize allowed_feature_sets
+    normalized_afs, afs_notes = normalize_allowed_feature_sets(contract)
+    contract["allowed_feature_sets"] = normalized_afs
+    
+    # Check for critical failure (invalid type that couldn't be normalized)
+    afs_has_error = normalized_afs.get("rationale", "").startswith("ERROR:")
+    
+    for note in afs_notes:
+        is_error = "invalid type" in note.lower()
+        issues.append({
+            "rule": "contract_normalization",
+            "severity": "error" if is_error else "warning",
+            "message": f"[allowed_feature_sets] {note}",
+            "item": "allowed_feature_sets"
+        })
+        if is_error:
+            status = "error"
+        elif status == "ok":
+            status = "warning"
+        
+        # Add to unknowns for traceability
+        unknowns = contract.get("unknowns")
+        if isinstance(unknowns, list):
+            unknowns.append(f"Normalized allowed_feature_sets: {note}")
+    
+    # 2) Normalize validation_requirements
+    normalized_val_req, val_req_notes = normalize_validation_requirements(contract)
+    contract["validation_requirements"] = normalized_val_req
+    
+    for note in val_req_notes:
+        issues.append({
+            "rule": "contract_normalization",
+            "severity": "warning",
+            "message": f"[validation_requirements] {note}",
+            "item": "validation_requirements"
+        })
+        if status == "ok":
+            status = "warning"
+        
+        # Add to unknowns for traceability
+        unknowns = contract.get("unknowns")
+        if isinstance(unknowns, list):
+            unknowns.append(f"Normalized validation_requirements: {note}")
+    
+    # 3) Lint scored_rows_schema (remove metric-like columns)
+    clean_cols, removed_metrics, lint_notes = lint_scored_rows_schema(contract)
+    if removed_metrics:
+        # Update the contract
+        artifact_req_for_lint = contract.get("artifact_requirements")
+        if isinstance(artifact_req_for_lint, dict):
+            scored_schema = artifact_req_for_lint.get("scored_rows_schema")
+            if isinstance(scored_schema, dict):
+                scored_schema["required_columns"] = clean_cols
+    
+    for note in lint_notes:
+        issues.append({
+            "rule": "contract_normalization",
+            "severity": "warning",
+            "message": f"[scored_rows_schema] {note}",
+            "item": "scored_rows_schema"
+        })
+        if status == "ok":
+            status = "warning"
+        
+        # Add to unknowns for traceability
+        unknowns = contract.get("unknowns")
+        if isinstance(unknowns, list):
+            unknowns.append(note)
+    
+    # Validate allowed_feature_sets is now a proper dict
+    if afs_has_error:
+        issues.append({
+            "rule": "allowed_feature_sets_type",
+            "severity": "error",
+            "message": "allowed_feature_sets could not be normalized to a valid dict; contract is unusable",
+            "item": "allowed_feature_sets"
+        })
+        status = "error"
+
+    # =========================================================================
+    # NORMALIZE ARTIFACT REQUIREMENTS (existing logic)
+    # =========================================================================
+    
     # Normalize artifact_requirements
     artifact_req, normalization_warnings = normalize_artifact_requirements(contract)
     for w in normalization_warnings:
@@ -357,12 +792,13 @@ def validate_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
 
     all_known_columns = canonical_columns | derived_columns | expandable
 
-    # Rule 1: allowed_feature_sets validation
+    # Rule 1: allowed_feature_sets validation (now guaranteed to be a dict after normalization)
     allowed_sets = contract.get("allowed_feature_sets", {})
     if isinstance(allowed_sets, dict):
         for set_name, features in allowed_sets.items():
-            if set_name == "forbidden":
-                continue  # Skip forbidden set
+            # Skip forbidden set and non-feature keys
+            if set_name in ("forbidden", "forbidden_for_modeling", "rationale"):
+                continue
             if isinstance(features, list):
                 for feat in features:
                     if feat not in all_known_columns and not _matches_any_selector(feat, selectors):
