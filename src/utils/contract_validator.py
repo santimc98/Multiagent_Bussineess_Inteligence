@@ -25,6 +25,24 @@ METRIC_LIKE_TOKENS = {
     "mean_squared_error", "mean_absolute_error", "root_mean_squared_error",
 }
 
+# Canonical column roles for column_roles normalization
+CANONICAL_ROLES = {
+    "outcome", "decision", "id", "feature", "timestamp", "group", "weight",
+    "ignore", "forbidden", "target", "label", "identifier", "index",
+    "segmentation", "audit_only", "protected", "sensitive",
+}
+
+# Role synonym mapping for normalization
+ROLE_SYNONYM_MAP = {
+    "target": "outcome",
+    "label": "outcome",
+    "identifier": "id",
+    "index": "id",
+    "ignored": "ignore",
+    "excluded": "forbidden",
+    "protected_attribute": "protected",
+}
+
 
 def _normalize_metric_name(name: str) -> str:
     """
@@ -606,6 +624,429 @@ def normalize_validation_requirements(
     return normalized, notes
 
 
+# =============================================================================
+# CONTRACT SCHEMA LINTER (Fix #6)
+# =============================================================================
+
+
+def _normalize_role(role: str) -> str:
+    """Normalize a role string to canonical form."""
+    if not isinstance(role, str):
+        return "feature"
+    r = role.strip().lower()
+    return ROLE_SYNONYM_MAP.get(r, r)
+
+
+def lint_column_roles(
+    contract: Dict[str, Any]
+) -> Tuple[Dict[str, str], List[Dict[str, Any]], List[str]]:
+    """
+    Lint and normalize column_roles to canonical dict format.
+
+    Accepts:
+      - dict (standard): {column: role, ...}
+      - list[dict]: [{"column": "X", "role": "outcome"}, ...]
+      - list[list/tuple]: [["X", "outcome"], ["Y", "feature"], ...]
+      - str/int: error (irreparable)
+
+    Returns:
+        (normalized_dict, issues, notes)
+        - normalized_dict: {column: canonical_role}
+        - issues: list of {rule, severity, message, item}
+        - notes: repair notes for unknowns
+    """
+    issues: List[Dict[str, Any]] = []
+    notes: List[str] = []
+    raw = contract.get("column_roles")
+
+    # None -> empty dict (ok)
+    if raw is None:
+        return {}, [], []
+
+    # Already a dict - normalize roles
+    if isinstance(raw, dict):
+        normalized: Dict[str, str] = {}
+        for col, role in raw.items():
+            if not isinstance(col, str) or not col.strip():
+                continue
+            col_clean = col.strip()
+            if isinstance(role, str):
+                role_norm = _normalize_role(role)
+                if role_norm not in CANONICAL_ROLES:
+                    issues.append({
+                        "rule": "contract_schema_lint.column_roles",
+                        "severity": "warning",
+                        "message": f"Unknown role '{role}' for column '{col_clean}'; keeping as-is",
+                        "item": col_clean
+                    })
+                    notes.append(f"column_roles: unknown role '{role}' for '{col_clean}', kept literal")
+                    role_norm = role.strip().lower()  # Keep literal
+                normalized[col_clean] = role_norm
+            else:
+                # Non-string role
+                issues.append({
+                    "rule": "contract_schema_lint.column_roles",
+                    "severity": "warning",
+                    "message": f"Role for column '{col_clean}' is not a string (type={type(role).__name__}); defaulting to 'feature'",
+                    "item": col_clean
+                })
+                notes.append(f"column_roles: non-string role for '{col_clean}', defaulted to 'feature'")
+                normalized[col_clean] = "feature"
+        return normalized, issues, notes
+
+    # list[dict] format: [{"column": "X", "role": "outcome"}, ...]
+    if isinstance(raw, list):
+        normalized = {}
+        for item in raw:
+            if isinstance(item, dict):
+                col = item.get("column") or item.get("name") or item.get("col")
+                role = item.get("role") or item.get("type") or "feature"
+                if isinstance(col, str) and col.strip():
+                    col_clean = col.strip()
+                    role_norm = _normalize_role(role) if isinstance(role, str) else "feature"
+                    if role_norm not in CANONICAL_ROLES:
+                        issues.append({
+                            "rule": "contract_schema_lint.column_roles",
+                            "severity": "warning",
+                            "message": f"Unknown role '{role}' for column '{col_clean}'; defaulting to 'feature'",
+                            "item": col_clean
+                        })
+                        notes.append(f"column_roles: unknown role '{role}' for '{col_clean}', defaulted to 'feature'")
+                        role_norm = "feature"
+                    normalized[col_clean] = role_norm
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                # list[list/tuple] format: [["X", "outcome"], ...]
+                col, role = item[0], item[1]
+                if isinstance(col, str) and col.strip():
+                    col_clean = col.strip()
+                    role_norm = _normalize_role(role) if isinstance(role, str) else "feature"
+                    if role_norm not in CANONICAL_ROLES:
+                        issues.append({
+                            "rule": "contract_schema_lint.column_roles",
+                            "severity": "warning",
+                            "message": f"Unknown role '{role}' for column '{col_clean}'; defaulting to 'feature'",
+                            "item": col_clean
+                        })
+                        notes.append(f"column_roles: unknown role '{role}' for '{col_clean}', defaulted to 'feature'")
+                        role_norm = "feature"
+                    normalized[col_clean] = role_norm
+
+        if normalized:
+            notes.insert(0, f"column_roles: normalized from list format to dict ({len(normalized)} columns)")
+            return normalized, issues, notes
+        else:
+            # Empty list or all items invalid
+            notes.append("column_roles: list was empty or all items invalid, returning empty dict")
+            return {}, issues, notes
+
+    # Invalid type (str, int, etc.) - irreparable
+    issues.append({
+        "rule": "contract_schema_lint.column_roles",
+        "severity": "fail",
+        "message": f"column_roles has invalid type '{type(raw).__name__}'; must be dict or list",
+        "item": "column_roles"
+    })
+    notes.append(f"column_roles: irreparable type '{type(raw).__name__}', returning empty dict")
+    return {}, issues, notes
+
+
+def lint_required_columns(
+    required_columns: Any
+) -> Tuple[List[str], List[Dict[str, Any]], List[str]]:
+    """
+    Lint scored_rows_schema.required_columns.
+
+    Rules:
+      - Must be list[str]
+      - Strip, dedupe
+      - Remove metric-like tokens
+      - Remove path-like values (contains .csv/.json or '/')
+
+    Returns:
+        (clean_columns, issues, notes)
+    """
+    issues: List[Dict[str, Any]] = []
+    notes: List[str] = []
+
+    # Handle None
+    if required_columns is None:
+        return [], [], []
+
+    # str -> [str]
+    if isinstance(required_columns, str):
+        required_columns = [required_columns]
+        notes.append("required_columns: converted single string to list")
+
+    # Not a list at this point -> try to extract strings
+    if not isinstance(required_columns, list):
+        issues.append({
+            "rule": "contract_schema_lint.required_columns",
+            "severity": "warning",
+            "message": f"required_columns has invalid type '{type(required_columns).__name__}'; returning empty",
+            "item": "required_columns"
+        })
+        notes.append(f"required_columns: invalid type '{type(required_columns).__name__}', returned empty")
+        return [], issues, notes
+
+    clean: List[str] = []
+    seen: set = set()
+
+    for item in required_columns:
+        # Extract string value
+        if isinstance(item, dict):
+            col_name = item.get("name") or item.get("column") or ""
+        elif isinstance(item, str):
+            col_name = item
+        else:
+            # Non-string, non-dict -> skip
+            continue
+
+        if not isinstance(col_name, str) or not col_name.strip():
+            continue
+
+        col_clean = col_name.strip()
+        col_lower = col_clean.lower()
+
+        # Skip duplicates
+        if col_lower in seen:
+            continue
+
+        # Check for metric-like token
+        if _is_metric_like_token(col_clean):
+            issues.append({
+                "rule": "contract_schema_lint.required_columns",
+                "severity": "warning",
+                "message": f"Removed metric-like token '{col_clean}' from required_columns; metrics belong in metrics.json",
+                "item": col_clean
+            })
+            notes.append(f"required_columns: removed metric '{col_clean}'")
+            continue
+
+        # Check for path-like value
+        if is_file_path(col_clean):
+            issues.append({
+                "rule": "contract_schema_lint.required_columns",
+                "severity": "warning",
+                "message": f"Removed path-like value '{col_clean}' from required_columns; looks like a file path",
+                "item": col_clean
+            })
+            notes.append(f"required_columns: removed path-like '{col_clean}'")
+            continue
+
+        clean.append(col_clean)
+        seen.add(col_lower)
+
+    return clean, issues, notes
+
+
+def lint_allowed_feature_sets_coherence(
+    contract: Dict[str, Any]
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str]]:
+    """
+    Lint allowed_feature_sets for internal coherence.
+
+    Rules:
+      - forbidden_for_modeling ∩ model_features != ∅ → auto-repair (remove from model_features)
+      - outcome/decision columns in model_features → warning + auto-repair
+
+    Returns:
+        (repaired_allowed_feature_sets, issues, notes)
+    """
+    issues: List[Dict[str, Any]] = []
+    notes: List[str] = []
+
+    allowed_sets = contract.get("allowed_feature_sets")
+    if not isinstance(allowed_sets, dict):
+        return allowed_sets if allowed_sets else {}, [], []
+
+    # Deep copy to avoid mutation issues
+    repaired = {k: list(v) if isinstance(v, list) else v for k, v in allowed_sets.items()}
+
+    model_features = repaired.get("model_features", [])
+    if not isinstance(model_features, list):
+        model_features = []
+
+    forbidden = repaired.get("forbidden_for_modeling", [])
+    if not isinstance(forbidden, list):
+        forbidden = []
+
+    # Get outcome and decision columns
+    column_roles = contract.get("column_roles", {})
+    outcome_cols = set()
+    decision_cols = set()
+
+    if isinstance(column_roles, dict):
+        for col, role in column_roles.items():
+            role_norm = _normalize_role(role) if isinstance(role, str) else ""
+            if role_norm == "outcome":
+                outcome_cols.add(col)
+            elif role_norm == "decision":
+                decision_cols.add(col)
+
+    # Also check explicit outcome_columns and decision_columns
+    for col in contract.get("outcome_columns", []) or []:
+        if isinstance(col, str):
+            outcome_cols.add(col)
+    for col in contract.get("decision_columns", []) or []:
+        if isinstance(col, str):
+            decision_cols.add(col)
+
+    # Check 1: forbidden_for_modeling ∩ model_features
+    forbidden_set = set(forbidden)
+    model_set = set(model_features)
+    overlap = forbidden_set & model_set
+
+    if overlap:
+        for col in overlap:
+            model_features.remove(col)
+            issues.append({
+                "rule": "contract_schema_lint.feature_set_coherence",
+                "severity": "warning",
+                "message": f"Column '{col}' in both model_features and forbidden_for_modeling; removed from model_features",
+                "item": col
+            })
+            notes.append(f"feature_set_coherence: removed '{col}' from model_features (was in forbidden)")
+        repaired["model_features"] = model_features
+
+    # Check 2: outcome/decision columns in model_features (leakage-by-contract)
+    leakage_cols = (outcome_cols | decision_cols) & set(model_features)
+    if leakage_cols:
+        for col in leakage_cols:
+            model_features.remove(col)
+            col_type = "outcome" if col in outcome_cols else "decision"
+            issues.append({
+                "rule": "contract_schema_lint.feature_set_coherence",
+                "severity": "warning",
+                "message": f"Leakage-by-contract: {col_type} column '{col}' found in model_features; removed",
+                "item": col
+            })
+            notes.append(f"feature_set_coherence: removed {col_type} column '{col}' from model_features (leakage)")
+        repaired["model_features"] = model_features
+
+    return repaired, issues, notes
+
+
+def lint_artifact_requirements_coherence(
+    contract: Dict[str, Any]
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """
+    Lint artifact_requirements for coherence with required_outputs.
+
+    Rules:
+      - If scored_rows_schema exists and expects scored_rows file but missing in required_outputs → warning
+
+    Returns:
+        (issues, notes)
+    """
+    issues: List[Dict[str, Any]] = []
+    notes: List[str] = []
+
+    artifact_req = contract.get("artifact_requirements")
+    if not isinstance(artifact_req, dict):
+        return [], []
+
+    scored_schema = artifact_req.get("scored_rows_schema")
+    if not isinstance(scored_schema, dict):
+        return [], []
+
+    # Check if schema has required_columns (meaning scored_rows is expected)
+    required_columns = scored_schema.get("required_columns", [])
+    if not required_columns:
+        return [], []
+
+    # Check if scored_rows file is in required_files or required_outputs
+    required_files = artifact_req.get("required_files", [])
+    required_outputs = contract.get("required_outputs", [])
+
+    has_scored_file = False
+
+    # Check in required_files
+    for f in required_files:
+        path = f.get("path", "") if isinstance(f, dict) else str(f)
+        if "scored" in path.lower() and path.endswith(".csv"):
+            has_scored_file = True
+            break
+
+    # Check in required_outputs
+    if not has_scored_file:
+        for item in required_outputs:
+            path = item.get("path", "") if isinstance(item, dict) else str(item)
+            if "scored" in path.lower() and path.endswith(".csv"):
+                has_scored_file = True
+                break
+
+    if not has_scored_file:
+        issues.append({
+            "rule": "contract_schema_lint.artifact_coherence",
+            "severity": "warning",
+            "message": "scored_rows_schema has required_columns but no scored_rows file in required_files/outputs",
+            "item": "scored_rows_schema"
+        })
+        notes.append("artifact_coherence: scored_rows_schema defined but no scored_rows file in outputs")
+
+    return issues, notes
+
+
+def run_contract_schema_linter(
+    contract: Dict[str, Any]
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str]]:
+    """
+    Run the full contract schema linter.
+
+    This is the main entry point for Fix #6 linting.
+    Applies:
+      A) column_roles normalization
+      B) required_columns linting
+      C) allowed_feature_sets coherence
+      D) artifact_requirements coherence
+
+    Args:
+        contract: The contract dictionary (will be mutated)
+
+    Returns:
+        (contract, all_issues, all_notes)
+    """
+    all_issues: List[Dict[str, Any]] = []
+    all_notes: List[str] = []
+    has_critical_error = False
+
+    # A) Lint column_roles
+    normalized_roles, roles_issues, roles_notes = lint_column_roles(contract)
+    contract["column_roles"] = normalized_roles
+    all_issues.extend(roles_issues)
+    all_notes.extend(roles_notes)
+
+    # Check for critical error in column_roles
+    for issue in roles_issues:
+        if issue.get("severity") == "fail":
+            has_critical_error = True
+
+    # B) Lint required_columns in artifact_requirements
+    artifact_req = contract.get("artifact_requirements")
+    if isinstance(artifact_req, dict):
+        scored_schema = artifact_req.get("scored_rows_schema")
+        if isinstance(scored_schema, dict):
+            raw_cols = scored_schema.get("required_columns")
+            clean_cols, cols_issues, cols_notes = lint_required_columns(raw_cols)
+            scored_schema["required_columns"] = clean_cols
+            all_issues.extend(cols_issues)
+            all_notes.extend(cols_notes)
+
+    # C) Lint allowed_feature_sets coherence
+    repaired_afs, afs_issues, afs_notes = lint_allowed_feature_sets_coherence(contract)
+    if repaired_afs:
+        contract["allowed_feature_sets"] = repaired_afs
+    all_issues.extend(afs_issues)
+    all_notes.extend(afs_notes)
+
+    # D) Lint artifact_requirements coherence
+    artifact_issues, artifact_notes = lint_artifact_requirements_coherence(contract)
+    all_issues.extend(artifact_issues)
+    all_notes.extend(artifact_notes)
+
+    return contract, all_issues, all_notes
+
+
 def lint_scored_rows_schema(
     contract: Dict[str, Any]
 ) -> Tuple[List[str], List[str], List[str]]:
@@ -664,6 +1105,7 @@ def validate_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     3) decision_columns only if action_space/levers declared
     4) artifact_requirements.required_files must exist as list
     5) scored_rows_schema.required_columns must exist
+    6) Contract schema linting (Fix #6): column_roles, required_columns, coherence checks
 
     Returns:
         {
@@ -681,6 +1123,10 @@ def validate_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
             "issues": [{"rule": "structure", "severity": "error", "message": "Contract must be a dictionary"}],
             "normalized_artifact_requirements": None
         }
+
+    # Ensure unknowns is a list for traceability
+    if not isinstance(contract.get("unknowns"), list):
+        contract["unknowns"] = []
 
     # =========================================================================
     # STRICT NORMALIZATION (auto-repair)
@@ -771,6 +1217,7 @@ def validate_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
     
     # Normalize artifact_requirements
     artifact_req, normalization_warnings = normalize_artifact_requirements(contract)
+    contract["artifact_requirements"] = artifact_req  # Ensure it's set before linter runs
     for w in normalization_warnings:
         issues.append({
             "rule": "output_ambiguity",
@@ -780,6 +1227,30 @@ def validate_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
         })
         if status == "ok":
             status = "warning"
+
+    # =========================================================================
+    # CONTRACT SCHEMA LINTER (Fix #6)
+    # =========================================================================
+    _, linter_issues, linter_notes = run_contract_schema_linter(contract)
+
+    # Process linter issues
+    for linter_issue in linter_issues:
+        issues.append(linter_issue)
+        severity = linter_issue.get("severity", "warning")
+        if severity == "fail" or severity == "error":
+            status = "error"
+        elif status == "ok":
+            status = "warning"
+
+    # Add linter notes to unknowns for traceability
+    unknowns = contract.get("unknowns")
+    if isinstance(unknowns, list):
+        for note in linter_notes:
+            if note not in unknowns:
+                unknowns.append(note)
+
+    # Update artifact_req after linter may have modified it
+    artifact_req = contract.get("artifact_requirements", artifact_req)
 
     # Get column sets
     canonical_columns = set(contract.get("canonical_columns", []) or [])
