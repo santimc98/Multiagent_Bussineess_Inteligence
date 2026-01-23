@@ -173,7 +173,26 @@ def convert_dataset_profile_to_data_profile(
 
 
 def _extract_outcome_columns(contract: Dict[str, Any]) -> List[str]:
-    """Extract outcome columns from contract (outcome_columns or column_roles.outcome)."""
+    """
+    Extract outcome columns from contract using V4.1 accessor.
+
+    Priority (handled by get_outcome_columns):
+      1. contract["outcome_columns"]
+      2. column_roles["outcome"] (supports all V4.1 formats: role->list, column->role, list of dicts)
+      3. objective_analysis target fields
+      4. Empty list if nothing found
+
+    This is NOT dataset-specific: it's schema-aware extraction.
+    """
+    try:
+        from src.utils.contract_v41 import get_outcome_columns
+        outcomes = get_outcome_columns(contract)
+        if outcomes:
+            return outcomes
+    except ImportError:
+        pass
+
+    # Legacy fallback if contract_v41 not available
     outcome_cols = []
 
     # Try outcome_columns first
@@ -188,11 +207,20 @@ def _extract_outcome_columns(contract: Dict[str, Any]) -> List[str]:
     if not outcome_cols:
         roles = contract.get("column_roles", {})
         if isinstance(roles, dict):
+            # V4.1 format A: role -> list[str]
             outcome_from_roles = roles.get("outcome", [])
             if isinstance(outcome_from_roles, list):
                 outcome_cols = [str(c) for c in outcome_from_roles if c]
             elif isinstance(outcome_from_roles, str):
                 outcome_cols = [outcome_from_roles]
+
+            # V4.1 format C: column -> role (inverted)
+            if not outcome_cols:
+                for col, role in roles.items():
+                    if isinstance(role, str) and role.lower() == "outcome":
+                        outcome_cols.append(str(col))
+                    elif isinstance(role, dict) and role.get("role", "").lower() == "outcome":
+                        outcome_cols.append(str(col))
 
     return outcome_cols
 

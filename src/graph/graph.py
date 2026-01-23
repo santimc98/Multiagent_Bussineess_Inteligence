@@ -8904,8 +8904,8 @@ def run_engineer(state: AgentState) -> AgentState:
             profile_source = "unknown"
 
             # PRIORITY 1: Try to load dataset_profile.json (canonical source)
+            # NOTE: Paths are relative to workspace root (cwd), NOT to work/
             dataset_profile_paths = [
-                "work/data/dataset_profile.json",
                 "data/dataset_profile.json",
             ]
             dataset_profile = None
@@ -8945,17 +8945,14 @@ def run_engineer(state: AgentState) -> AgentState:
                     print(f"DATA_PROFILE: Built from CSV (fallback - dataset_profile.json not found)")
 
             if data_profile:
-                # Ensure canonical directories exist
-                os.makedirs("work/data", exist_ok=True)
-                os.makedirs("work/artifacts", exist_ok=True)
+                # Ensure canonical directory exists (relative to workspace root)
+                os.makedirs("data", exist_ok=True)
 
-                # Save to work/data/ (canonical location for run bundle)
-                write_data_profile(data_profile, "work/data/data_profile.json")
-                # Also save to work/artifacts for backwards compatibility
-                write_data_profile(data_profile, "work/artifacts/data_profile.json")
+                # Save to data/ (canonical location for run bundle capture)
+                write_data_profile(data_profile, "data/data_profile.json")
 
                 state["data_profile"] = data_profile
-                state["data_profile_path"] = "work/data/data_profile.json"
+                state["data_profile_path"] = "data/data_profile.json"
                 state["data_profile_source"] = profile_source
 
                 print(f"DATA_PROFILE: {profile_source} - {data_profile.get('basic_stats', {}).get('n_rows', 0)} rows, "
@@ -9314,14 +9311,12 @@ def run_engineer(state: AgentState) -> AgentState:
                     business_objective=business_objective,
                 )
 
-                # Save ml_plan to canonical locations
-                os.makedirs("work/data", exist_ok=True)
-                dump_json("work/data/ml_plan.json", ml_plan)
-                os.makedirs("work/artifacts", exist_ok=True)
-                dump_json("work/artifacts/ml_plan.json", ml_plan)
+                # Save ml_plan to canonical location (relative to workspace root)
+                os.makedirs("data", exist_ok=True)
+                dump_json("data/ml_plan.json", ml_plan)
 
                 state["ml_plan"] = ml_plan
-                state["ml_plan_path"] = "work/data/ml_plan.json"
+                state["ml_plan_path"] = "data/ml_plan.json"
 
                 print(f"ML_PLAN: Generated plan with training_rows_policy='{ml_plan.get('training_rows_policy')}', "
                       f"metric='{ml_plan.get('metric_policy', {}).get('primary_metric')}', "

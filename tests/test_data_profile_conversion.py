@@ -480,3 +480,153 @@ class TestExtractOutcomeColumns:
         contract = {"outcome_columns": "target"}
         result = _extract_outcome_columns(contract)
         assert result == ["target"]
+
+    def test_extracts_from_v41_column_to_role_format(self):
+        """Test extraction from V4.1 column -> role format (inverted)."""
+        # V4.1 format C: column_roles = {column_name: role_string}
+        contract = {
+            "column_roles": {
+                "PassengerId": "identifier",
+                "Survived": "outcome",
+                "Age": "feature",
+            }
+        }
+        result = _extract_outcome_columns(contract)
+        assert "Survived" in result
+
+    def test_extracts_from_v41_column_to_role_dict_format(self):
+        """Test extraction from V4.1 column -> {role: ...} format."""
+        # V4.1 format C with metadata: column_roles = {column_name: {role: ..., ...}}
+        contract = {
+            "column_roles": {
+                "PassengerId": {"role": "identifier"},
+                "Survived": {"role": "outcome", "nullable": False},
+                "Age": {"role": "feature"},
+            }
+        }
+        result = _extract_outcome_columns(contract)
+        assert "Survived" in result
+
+
+# =============================================================================
+# Tests: V4.1 Contract Schema Support
+# =============================================================================
+
+class TestV41ContractSupport:
+    """Tests for V4.1 contract schema support in conversion."""
+
+    def test_convert_with_v41_inverted_column_roles(self):
+        """Test conversion with V4.1 column -> role format populates outcome_analysis."""
+        dataset_profile = {
+            "rows": 1309,
+            "cols": 13,
+            "columns": ["PassengerId", "Survived", "Pclass", "Age"],
+            "type_hints": {
+                "PassengerId": "numeric",
+                "Survived": "numeric",
+                "Pclass": "numeric",
+                "Age": "numeric",
+            },
+            "missing_frac": {
+                "PassengerId": 0.0,
+                "Survived": 0.319,  # ~32% missing (test set)
+                "Pclass": 0.0,
+                "Age": 0.2,
+            },
+            "cardinality": {
+                "PassengerId": {"unique": 1309, "top_values": []},
+                "Survived": {"unique": 2, "top_values": [
+                    {"value": "0.0", "count": 549},
+                    {"value": "1.0", "count": 342},
+                ]},
+                "Pclass": {"unique": 3, "top_values": []},
+                "Age": {"unique": 98, "top_values": []},
+            },
+        }
+
+        # V4.1 inverted format: column -> role
+        contract_v41 = {
+            "column_roles": {
+                "PassengerId": "identifier",
+                "Survived": "outcome",
+                "Pclass": "feature",
+                "Age": "feature",
+            }
+        }
+
+        result = convert_dataset_profile_to_data_profile(
+            dataset_profile, contract_v41, analysis_type="classification"
+        )
+
+        # Must detect Survived as outcome
+        assert "Survived" in result["outcome_analysis"]
+        outcome = result["outcome_analysis"]["Survived"]
+        assert outcome["present"] is True
+        # null_frac should be ~0.319 from missing_frac
+        assert abs(outcome["null_frac"] - 0.319) < 0.01
+        assert outcome["total_count"] == 1309
+        # non_null_count = 1309 * (1 - 0.319) ≈ 891
+        assert outcome["non_null_count"] == int(1309 * (1 - 0.319))
+
+    def test_convert_with_v41_role_dict_format(self):
+        """Test conversion with V4.1 column -> {role: ...} format."""
+        dataset_profile = {
+            "rows": 100,
+            "cols": 3,
+            "columns": ["id", "target", "feature1"],
+            "type_hints": {"id": "numeric", "target": "numeric", "feature1": "numeric"},
+            "missing_frac": {"id": 0.0, "target": 0.25, "feature1": 0.0},
+            "cardinality": {
+                "id": {"unique": 100, "top_values": []},
+                "target": {"unique": 2, "top_values": []},
+                "feature1": {"unique": 50, "top_values": []},
+            },
+        }
+
+        contract_v41 = {
+            "column_roles": {
+                "id": {"role": "identifier"},
+                "target": {"role": "outcome", "nullable": True},
+                "feature1": {"role": "feature"},
+            }
+        }
+
+        result = convert_dataset_profile_to_data_profile(dataset_profile, contract_v41)
+
+        assert "target" in result["outcome_analysis"]
+        assert result["outcome_analysis"]["target"]["null_frac"] == 0.25
+
+    def test_validation_detects_missing_labels_from_v41_contract(self):
+        """Test that validation catches missing labels with V4.1 contract format."""
+        dataset_profile = {
+            "rows": 1309,
+            "cols": 2,
+            "columns": ["Survived", "Age"],
+            "type_hints": {"Survived": "numeric", "Age": "numeric"},
+            "missing_frac": {"Survived": 0.32, "Age": 0.2},
+            "cardinality": {
+                "Survived": {"unique": 2, "top_values": []},
+                "Age": {"unique": 98, "top_values": []},
+            },
+        }
+
+        contract_v41 = {"column_roles": {"Survived": "outcome", "Age": "feature"}}
+        strategy = {"analysis_type": "classification"}
+
+        data_profile = convert_dataset_profile_to_data_profile(
+            dataset_profile, contract_v41, analysis_type="classification"
+        )
+
+        # Plan that incorrectly uses all rows
+        bad_plan = {
+            "training_rows_policy": "use_all_rows",
+            "metric_policy": {"primary_metric": "roc_auc"},
+            "plan_source": "llm",
+            "evidence_used": {},
+        }
+
+        result = validate_ml_plan_constraints(bad_plan, data_profile, contract_v41, strategy)
+
+        # Must detect the violation
+        assert result["ok"] is False
+        assert any("use_all_rows" in v for v in result["violations"])
