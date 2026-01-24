@@ -121,3 +121,20 @@ def test_contract_min_normalizes_column_role_maps() -> None:
     assert roles.get("decision") == ["ColB"]
     assert roles.get("outcome") == ["ColC"]
     assert roles.get("post_decision_audit_only") == ["ColD"]
+
+
+def test_contract_min_inherits_scored_rows_schema_required_columns() -> None:
+    inventory = ["PassengerId", "Age"]
+    strategy = {"required_columns": ["PassengerId", "Age"]}
+    full_contract = {
+        "artifact_requirements": {
+            "required_files": [{"path": "data/scored_rows.csv"}],
+            "scored_rows_schema": {"required_columns": ["Individual_Triage_List_CSV"]},
+        }
+    }
+    relevant = ["PassengerId", "Age"]
+    contract_min = build_contract_min(full_contract, strategy, inventory, relevant)
+    schema = contract_min.get("artifact_requirements", {}).get("scored_rows_schema", {})
+    required_cols = schema.get("required_columns", [])
+    assert "Individual_Triage_List_CSV" in required_cols
+    assert any(path == "data/scored_rows.csv" for path in contract_min.get("required_outputs", []))

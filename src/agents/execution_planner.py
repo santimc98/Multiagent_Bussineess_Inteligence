@@ -194,6 +194,56 @@ def _extract_required_paths(artifact_requirements: Dict[str, Any]) -> List[str]:
     return paths
 
 
+def _merge_scored_rows_schema(
+    base_schema: Dict[str, Any] | None,
+    incoming_schema: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    base = base_schema if isinstance(base_schema, dict) else {}
+    incoming = incoming_schema if isinstance(incoming_schema, dict) else {}
+    if not base and not incoming:
+        return {}
+    if not base:
+        return dict(incoming)
+    if not incoming:
+        return dict(base)
+
+    def _merge_list(key: str) -> List[str]:
+        merged: List[str] = []
+        seen: set[str] = set()
+        for item in (base.get(key, []) or []) + (incoming.get(key, []) or []):
+            if item is None:
+                continue
+            val = str(item)
+            if not val or val in seen:
+                continue
+            seen.add(val)
+            merged.append(val)
+        return merged
+
+    def _merge_groups(key: str) -> List[List[str]]:
+        merged: List[List[str]] = []
+        seen: set[tuple[str, ...]] = set()
+        for group in (base.get(key, []) or []) + (incoming.get(key, []) or []):
+            if not isinstance(group, list) or not group:
+                continue
+            normalized = tuple(sorted({str(item).lower() for item in group if item}))
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            merged.append([str(item) for item in group if item])
+        return merged
+
+    merged = dict(base)
+    merged["required_columns"] = _merge_list("required_columns")
+    merged["recommended_columns"] = _merge_list("recommended_columns")
+    merged["required_any_of_groups"] = _merge_groups("required_any_of_groups")
+    if base.get("required_any_of_group_severity"):
+        merged["required_any_of_group_severity"] = list(base.get("required_any_of_group_severity") or [])
+    elif incoming.get("required_any_of_group_severity"):
+        merged["required_any_of_group_severity"] = list(incoming.get("required_any_of_group_severity") or [])
+    return merged
+
+
 def _sync_execution_contract_outputs(contract: Dict[str, Any], contract_min: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(contract, dict) or not isinstance(contract_min, dict):
         return contract
@@ -237,6 +287,13 @@ def _sync_execution_contract_outputs(contract: Dict[str, Any], contract_min: Dic
         if merged_files:
             contract_artifacts["required_files"] = merged_files
             contract["artifact_requirements"] = contract_artifacts
+
+    contract_scored_schema = contract_artifacts.get("scored_rows_schema")
+    min_scored_schema = min_artifacts.get("scored_rows_schema")
+    merged_scored_schema = _merge_scored_rows_schema(contract_scored_schema, min_scored_schema)
+    if merged_scored_schema:
+        contract_artifacts["scored_rows_schema"] = merged_scored_schema
+        contract["artifact_requirements"] = contract_artifacts
 
     merged_outputs: List[str] = []
     seen_outputs: set[str] = set()
@@ -1254,12 +1311,21 @@ def build_contract_min(
                 if col not in audit_only_features:
                     audit_only_features.append(col)
 
-    required_outputs = [
+    full_artifact_requirements = contract.get("artifact_requirements")
+    if not isinstance(full_artifact_requirements, dict):
+        full_artifact_requirements = {}
+
+    default_outputs = [
         "data/cleaned_data.csv",
         "data/scored_rows.csv",
         "data/metrics.json",
         "data/alignment_check.json",
     ]
+    full_required_files = _extract_required_paths(full_artifact_requirements)
+    if full_required_files:
+        required_outputs = list(dict.fromkeys(full_required_files + default_outputs))
+    else:
+        required_outputs = list(default_outputs)
 
     # P1.5: Infer feature selectors for wide datasets
     feature_selectors = []
@@ -1309,6 +1375,42 @@ def build_contract_min(
         required_any_of_groups.append(["priority", "rank", "ranking", "triage_priority"])
         required_any_of_group_severity.append("fail")  # Ranking is critical when required
 
+    scored_rows_schema = {
+        "required_columns": scored_rows_required_columns,
+        "required_any_of_groups": required_any_of_groups,
+        "required_any_of_group_severity": required_any_of_group_severity,
+        "recommended_columns": [],
+    }
+    scored_rows_schema = _merge_scored_rows_schema(
+        scored_rows_schema,
+        full_artifact_requirements.get("scored_rows_schema"),
+    )
+
+    required_files: List[Dict[str, Any]] = []
+    if isinstance(full_artifact_requirements.get("required_files"), list):
+        for entry in full_artifact_requirements.get("required_files") or []:
+            if not entry:
+                continue
+            if isinstance(entry, dict):
+                path = entry.get("path") or entry.get("output") or entry.get("artifact")
+                if path and is_probably_path(str(path)):
+                    required_files.append(
+                        {"path": str(path), "description": str(entry.get("description") or "")}
+                    )
+            else:
+                path = str(entry)
+                if path and is_probably_path(path):
+                    required_files.append({"path": path, "description": ""})
+
+    for path in required_outputs:
+        if not path:
+            continue
+        if not is_probably_path(str(path)):
+            continue
+        if any(str(path).lower() == str(item.get("path", "")).lower() for item in required_files):
+            continue
+        required_files.append({"path": str(path), "description": ""})
+
     artifact_requirements = {
         "clean_dataset": {
             "required_columns": canonical_columns,
@@ -1318,16 +1420,9 @@ def build_contract_min(
         "alignment_check": {"required": True, "path": "data/alignment_check.json"},
         "plots": {"optional": True, "expected": ["*.png"]},
         # P1.1: Formal file vs column separation
-        "required_files": [
-            {"path": p, "description": ""} for p in required_outputs
-        ],
-        "scored_rows_schema": {
-            "required_columns": scored_rows_required_columns,
-            "required_any_of_groups": required_any_of_groups,
-            "required_any_of_group_severity": required_any_of_group_severity,
-            "recommended_columns": [],
-        },
-        "file_schemas": contract.get("artifact_requirements", {}).get("file_schemas", {}) if isinstance(contract.get("artifact_requirements"), dict) else {},
+        "required_files": required_files,
+        "scored_rows_schema": scored_rows_schema,
+        "file_schemas": full_artifact_requirements.get("file_schemas", {}) if isinstance(full_artifact_requirements.get("file_schemas"), dict) else {},
         "schema_binding": {
             "required_columns": canonical_columns,
             "optional_passthrough_columns": [],
@@ -5298,6 +5393,20 @@ domain_expert_critique:
             print(f"CONTRACT_VALIDATION_WARNING: {len(validation_result['issues'])} issues found")
             for issue in validation_result["issues"]:
                 print(f"  - [{issue['severity']}] {issue['rule']}: {issue['message']}")
+        issues = validation_result.get("issues") if isinstance(validation_result, dict) else []
+        if isinstance(issues, list):
+            if any(issue.get("rule") == "output_ambiguity" for issue in issues if isinstance(issue, dict)):
+                planner_self_check = contract.get("planner_self_check")
+                if not isinstance(planner_self_check, list):
+                    planner_self_check = []
+                msg = (
+                    "OUTPUT_AMBIGUITY: required_outputs contained non-file entries. "
+                    "Ensure required_outputs are file paths only; move columns to scored_rows_schema "
+                    "and conceptual deliverables to reporting_requirements."
+                )
+                if msg not in planner_self_check:
+                    planner_self_check.append(msg)
+                contract["planner_self_check"] = planner_self_check
         # Store normalized artifact_requirements
         if validation_result.get("normalized_artifact_requirements"):
             contract["artifact_requirements"] = validation_result["normalized_artifact_requirements"]

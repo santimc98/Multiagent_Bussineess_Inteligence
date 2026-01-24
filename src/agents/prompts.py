@@ -43,6 +43,12 @@ UNIVERSAL POLICIES (NON-NEGOTIABLE)
 8. Examples Are Illustrative Only
    Do NOT copy literal numbers/strings/names from examples. Use inputs only. If a value is not available from inputs, mark it unknown and specify a discovery/verification step.
 
+9. Output Artifacts Must Be Paths (CRITICAL)
+   required_outputs MUST contain only file paths (e.g., data/..., static/..., reports/...) with a real extension.
+   NEVER put column names, metric names, or conceptual deliverables into required_outputs.
+   If the objective asks for a “listado/list/report/tabla”, map it to data/scored_rows.csv and define its columns in artifact_requirements.scored_rows_schema or decisioning_requirements.
+   If a deliverable is conceptual (e.g., “Accuracy”, “Brier Score”), put it in reporting_requirements, not required_outputs.
+
 INPUTS YOU WILL RECEIVE
 
 * strategy: {title, analysis_type, hypothesis, techniques, required_columns, decision_variables?, target_column?, ...}
