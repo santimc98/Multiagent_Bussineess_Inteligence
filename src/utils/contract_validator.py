@@ -637,6 +637,48 @@ def _normalize_role(role: str) -> str:
     return ROLE_SYNONYM_MAP.get(r, r)
 
 
+def _extract_role_from_value(value: Any) -> Tuple[str, bool]:
+    """
+    Extract role from a column_roles value that may be str or dict.
+
+    Args:
+        value: The value associated with a column in column_roles.
+               Can be str (the role directly) or dict with role info.
+
+    Returns:
+        (role_string, was_extracted_from_dict)
+        - role_string: The extracted and normalized role
+        - was_extracted_from_dict: True if role was parsed from a dict
+    """
+    # Direct string role
+    if isinstance(value, str):
+        return _normalize_role(value), False
+
+    # Dict with role info: {"role": "outcome", ...} or {"column_role": "target", ...}
+    if isinstance(value, dict):
+        for key in ("role", "column_role", "type", "category"):
+            extracted = value.get(key)
+            if isinstance(extracted, str) and extracted.strip():
+                return _normalize_role(extracted), True
+        # Dict but no recognizable role key
+        return "feature", True
+
+    # Other types (int, list, etc.) - can't extract
+    return "feature", False
+
+
+# Supervised metric tokens - if primary_metric matches these, it's supervised learning
+SUPERVISED_METRIC_TOKENS = {
+    # Classification
+    "accuracy", "roc_auc", "auc", "f1", "f1_score", "precision", "recall",
+    "log_loss", "logloss", "cross_entropy", "balanced_accuracy",
+    "cohen_kappa", "matthews_corrcoef", "mcc", "gini", "normalized_gini",
+    # Regression
+    "rmse", "mae", "mse", "r2", "rmsle", "mean_squared_error",
+    "mean_absolute_error", "root_mean_squared_error",
+}
+
+
 def lint_column_roles(
     contract: Dict[str, Any]
 ) -> Tuple[Dict[str, str], List[Dict[str, Any]], List[str]]:
@@ -666,32 +708,39 @@ def lint_column_roles(
     # Already a dict - normalize roles
     if isinstance(raw, dict):
         normalized: Dict[str, str] = {}
-        for col, role in raw.items():
+        for col, role_value in raw.items():
             if not isinstance(col, str) or not col.strip():
                 continue
             col_clean = col.strip()
-            if isinstance(role, str):
-                role_norm = _normalize_role(role)
-                if role_norm not in CANONICAL_ROLES:
-                    issues.append({
-                        "rule": "contract_schema_lint.column_roles",
-                        "severity": "warning",
-                        "message": f"Unknown role '{role}' for column '{col_clean}'; keeping as-is",
-                        "item": col_clean
-                    })
-                    notes.append(f"column_roles: unknown role '{role}' for '{col_clean}', kept literal")
-                    role_norm = role.strip().lower()  # Keep literal
-                normalized[col_clean] = role_norm
-            else:
-                # Non-string role
+
+            # Extract role from value (handles both str and dict formats)
+            role_norm, was_from_dict = _extract_role_from_value(role_value)
+
+            if was_from_dict:
+                # Log that we parsed role from dict
+                issues.append({
+                    "rule": "contract_schema_lint.column_roles_parsed",
+                    "severity": "info",
+                    "message": f"Parsed role '{role_norm}' for column '{col_clean}' from dict value",
+                    "item": col_clean
+                })
+                notes.append(f"column_roles: parsed '{role_norm}' for '{col_clean}' from dict")
+
+            # Validate the normalized role
+            if role_norm not in CANONICAL_ROLES:
+                original_role = role_value if isinstance(role_value, str) else str(role_value)
                 issues.append({
                     "rule": "contract_schema_lint.column_roles",
                     "severity": "warning",
-                    "message": f"Role for column '{col_clean}' is not a string (type={type(role).__name__}); defaulting to 'feature'",
+                    "message": f"Unknown role '{original_role}' for column '{col_clean}'; keeping as-is",
                     "item": col_clean
                 })
-                notes.append(f"column_roles: non-string role for '{col_clean}', defaulted to 'feature'")
-                normalized[col_clean] = "feature"
+                notes.append(f"column_roles: unknown role '{original_role}' for '{col_clean}', kept literal")
+                # Keep the normalized version even if not canonical
+                if isinstance(role_value, str):
+                    role_norm = role_value.strip().lower()
+
+            normalized[col_clean] = role_norm
         return normalized, issues, notes
 
     # list[dict] format: [{"column": "X", "role": "outcome"}, ...]
@@ -987,24 +1036,246 @@ def lint_artifact_requirements_coherence(
     return issues, notes
 
 
+def _is_supervised_contract(contract: Dict[str, Any]) -> bool:
+    """
+    Determine if the contract implies supervised learning.
+
+    Checks:
+      - validation_requirements.primary_metric is a supervised metric
+      - validation_requirements.metrics_to_report contains supervised metrics
+      - qa_gates contain benchmark/metric gates
+
+    Returns:
+        True if supervised learning is implied.
+    """
+    val_req = contract.get("validation_requirements")
+    if isinstance(val_req, dict):
+        # Check primary_metric
+        primary = val_req.get("primary_metric")
+        if isinstance(primary, str):
+            primary_norm = _normalize_metric_name(primary)
+            if primary_norm in SUPERVISED_METRIC_TOKENS:
+                return True
+
+        # Check metrics_to_report
+        metrics = val_req.get("metrics_to_report", [])
+        if isinstance(metrics, list):
+            for m in metrics:
+                if isinstance(m, str):
+                    m_norm = _normalize_metric_name(m)
+                    if m_norm in SUPERVISED_METRIC_TOKENS:
+                        return True
+
+    # Check qa_gates for benchmark gates
+    qa_gates = contract.get("qa_gates", [])
+    if isinstance(qa_gates, list):
+        for gate in qa_gates:
+            if isinstance(gate, dict):
+                gate_name = str(gate.get("name", "")).lower()
+                if any(kw in gate_name for kw in ("benchmark", "metric", "kpi")):
+                    return True
+
+    return False
+
+
+def _infer_outcome_from_validation_requirements(contract: Dict[str, Any]) -> List[str]:
+    """
+    Attempt to infer outcome column from validation_requirements.params.
+
+    Checks common keys like target, label_column, outcome_column.
+
+    Returns:
+        List of inferred outcome column names.
+    """
+    candidates: List[str] = []
+
+    val_req = contract.get("validation_requirements")
+    if isinstance(val_req, dict):
+        params = val_req.get("params", {})
+        if isinstance(params, dict):
+            for key in ("target", "target_column", "label_column", "outcome_column", "y_column"):
+                val = params.get(key)
+                if isinstance(val, str) and val.strip() and val.lower() != "unknown":
+                    candidates.append(val.strip())
+                elif isinstance(val, list):
+                    for v in val:
+                        if isinstance(v, str) and v.strip() and v.lower() != "unknown":
+                            candidates.append(v.strip())
+
+    # Also check objective_analysis
+    obj_analysis = contract.get("objective_analysis")
+    if isinstance(obj_analysis, dict):
+        for key in ("target_column", "outcome_column", "target", "outcome", "label"):
+            val = obj_analysis.get(key)
+            if isinstance(val, str) and val.strip() and val.lower() != "unknown":
+                if val.strip() not in candidates:
+                    candidates.append(val.strip())
+            elif isinstance(val, list):
+                for v in val:
+                    if isinstance(v, str) and v.strip() and v.lower() != "unknown":
+                        if v.strip() not in candidates:
+                            candidates.append(v.strip())
+
+    return candidates
+
+
+def lint_outcome_presence_and_coherence(
+    contract: Dict[str, Any]
+) -> Tuple[List[Dict[str, Any]], List[str], bool]:
+    """
+    Lint outcome column presence and coherence for supervised learning contracts.
+
+    Rules:
+      - If supervised and outcome_columns empty → try to infer from column_roles/params
+      - If still empty after inference → HARD error (status="error")
+      - Ensure outcomes are in canonical_columns (auto-repair)
+      - Ensure outcomes are NOT in model_features (auto-repair via forbidden_for_modeling)
+
+    Args:
+        contract: The contract dictionary (will be mutated for auto-repair)
+
+    Returns:
+        (issues, notes, has_critical_error)
+    """
+    issues: List[Dict[str, Any]] = []
+    notes: List[str] = []
+    has_critical_error = False
+
+    # Determine if supervised
+    is_supervised = _is_supervised_contract(contract)
+    if not is_supervised:
+        return issues, notes, has_critical_error
+
+    # Collect outcome candidates
+    outcome_candidates: List[str] = []
+
+    # Source 1: column_roles with role == "outcome"
+    column_roles = contract.get("column_roles", {})
+    if isinstance(column_roles, dict):
+        for col, role in column_roles.items():
+            if isinstance(role, str) and role.lower() == "outcome":
+                if col not in outcome_candidates:
+                    outcome_candidates.append(col)
+
+    # Source 2: explicit outcome_columns
+    explicit_outcomes = contract.get("outcome_columns", [])
+    if isinstance(explicit_outcomes, list):
+        for oc in explicit_outcomes:
+            if isinstance(oc, str) and oc.strip() and oc.lower() != "unknown":
+                if oc.strip() not in outcome_candidates:
+                    outcome_candidates.append(oc.strip())
+    elif isinstance(explicit_outcomes, str) and explicit_outcomes.lower() != "unknown":
+        if explicit_outcomes.strip() not in outcome_candidates:
+            outcome_candidates.append(explicit_outcomes.strip())
+
+    # Source 3: validation_requirements.params and objective_analysis
+    inferred = _infer_outcome_from_validation_requirements(contract)
+    for col in inferred:
+        if col not in outcome_candidates:
+            outcome_candidates.append(col)
+            notes.append(f"outcome_coherence: inferred outcome '{col}' from validation_requirements/objective_analysis")
+
+    # If still no outcomes → HARD error for supervised contract
+    if not outcome_candidates:
+        issues.append({
+            "rule": "contract_schema_lint.outcome_required",
+            "severity": "error",
+            "message": "Supervised learning contract requires outcome_columns but none found or inferable. "
+                       "Specify outcome_columns or mark a column with role='outcome' in column_roles.",
+            "item": "outcome_columns"
+        })
+        notes.append("outcome_coherence: CRITICAL - supervised contract has no outcome column")
+        has_critical_error = True
+        return issues, notes, has_critical_error
+
+    # =========================================================================
+    # Auto-repair: Ensure outcomes are properly configured
+    # =========================================================================
+
+    # Ensure outcome_columns is set
+    contract["outcome_columns"] = outcome_candidates
+
+    # Ensure outcomes are in canonical_columns
+    canonical = contract.get("canonical_columns", [])
+    if not isinstance(canonical, list):
+        canonical = []
+
+    canonical_lower = {c.lower() for c in canonical if isinstance(c, str)}
+    added_to_canonical = []
+    for oc in outcome_candidates:
+        if oc.lower() not in canonical_lower:
+            canonical.append(oc)
+            canonical_lower.add(oc.lower())
+            added_to_canonical.append(oc)
+
+    if added_to_canonical:
+        contract["canonical_columns"] = canonical
+        issues.append({
+            "rule": "contract_schema_lint.outcome_in_canonical",
+            "severity": "warning",
+            "message": f"Auto-added outcome column(s) {added_to_canonical} to canonical_columns",
+            "item": added_to_canonical
+        })
+        notes.append(f"outcome_coherence: added {added_to_canonical} to canonical_columns")
+
+    # Ensure outcomes have role="outcome" in column_roles
+    if isinstance(column_roles, dict):
+        for oc in outcome_candidates:
+            current_role = column_roles.get(oc)
+            if current_role != "outcome":
+                column_roles[oc] = "outcome"
+                if current_role:
+                    notes.append(f"outcome_coherence: changed column_roles['{oc}'] from '{current_role}' to 'outcome'")
+                else:
+                    notes.append(f"outcome_coherence: set column_roles['{oc}'] = 'outcome'")
+        contract["column_roles"] = column_roles
+
+    # Ensure outcomes are in forbidden_for_modeling (to prevent leakage)
+    allowed_sets = contract.get("allowed_feature_sets", {})
+    if isinstance(allowed_sets, dict):
+        forbidden = allowed_sets.get("forbidden_for_modeling", [])
+        if not isinstance(forbidden, list):
+            forbidden = []
+
+        forbidden_lower = {f.lower() for f in forbidden if isinstance(f, str)}
+        added_to_forbidden = []
+        for oc in outcome_candidates:
+            if oc.lower() not in forbidden_lower:
+                forbidden.append(oc)
+                forbidden_lower.add(oc.lower())
+                added_to_forbidden.append(oc)
+
+        if added_to_forbidden:
+            allowed_sets["forbidden_for_modeling"] = forbidden
+            contract["allowed_feature_sets"] = allowed_sets
+            notes.append(f"outcome_coherence: added {added_to_forbidden} to forbidden_for_modeling")
+
+    return issues, notes, has_critical_error
+
+
 def run_contract_schema_linter(
     contract: Dict[str, Any]
-) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str]]:
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[str], bool]:
     """
     Run the full contract schema linter.
 
-    This is the main entry point for Fix #6 linting.
+    This is the main entry point for Fix #6 + Fix #7 linting.
     Applies:
       A) column_roles normalization
       B) required_columns linting
       C) allowed_feature_sets coherence
       D) artifact_requirements coherence
+      E) outcome presence and coherence (Fix #7)
 
     Args:
         contract: The contract dictionary (will be mutated)
 
     Returns:
-        (contract, all_issues, all_notes)
+        (contract, all_issues, all_notes, has_critical_error)
+        - contract: The mutated contract with normalizations applied
+        - all_issues: List of issue dicts with rule, severity, message, item
+        - all_notes: List of repair notes for traceability
+        - has_critical_error: True if a critical/unrecoverable error was found
     """
     all_issues: List[Dict[str, Any]] = []
     all_notes: List[str] = []
@@ -1044,7 +1315,14 @@ def run_contract_schema_linter(
     all_issues.extend(artifact_issues)
     all_notes.extend(artifact_notes)
 
-    return contract, all_issues, all_notes
+    # E) Lint outcome presence and coherence (Fix #7)
+    outcome_issues, outcome_notes, outcome_critical = lint_outcome_presence_and_coherence(contract)
+    all_issues.extend(outcome_issues)
+    all_notes.extend(outcome_notes)
+    if outcome_critical:
+        has_critical_error = True
+
+    return contract, all_issues, all_notes, has_critical_error
 
 
 def lint_scored_rows_schema(
@@ -1229,9 +1507,9 @@ def validate_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
             status = "warning"
 
     # =========================================================================
-    # CONTRACT SCHEMA LINTER (Fix #6)
+    # CONTRACT SCHEMA LINTER (Fix #6 + Fix #7)
     # =========================================================================
-    _, linter_issues, linter_notes = run_contract_schema_linter(contract)
+    _, linter_issues, linter_notes, linter_critical = run_contract_schema_linter(contract)
 
     # Process linter issues
     for linter_issue in linter_issues:
@@ -1239,8 +1517,12 @@ def validate_contract(contract: Dict[str, Any]) -> Dict[str, Any]:
         severity = linter_issue.get("severity", "warning")
         if severity == "fail" or severity == "error":
             status = "error"
-        elif status == "ok":
+        elif status == "ok" and severity != "info":
             status = "warning"
+
+    # Critical error from linter (e.g., missing outcome for supervised contract)
+    if linter_critical:
+        status = "error"
 
     # Add linter notes to unknowns for traceability
     unknowns = contract.get("unknowns")

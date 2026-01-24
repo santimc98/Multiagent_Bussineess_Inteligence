@@ -413,11 +413,12 @@ class TestValidateContractIntegration:
         """Properly structured contract passes with ok/warning status."""
         contract = {
             "canonical_columns": ["A", "B", "target"],
+            "column_roles": {"target": "outcome", "A": "feature", "B": "feature"},
             "allowed_feature_sets": {
                 "model_features": ["A", "B"],
                 "segmentation_features": [],
                 "audit_only_features": [],
-                "forbidden_for_modeling": [],
+                "forbidden_for_modeling": ["target"],
                 "rationale": "Preselected",
             },
             "validation_requirements": {
@@ -432,6 +433,6 @@ class TestValidateContractIntegration:
             },
         }
         result = validate_contract(contract)
-        
-        # Should not be error
+
+        # Should not be error (target is properly defined as outcome)
         assert result["status"] in ("ok", "warning")

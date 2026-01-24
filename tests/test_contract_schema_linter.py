@@ -319,7 +319,7 @@ class TestRunContractSchemaLinter:
                 "forbidden_for_modeling": [],
             }
         }
-        result_contract, issues, notes = run_contract_schema_linter(contract)
+        result_contract, issues, notes, _ = run_contract_schema_linter(contract)
 
         # column_roles should be normalized
         assert isinstance(result_contract["column_roles"], dict)

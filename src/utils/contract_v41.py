@@ -309,13 +309,14 @@ def get_column_roles(contract: Dict[str, Any]) -> Dict[str, List[str]]:
 def get_outcome_columns(contract: Dict[str, Any]) -> List[str]:
     """
     Return the list of outcome column names.
-    
+
     Priority:
       1. contract["outcome_columns"] if provided
       2. column_roles["outcome"] if exists
-      3. objective_analysis if contains target-related info
-      3. Empty list if nothing found
-    
+      3. validation_requirements.params (target, label_column, outcome_column)
+      4. objective_analysis if contains target-related info
+      5. Empty list if nothing found
+
     Returns:
         List of outcome column names. Empty if not specified or 'unknown'.
     """
@@ -327,13 +328,27 @@ def get_outcome_columns(contract: Dict[str, Any]) -> List[str]:
         return [str(v) for v in explicit if v and str(v).lower() != "unknown"]
     if isinstance(explicit, str) and explicit.lower() != "unknown":
         return [explicit]
-    
+
     # First: try column_roles["outcome"]
     roles = get_column_roles(contract)
     outcome_cols = roles.get("outcome", [])
     if outcome_cols:
         return [c for c in outcome_cols if c and c.lower() != "unknown"]
-    
+
+    # Fallback: validation_requirements.params
+    val_req = contract.get("validation_requirements")
+    if isinstance(val_req, dict):
+        params = val_req.get("params", {})
+        if isinstance(params, dict):
+            for key in ("target", "target_column", "label_column", "outcome_column", "y_column"):
+                val = params.get(key)
+                if isinstance(val, str) and val.strip() and val.lower() != "unknown":
+                    return [val.strip()]
+                elif isinstance(val, list):
+                    result = [str(v).strip() for v in val if v and str(v).lower() != "unknown"]
+                    if result:
+                        return result
+
     # Fallback: objective_analysis
     obj_analysis = contract.get("objective_analysis")
     if isinstance(obj_analysis, dict):
@@ -345,7 +360,7 @@ def get_outcome_columns(contract: Dict[str, Any]) -> List[str]:
                     return [str(v) for v in val if v and str(v).lower() != "unknown"]
                 elif isinstance(val, str) and val.lower() != "unknown":
                     return [val]
-    
+
     return []
 
 
