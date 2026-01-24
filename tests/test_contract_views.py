@@ -46,6 +46,32 @@ def test_ml_view_includes_required_fields():
     assert decisioning.get("enabled") is False
 
 
+def test_ml_view_includes_scored_rows_schema():
+    contract_min = {
+        "canonical_columns": ["id", "feature_a"],
+        "column_roles": {"pre_decision": ["id", "feature_a"]},
+        "allowed_feature_sets": {
+            "model_features": ["feature_a"],
+            "segmentation_features": ["feature_a"],
+            "forbidden_features": [],
+        },
+        "artifact_requirements": {
+            "required_files": [{"path": "data/scored_rows.csv"}],
+            "scored_rows_schema": {
+                "required_columns": ["id", "prediction"],
+                "required_any_of_groups": [["prediction", "probability"]],
+                "required_any_of_group_severity": ["fail"],
+            },
+        },
+        "required_outputs": ["data/scored_rows.csv"],
+    }
+    ml_view = build_ml_view({}, contract_min, [])
+    artifact_requirements = ml_view.get("artifact_requirements") or {}
+    scored_schema = artifact_requirements.get("scored_rows_schema") or {}
+    assert scored_schema.get("required_columns") == ["id", "prediction"]
+    assert scored_schema.get("required_any_of_groups")
+
+
 def test_ml_view_includes_plot_spec_from_policy():
     contract_full = {
         "canonical_columns": ["col_a"],

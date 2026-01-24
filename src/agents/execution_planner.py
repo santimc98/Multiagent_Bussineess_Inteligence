@@ -244,6 +244,126 @@ def _merge_scored_rows_schema(
     return merged
 
 
+def _merge_unique_values(values: List[str], extras: List[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for item in values + extras:
+        if not item:
+            continue
+        text = str(item)
+        if text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _normalize_column_token(name: str) -> str:
+    return re.sub(r"[^0-9a-zA-Z]+", "", str(name or "").lower())
+
+
+def _extract_decisioning_required_column_names(decisioning: Dict[str, Any] | None) -> List[str]:
+    if not isinstance(decisioning, dict):
+        return []
+    if decisioning.get("required") is not True:
+        return []
+    output = decisioning.get("output")
+    if not isinstance(output, dict):
+        return []
+    required_columns = output.get("required_columns")
+    if not isinstance(required_columns, list):
+        return []
+    names: List[str] = []
+    for entry in required_columns:
+        if not entry:
+            continue
+        if isinstance(entry, dict):
+            name = entry.get("name") or entry.get("column")
+        else:
+            name = entry
+        if name:
+            names.append(str(name))
+    return names
+
+
+def _is_prediction_like_column(name: str) -> bool:
+    token = _normalize_column_token(name)
+    if not token:
+        return False
+    return any(
+        key in token
+        for key in (
+            "pred",
+            "prob",
+            "score",
+            "risk",
+            "likelihood",
+            "chance",
+        )
+    )
+
+
+def _align_decisioning_requirements_with_schema(
+    decisioning: Dict[str, Any] | None,
+    scored_rows_schema: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    if not isinstance(decisioning, dict):
+        return {}
+    if not isinstance(scored_rows_schema, dict):
+        return decisioning
+    required_cols = scored_rows_schema.get("required_columns")
+    if not isinstance(required_cols, list) or not required_cols:
+        return decisioning
+
+    explanation_name = None
+    for col in required_cols:
+        if _normalize_column_token(col) == "explanation":
+            explanation_name = str(col)
+            break
+    if explanation_name is None:
+        for col in required_cols:
+            if "driver" in _normalize_column_token(col):
+                explanation_name = str(col)
+                break
+    if explanation_name is None:
+        return decisioning
+
+    output = decisioning.get("output")
+    if not isinstance(output, dict):
+        return decisioning
+    required = output.get("required_columns")
+    if not isinstance(required, list) or not required:
+        return decisioning
+
+    updated: List[Any] = []
+    touched = False
+    for entry in required:
+        if isinstance(entry, dict):
+            name = entry.get("name")
+            role = str(entry.get("role") or "").lower()
+            if role == "explanation" or _normalize_column_token(name) in {"explanation", "topdrivers", "topdriver"}:
+                updated_entry = dict(entry)
+                updated_entry["name"] = explanation_name
+                updated.append(updated_entry)
+                touched = True
+            else:
+                updated.append(entry)
+        else:
+            name = str(entry)
+            if _normalize_column_token(name) in {"explanation", "topdrivers", "topdriver"}:
+                updated.append(explanation_name)
+                touched = True
+            else:
+                updated.append(entry)
+    if not touched:
+        return decisioning
+    aligned = dict(decisioning)
+    new_output = dict(output)
+    new_output["required_columns"] = updated
+    aligned["output"] = new_output
+    return aligned
+
+
 def _sync_execution_contract_outputs(contract: Dict[str, Any], contract_min: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(contract, dict) or not isinstance(contract_min, dict):
         return contract
@@ -1385,6 +1505,36 @@ def build_contract_min(
         scored_rows_schema,
         full_artifact_requirements.get("scored_rows_schema"),
     )
+    decisioning_requirements = _align_decisioning_requirements_with_schema(
+        contract.get("decisioning_requirements", {}),
+        scored_rows_schema,
+    )
+    decisioning_required = _extract_decisioning_required_column_names(decisioning_requirements)
+    if decisioning_required:
+        scored_rows_schema["required_columns"] = _merge_unique_values(
+            scored_rows_schema.get("required_columns", []) or [],
+            decisioning_required,
+        )
+    required_cols_for_anyof = scored_rows_schema.get("required_columns")
+    anyof_groups = scored_rows_schema.get("required_any_of_groups")
+    if isinstance(required_cols_for_anyof, list) and isinstance(anyof_groups, list):
+        prediction_group = None
+        for group in anyof_groups:
+            if not isinstance(group, list):
+                continue
+            if any(_is_prediction_like_column(item) for item in group):
+                prediction_group = group
+                break
+        if prediction_group is not None:
+            seen = {_normalize_column_token(item) for item in prediction_group if item}
+            for col in required_cols_for_anyof:
+                if not col or not _is_prediction_like_column(col):
+                    continue
+                norm = _normalize_column_token(col)
+                if norm in seen:
+                    continue
+                prediction_group.append(col)
+                seen.add(norm)
 
     required_files: List[Dict[str, Any]] = []
     if isinstance(full_artifact_requirements.get("required_files"), list):
@@ -1524,7 +1674,7 @@ def build_contract_min(
         "ml_engineer_runbook": ml_engineer_runbook,
         "omitted_columns_policy": omitted_columns_policy,
         "reporting_policy": reporting_policy or {},
-        "decisioning_requirements": contract.get("decisioning_requirements", {}),
+        "decisioning_requirements": decisioning_requirements,
     }
     if training_rows_rule:
         contract_min["training_rows_rule"] = training_rows_rule
@@ -2516,6 +2666,27 @@ def _build_decisioning_requirements(
     id_column = next((col for col in canonical_columns if re.search(r"^id$|_id$|row_id", col, flags=re.IGNORECASE)), None)
     key_columns = [id_column] if id_column else canonical_columns[:1]
 
+    def _resolve_explanation_column_name() -> str:
+        artifact_reqs = contract.get("artifact_requirements")
+        if not isinstance(artifact_reqs, dict):
+            artifact_reqs = {}
+        scored_schema = artifact_reqs.get("scored_rows_schema")
+        required_cols: List[str] = []
+        if isinstance(scored_schema, dict):
+            required = scored_schema.get("required_columns")
+            if isinstance(required, list):
+                required_cols = [str(c) for c in required if c]
+        if required_cols:
+            for col in required_cols:
+                if _normalize_column_token(col) == "explanation":
+                    return col
+            for col in required_cols:
+                if "driver" in _normalize_column_token(col):
+                    return col
+        if any(tok in strategy_text for tok in ["driver", "drivers", "factor", "factors"]):
+            return "top_drivers"
+        return "explanation"
+
     def _has_objective(tok_list: List[str]) -> bool:
         return any(tok in objective_type for tok in tok_list) or _contains_decisioning_token(strategy_text, set(tok_list))
 
@@ -2577,7 +2748,7 @@ def _build_decisioning_requirements(
             )
         )
     if explanation_needed:
-        name_hint = "top_drivers" if any(tok in strategy_text for tok in ["driver", "drivers", "factor", "factors"]) else "explanation"
+        name_hint = _resolve_explanation_column_name()
         if not any(str(entry.get("name")) == name_hint for entry in columns if isinstance(entry, dict)):
             columns.append(
                 _build_decision_column_entry(

@@ -59,6 +59,7 @@ class MLView(TypedDict, total=False):
     validation_requirements: Dict[str, Any]
     case_rules: Any
     plot_spec: Dict[str, Any]
+    artifact_requirements: Dict[str, Any]
 
 
 class ReviewerView(TypedDict, total=False):
@@ -861,6 +862,39 @@ def build_ml_view(
     validation = _resolve_validation_requirements(contract_min, contract_full)
     case_rules = _resolve_case_rules(contract_full)
 
+    artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
+        contract_full.get("artifact_requirements")
+    )
+    scored_rows_schema: Dict[str, Any] = {}
+    if isinstance(artifact_reqs.get("scored_rows_schema"), dict):
+        scored_rows_schema = {
+            key: artifact_reqs["scored_rows_schema"].get(key)
+            for key in (
+                "required_columns",
+                "recommended_columns",
+                "required_any_of_groups",
+                "required_any_of_group_severity",
+            )
+            if artifact_reqs["scored_rows_schema"].get(key) not in (None, [], {})
+        }
+    required_files_payload: List[str] = []
+    required_files = artifact_reqs.get("required_files")
+    if isinstance(required_files, list):
+        for entry in required_files:
+            if not entry:
+                continue
+            if isinstance(entry, dict):
+                path = entry.get("path") or entry.get("output") or entry.get("artifact")
+                if path:
+                    required_files_payload.append(str(path))
+            else:
+                required_files_payload.append(str(entry))
+    artifact_payload: Dict[str, Any] = {"required_outputs": required_outputs}
+    if required_files_payload:
+        artifact_payload["required_files"] = required_files_payload
+    if scored_rows_schema:
+        artifact_payload["scored_rows_schema"] = scored_rows_schema
+
     view: MLView = {
         "role": "ml_engineer",
         "objective_type": objective_type,
@@ -902,9 +936,8 @@ def build_ml_view(
         "strict_allowed_by_contract": strict_allowed_by_contract,
         "candidate_allowed_by_contract": candidate_allowed_by_contract,
     }
-    artifact_reqs = _coerce_dict(contract_min.get("artifact_requirements")) or _coerce_dict(
-        contract_full.get("artifact_requirements")
-    )
+    if artifact_payload:
+        view["artifact_requirements"] = artifact_payload
     visual_reqs = (
         artifact_reqs.get("visual_requirements") if isinstance(artifact_reqs.get("visual_requirements"), dict) else {}
     )

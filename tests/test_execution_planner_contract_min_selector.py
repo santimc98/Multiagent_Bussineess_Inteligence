@@ -138,3 +138,77 @@ def test_contract_min_inherits_scored_rows_schema_required_columns() -> None:
     required_cols = schema.get("required_columns", [])
     assert "Individual_Triage_List_CSV" in required_cols
     assert any(path == "data/scored_rows.csv" for path in contract_min.get("required_outputs", []))
+
+
+def test_contract_min_includes_decisioning_required_columns() -> None:
+    inventory = ["id", "feature_a"]
+    strategy = {"required_columns": ["id", "feature_a"]}
+    full_contract = {
+        "decisioning_requirements": {
+            "enabled": True,
+            "required": True,
+            "output": {
+                "file": "data/scored_rows.csv",
+                "required_columns": [
+                    {"name": "priority_score", "role": "score"},
+                    {"name": "priority_rank", "role": "priority"},
+                    {"name": "explanation", "role": "explanation"},
+                ],
+            },
+        },
+        "artifact_requirements": {
+            "required_files": [{"path": "data/scored_rows.csv"}],
+        },
+    }
+    contract_min = build_contract_min(full_contract, strategy, inventory, inventory)
+    schema = contract_min.get("artifact_requirements", {}).get("scored_rows_schema", {})
+    required_cols = schema.get("required_columns", [])
+    assert "priority_score" in required_cols
+    assert "priority_rank" in required_cols
+    assert "explanation" in required_cols
+
+
+def test_contract_min_adds_prediction_like_required_to_anyof_group() -> None:
+    inventory = ["id", "feature_a"]
+    strategy = {"required_columns": ["id", "feature_a"]}
+    full_contract = {
+        "artifact_requirements": {
+            "required_files": [{"path": "data/scored_rows.csv"}],
+            "scored_rows_schema": {"required_columns": ["survival_probability"]},
+        }
+    }
+    contract_min = build_contract_min(full_contract, strategy, inventory, inventory)
+    schema = contract_min.get("artifact_requirements", {}).get("scored_rows_schema", {})
+    groups = schema.get("required_any_of_groups", [])
+    assert any(
+        isinstance(group, list) and "survival_probability" in group
+        for group in groups
+    )
+
+
+def test_contract_min_aligns_decisioning_explanation_name() -> None:
+    inventory = ["id", "feature_a"]
+    strategy = {"required_columns": ["id", "feature_a"]}
+    full_contract = {
+        "decisioning_requirements": {
+            "enabled": True,
+            "required": True,
+            "output": {
+                "file": "data/scored_rows.csv",
+                "required_columns": [
+                    {"name": "top_drivers", "role": "explanation"},
+                ],
+            },
+        },
+        "artifact_requirements": {
+            "required_files": [{"path": "data/scored_rows.csv"}],
+            "scored_rows_schema": {"required_columns": ["explanation"]},
+        },
+    }
+    contract_min = build_contract_min(full_contract, strategy, inventory, inventory)
+    decisioning = contract_min.get("decisioning_requirements", {})
+    required_cols = decisioning.get("output", {}).get("required_columns", [])
+    assert any(
+        isinstance(entry, dict) and entry.get("name") == "explanation"
+        for entry in required_cols
+    )
