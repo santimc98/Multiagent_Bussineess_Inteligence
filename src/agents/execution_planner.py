@@ -610,6 +610,104 @@ def _apply_cleaning_gate_policy(raw_gates: Any) -> List[Dict[str, Any]]:
     return gates
 
 
+_DEFAULT_MISSING_CATEGORY_VALUE = "__MISSING__"
+_UNSAFE_MISSING_CATEGORY_VALUES = {
+    "",
+    "none",
+    "null",
+    "nan",
+    "na",
+    "n/a",
+    "nil",
+}
+
+
+def _normalize_missing_category_value(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if cleaned.strip().lower() in _UNSAFE_MISSING_CATEGORY_VALUES:
+        return None
+    return cleaned
+
+
+def _normalize_gate_name(name: Any) -> str:
+    if not name:
+        return ""
+    text = str(name).strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    return text
+
+
+def _ensure_missing_category_values(contract: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Ensure preprocessing_requirements.nan_strategies missing_category entries
+    have a safe missing_category_value and propagate it into null_handling_gate
+    params for reviewer visibility.
+    """
+    if not isinstance(contract, dict):
+        return contract
+    prep = contract.get("preprocessing_requirements")
+    if not isinstance(prep, dict):
+        return contract
+    nan_strategies = prep.get("nan_strategies")
+    if not isinstance(nan_strategies, list):
+        return contract
+
+    missing_category_map: Dict[str, str] = {}
+    updated = False
+    for strategy in nan_strategies:
+        if not isinstance(strategy, dict):
+            continue
+        strat_name = str(strategy.get("strategy") or "").strip().lower()
+        if strat_name != "missing_category":
+            continue
+        col = strategy.get("column") or strategy.get("name")
+        if not col:
+            continue
+        col_name = str(col)
+        value = _normalize_missing_category_value(strategy.get("missing_category_value"))
+        if not value:
+            value = _DEFAULT_MISSING_CATEGORY_VALUE
+            strategy["missing_category_value"] = value
+            updated = True
+        missing_category_map[col_name] = value
+
+    if missing_category_map:
+        gates = contract.get("cleaning_gates")
+        if isinstance(gates, list):
+            for gate in gates:
+                if not isinstance(gate, dict):
+                    continue
+                gate_name = gate.get("name") or gate.get("id") or gate.get("gate")
+                if _normalize_gate_name(gate_name) != "null_handling_gate":
+                    continue
+                params = gate.get("params")
+                if not isinstance(params, dict):
+                    params = {}
+                missing_values = params.get("missing_category_values")
+                if not isinstance(missing_values, dict):
+                    missing_values = {}
+                for col, value in missing_category_map.items():
+                    if col not in missing_values:
+                        missing_values[col] = value
+                        updated = True
+                params["missing_category_values"] = missing_values
+                gate["params"] = params
+
+    if updated:
+        notes = contract.get("notes_for_engineers")
+        if not isinstance(notes, list):
+            notes = []
+        msg = "Injected missing_category_value for missing_category strategies to avoid NA sentinel collisions."
+        if msg not in notes:
+            notes.append(msg)
+        contract["notes_for_engineers"] = notes
+    return contract
+
+
 def _strategy_mentions_resampling(strategy: Dict[str, Any], business_objective: str) -> bool:
     if not isinstance(strategy, dict):
         strategy = {}
@@ -1614,6 +1712,34 @@ def build_contract_min(
         "Ignored by default unless promoted by strategy/explicit mention; available via column_inventory."
     )
 
+    def _extract_preprocessing_requirements_min(source: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(source, dict):
+            return {}
+        prep = source.get("preprocessing_requirements")
+        if not isinstance(prep, dict):
+            return {}
+        out: Dict[str, Any] = {}
+        nan_strategies = prep.get("nan_strategies")
+        if isinstance(nan_strategies, list):
+            trimmed = []
+            for item in nan_strategies:
+                if not isinstance(item, dict):
+                    continue
+                entry: Dict[str, Any] = {}
+                for key in ("column", "strategy", "missing_category_value", "owner", "group_by"):
+                    if key in item and item.get(key) not in (None, ""):
+                        entry[key] = item.get(key)
+                if entry:
+                    trimmed.append(entry)
+            if trimmed:
+                out["nan_strategies"] = trimmed
+        default_val = prep.get("missing_category_default")
+        if isinstance(default_val, str) and default_val.strip():
+            out["missing_category_default"] = default_val.strip()
+        return out
+
+    prep_reqs_min = _extract_preprocessing_requirements_min(contract)
+
     reporting_policy = contract.get("reporting_policy")
     if not isinstance(reporting_policy, dict) or not reporting_policy:
         execution_plan = contract.get("execution_plan")
@@ -1676,6 +1802,8 @@ def build_contract_min(
         "reporting_policy": reporting_policy or {},
         "decisioning_requirements": decisioning_requirements,
     }
+    if prep_reqs_min:
+        contract_min["preprocessing_requirements"] = prep_reqs_min
     if training_rows_rule:
         contract_min["training_rows_rule"] = training_rows_rule
     if scoring_rows_rule:
@@ -5528,6 +5656,7 @@ domain_expert_critique:
         )
         contract = _ensure_benchmark_kpi_gate(contract, strategy, business_objective or "")
         contract["cleaning_gates"] = _apply_cleaning_gate_policy(contract.get("cleaning_gates"))
+        contract = _ensure_missing_category_values(contract)
 
         if column_inventory and not contract.get("available_columns"):
             contract["available_columns"] = column_inventory
