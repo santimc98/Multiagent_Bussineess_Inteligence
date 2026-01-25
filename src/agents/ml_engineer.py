@@ -542,6 +542,7 @@ class MLEngineerAgent:
         training_rows_rule = context.get("training_rows_rule")
         training_rows_policy = context.get("training_rows_policy")
         split_column = context.get("split_column")
+        plan = ml_plan or {}
 
         requires_label_filter = False
         if isinstance(training_rows_policy, str) and training_rows_policy in {"only_rows_with_label"}:
@@ -552,7 +553,28 @@ class MLEngineerAgent:
                 requires_label_filter = True
 
         if requires_label_filter and not self._code_mentions_label_filter(code, target):
-            issues.append("training_rows_filter_missing")
+            split_ok = False
+            if split_column and self._code_mentions_split_usage(code, split_column):
+                evidence = plan.get("evidence_used") if isinstance(plan.get("evidence_used"), dict) else {}
+                split_eval = str(evidence.get("split_evaluation", "")).lower()
+                split_candidates = evidence.get("split_candidates") if isinstance(evidence.get("split_candidates"), list) else []
+                uses_split = "split" in split_eval and "use" in split_eval
+                has_train_test = False
+                for cand in split_candidates:
+                    if not isinstance(cand, dict):
+                        continue
+                    if str(cand.get("column") or "") != str(split_column):
+                        continue
+                    values = cand.get("values")
+                    if isinstance(values, list):
+                        lowered = {str(v).lower() for v in values}
+                        if "train" in lowered and "test" in lowered:
+                            has_train_test = True
+                            break
+                if uses_split or has_train_test:
+                    split_ok = True
+            if not split_ok:
+                issues.append("training_rows_filter_missing")
 
         requires_split = isinstance(training_rows_policy, str) and training_rows_policy == "use_split_column"
         if requires_split and not self._code_mentions_split_usage(code, split_column):
