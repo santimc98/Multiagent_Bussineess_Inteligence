@@ -8626,17 +8626,15 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         print("⚠️ DESTRUCTIVE_CONVERSION_GUARD: retrying Data Engineer once with patch instructions.")
                         return run_data_engineer(new_state)
                     conflict_msg = f" Alias conflicts: {alias_conflicts}" if alias_conflicts else ""
-                    failure_msg = f"CRITICAL: Missing required columns after mapping: {missing_input}.{conflict_msg} Cleaning failed to provide necessary features."
-                    return {
-                        "cleaning_code": code,
-                        "cleaned_data_preview": "Error: Missing Columns",
-                        "error_message": failure_msg,
-                        "csv_sep": csv_sep,
-                        "csv_decimal": csv_decimal,
-                        "csv_encoding": csv_encoding,
-                        "leakage_audit_summary": leakage_audit_summary,
-                        "budget_counters": counters,
-                    }
+                    warning_msg = f"MISSING_REQUIRED_COLUMNS_AFTER_MAPPING: {missing_input}.{conflict_msg}"
+                    warnings = state.get("data_engineer_guard_warnings")
+                    if not isinstance(warnings, list):
+                        warnings = []
+                    warnings.append(warning_msg)
+                    state["data_engineer_guard_warnings"] = warnings
+                    state["data_engineer_missing_required_columns"] = missing_input
+                    state["data_engineer_alias_conflicts"] = alias_conflicts
+                    print("Missing required columns after mapping: recorded warning for reviewer context.")
 
             # Apply Renaming to Canonical Names
             df_mapped = df.rename(columns=mapping_result['rename_mapping'])

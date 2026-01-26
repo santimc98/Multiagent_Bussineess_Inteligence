@@ -287,6 +287,10 @@ def build_context_pack(stage: str, state: Dict[str, Any]) -> str:
         if exists or path not in evidence_index:
             evidence_index.append(path)
 
+    guard_warnings = state.get("data_engineer_guard_warnings")
+    if not isinstance(guard_warnings, list):
+        guard_warnings = []
+
     payload = {
         "stage": stage,
         "run_id": state.get("run_id"),
@@ -295,6 +299,7 @@ def build_context_pack(stage: str, state: Dict[str, Any]) -> str:
         "required_outputs": _summarize_if_long(required_outputs),
         "decisioning_required_columns": _summarize_if_long(decisioning_columns),
         "column_sets_summary": column_sets_summary,
+        "guard_warnings": _limit_list([str(item) for item in guard_warnings if item], max_items=10),
         "artifacts": artifacts,
         "evidence_index": evidence_index,
     }
