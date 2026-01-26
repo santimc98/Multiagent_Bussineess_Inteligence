@@ -1765,7 +1765,9 @@ $strategy_json
         7) NEVER fabricate synthetic rows/features (pd.DataFrame({}) from literals, faker, sklearn.datasets.make_*, etc.).
            - Bootstrap/CV resampling of the OBSERVED rows is allowed (and expected when validation_requirements asks for bootstrap).
            - Randomness is permitted ONLY for resampling indices; do not generate new feature values from distributions.
-        8) scored_rows.csv may include canonical columns plus contract-approved derived outputs (target/prediction/probability/segment/optimal values) ONLY if explicitly declared in artifact_requirements.scored_rows_schema.allowed_extra_columns or allowed_name_patterns. Any other derived columns must go to a separate artifact file.
+        8) scored_rows.csv may include canonical columns plus contract-approved derived outputs ONLY if explicitly declared in the contract.
+           Acceptable sources: artifact_requirements.scored_rows_schema (derived_columns/required_columns/allowed_extra_columns/allowed_name_patterns) or execution_contract.derived_columns.
+           Any other derived columns must go to a separate artifact file.
         9) Start the script with a short comment block labeled PLAN describing: (1) dialect loading from cleaning_manifest.json, (2) detected columns, (3) row_id construction, (4) scored_rows columns, and (5) where extra derived artifacts go.
         10) Define CONTRACT_COLUMNS from the Execution Contract (use canonical_columns) and validate they exist in df_in; raise ValueError listing missing columns.
         11) LEAKAGE ZERO-TOLERANCE: Check 'allowed_feature_sets' in the contract. Any column listed as 'audit_only_features' or 'forbidden_for_modeling' MUST be excluded from X (features). Use them ONLY for audit/metrics calculation. Violation = REJECTION.
@@ -1811,8 +1813,9 @@ $strategy_json
               raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
           ```
           Then: json.dump(data, f, indent=2, default=_json_default)
-        - Sklearn scoring: Use string scorers ('accuracy', 'roc_auc', 'neg_mean_squared_error') instead of custom scorers.
-          Avoid 'needs_proba' parameter issues by using cross_val_score with scoring='accuracy' for classification.
+        - Sklearn scoring: Prefer built-in string scorers ONLY when they match the contract/plan metric.
+          If the required metric is not available as a string (e.g., RMSLE, RMSE_log1p), compute it explicitly
+          after predictions. Do NOT substitute a different metric to fit a scoring string.
 
         SECURITY / SANDBOX (VIOLATION = FAILURE)
         - Do NOT import sys.
@@ -1950,30 +1953,34 @@ $strategy_json
         - Do NOT create segment_id by concatenating raw columns if it yields unique IDs per row.
 
         Step 3) Decide validation correctly:
+        - If contract/plan provides an explicit validation method (validation_requirements or ml_plan.cv_policy), follow it.
         - If objective_type == "forecasting" or requires_time_series_split=true -> use TimeSeriesSplit or chronological holdout (shuffle=False). Do NOT use random KFold.
         - If the contract/spec indicates group_key OR you infer a grouping vector -> use GroupKFold or GroupShuffleSplit (or CV with groups=...).
         - Else if time_key or time ordering matters -> use a time-based split.
         - Else -> StratifiedKFold (classification) or KFold (regression).
         - Never evaluate on training data.
 
-        Step 4) Implement with pipelines (default):
-        - Use sklearn Pipeline + ColumnTransformer for preprocessing.
-        - Numeric: imputer (+ scaler if needed).
-        - Categorical: imputer + OneHotEncoder(handle_unknown='ignore', sparse_output=False).
+        Step 4) Implement with pipelines (contract-aware default):
+        - Use sklearn Pipeline + ColumnTransformer for preprocessing UNLESS the contract/plan specifies an explicit
+          preprocessing or encoding requirement. Contract/plan overrides defaults.
+        - Numeric: imputer (+ scaler if needed) when not contradicted by contract parsing requirements.
+        - Categorical: imputer + encoder (OneHotEncoder or contract-specified ordinal mapping).
         - Apply a high-cardinality safeguard when needed (e.g., limit top-K categories or hashing) without leakage.
 
-        Step 5) Models (default behavior):
-        - Always include:
-        - A baseline (simple, interpretable).
-        - A stronger model (more expressive) appropriate for dataset size and task.
+        Step 5) Models (contract-first):
+        - If the contract/plan specifies model family or a single model, follow that exactly.
+        - If not specified, you MAY include:
+          * A baseline (simple, interpretable).
+          * A stronger model (more expressive) appropriate for dataset size and task.
         - Prefer stable sklearn models unless the contract explicitly requires others.
         - Any predict_proba call must pass a 2D array (e.g., X.reshape(1, -1) or [[x]] for a single row).
 
         MODEL SELECTION & METRICS CONSISTENCY:
-        - If comparing multiple models, select best based on primary metric (AUC/accuracy/R2).
+        - If comparing multiple models, select best based on the PRIMARY METRIC from the contract/plan
+          (ml_plan.metric_policy.primary_metric, validation_requirements.primary_metric, or evaluation_spec.qa_gates).
         - Save both best_model_name AND its corresponding metric value.
-        - CRITICAL: best_model_auc must match the AUC of best_model_name (never mix models).
-        - Pattern: if lr_auc > rf_auc: best_name="LR", best_auc=lr_auc (NOT rf_auc).
+        - CRITICAL: best_model_metric must match the metric value of best_model_name (never mix models).
+        - Pattern: if modelA_metric > modelB_metric: best_name="A", best_metric=modelA_metric (NOT modelB_metric).
 
         Step 6) Contract compliance outputs:
         - Do NOT invent global rules. Use execution_contract to decide:
@@ -2007,11 +2014,9 @@ $strategy_json
         - Write all required deliverables; write optional deliverables only if they materially support the objective.
         - metrics.json RULES:
           - MUST include top-level key: "model_performance".
-          - Populate "model_performance" with standard technical metrics RELEVANT TO THE TASK:
-            * Classification: AUC, F1, Accuracy, LogLoss.
-            * Regression: RMSE, R2, MAE.
-            * Clustering: Silhouette Score, Inertia.
-            * Descriptive/Rule-based: Coverage %, Rule Hit Rate.
+          - Populate "model_performance" ONLY with metrics REQUIRED by the contract/plan/evaluation_spec/qa_gates.
+          - If no metrics are specified by contract/plan, choose a minimal, task-appropriate set and document the rationale.
+          - Never omit a contract-required metric (including transformed metrics like RMSE_log1p or RMSLE).
           - Never leave "model_performance" empty for a modeling task.
         - Plotting: matplotlib.use('Agg') BEFORE pyplot; if PLOT_SPEC_CONTEXT.enabled true, generate plots per plot_spec; otherwise save a plot only when required deliverables include plots.
         DECISION POLICY (CONTRACT-DRIVEN)
@@ -2032,7 +2037,7 @@ $strategy_json
         - If there are no alignment requirements provided, write WARN with failure_mode=data_limited and explain.
 
         FINAL SELF-CHECK
-        - Print QA_SELF_CHECK: PASS with a short bullet list of what was satisfied (target guard, split choice, baseline, required deliverables, no forbidden imports/ops).
+        - Print QA_SELF_CHECK: PASS with a short bullet list of what was satisfied (target guard, split choice, model choice, required deliverables, no forbidden imports/ops).
 
         Return Python code only.
 
