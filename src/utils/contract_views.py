@@ -695,6 +695,9 @@ def build_de_view(
     output_dialect = _resolve_output_dialect(contract_min, contract_full)
     if output_dialect:
         view["output_dialect"] = output_dialect
+    column_sets_summary = contract_min.get("column_sets_summary") or contract_full.get("column_sets_summary")
+    if column_sets_summary:
+        view["column_sets_summary"] = column_sets_summary
     return trim_to_budget(view, 8000)
 
 
@@ -910,6 +913,9 @@ def build_ml_view(
         "required_outputs": required_outputs,
         "validation_requirements": validation,
     }
+    column_sets_summary = contract_min.get("column_sets_summary") or contract_full.get("column_sets_summary")
+    if column_sets_summary:
+        view["column_sets_summary"] = column_sets_summary
     training_rows_rule = contract_min.get("training_rows_rule") or contract_full.get("training_rows_rule")
     scoring_rows_rule = contract_min.get("scoring_rows_rule") or contract_full.get("scoring_rows_rule")
     secondary_scoring_subset = contract_min.get("secondary_scoring_subset") or contract_full.get("secondary_scoring_subset")

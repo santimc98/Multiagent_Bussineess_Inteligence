@@ -5751,8 +5751,10 @@ domain_expert_critique:
         contract["cleaning_gates"] = _apply_cleaning_gate_policy(contract.get("cleaning_gates"))
         contract = _ensure_missing_category_values(contract)
 
-        if column_inventory and not contract.get("available_columns"):
-            contract["available_columns"] = column_inventory
+        if isinstance(column_inventory, list) and column_inventory:
+            # Always preserve full inventory as available_columns; use focus_columns for relevance.
+            contract["available_columns"] = [str(c) for c in column_inventory if c]
+            contract["available_columns_source"] = "column_inventory"
 
         available_columns = contract.get("available_columns")
         if isinstance(available_columns, list) and available_columns:

@@ -6611,6 +6611,24 @@ def run_steward(state: AgentState) -> AgentState:
         if not isinstance(column_sets, dict):
             column_sets = {}
 
+        # Universal fallback: if column_sets is empty on wide datasets, build selectors from inventory.
+        if not column_sets and header_cols and len(header_cols) > 200:
+            try:
+                from src.utils.column_sets import build_column_sets
+                role_map = {}
+                if primary_target:
+                    role_map[str(primary_target)] = "target_candidate"
+                for col in split_candidates:
+                    if col:
+                        role_map[str(col)] = "split_candidate"
+                for col in id_candidates:
+                    if col:
+                        role_map[str(col)] = "id_like"
+                column_sets = build_column_sets(header_cols, roles=role_map)
+            except Exception as cs_err:
+                print(f"Warning: failed to build column_sets fallback: {cs_err}")
+                column_sets = {}
+
         dataset_semantics_summary = summarize_dataset_semantics(dataset_semantics, dataset_training_mask)
         column_sets_summary = summarize_column_sets(column_sets) if column_sets else ""
         try:
@@ -7061,6 +7079,12 @@ def run_execution_planner(state: AgentState) -> AgentState:
             else:
                 contract_min["canonical_columns"] = []
                 contract_min["available_columns"] = []
+    column_sets_summary = state.get("column_sets_summary") if isinstance(state, dict) else None
+    if column_sets_summary:
+        if isinstance(contract, dict):
+            contract["column_sets_summary"] = column_sets_summary
+        if isinstance(contract_min, dict):
+            contract_min["column_sets_summary"] = column_sets_summary
     dataset_semantics = state.get("dataset_semantics") if isinstance(state, dict) else {}
     dataset_training_mask = state.get("dataset_training_mask") if isinstance(state, dict) else {}
     partial_labels = bool(
