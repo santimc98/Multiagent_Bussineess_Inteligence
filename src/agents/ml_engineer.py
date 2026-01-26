@@ -26,6 +26,7 @@ _scan_code_safety_ref = "scan_code_safety"
 
 REQUIRED_PLAN_KEYS = [
     "training_rows_policy",
+    "train_filter",
     "metric_policy",
     "cv_policy",
     "scoring_policy",
@@ -38,6 +39,12 @@ DEFAULT_PLAN: Dict[str, Any] = {
     "training_rows_policy": "unspecified",
     "training_rows_rule": None,
     "split_column": None,
+    "train_filter": {
+        "type": "unspecified",
+        "column": None,
+        "value": None,
+        "rule": None,
+    },
     "metric_policy": {
         "primary_metric": "unspecified",
         "secondary_metrics": [],
@@ -493,6 +500,7 @@ class MLEngineerAgent:
 
         training_rows_policy = plan.get("training_rows_policy")
         split_column = plan.get("split_column")
+        train_filter = plan.get("train_filter") if isinstance(plan.get("train_filter"), dict) else None
         if not isinstance(split_column, str) or not split_column.strip():
             split_column = None
         if split_column is None:
@@ -514,6 +522,7 @@ class MLEngineerAgent:
             "secondary_scoring_subset": secondary_scoring_subset,
             "training_rows_policy": training_rows_policy,
             "split_column": split_column,
+            "train_filter": train_filter,
         }
 
     def _code_mentions_label_filter(self, code: str, target: str | None) -> bool:
@@ -553,19 +562,31 @@ class MLEngineerAgent:
         training_rows_rule = context.get("training_rows_rule")
         training_rows_policy = context.get("training_rows_policy")
         split_column = context.get("split_column")
+        train_filter = context.get("train_filter")
         plan = ml_plan or {}
 
         requires_label_filter = False
-        if isinstance(training_rows_policy, str) and training_rows_policy in {"only_rows_with_label"}:
-            requires_label_filter = True
-        if isinstance(training_rows_rule, str):
-            rule_lower = training_rows_rule.lower()
-            if any(token in rule_lower for token in ("not missing", "not null", "notna", "non-null")):
+        requires_split_filter = False
+        if isinstance(train_filter, dict):
+            tf_type = str(train_filter.get("type") or "").strip().lower()
+            if tf_type == "label_not_null":
                 requires_label_filter = True
+            elif tf_type == "split_equals":
+                requires_split_filter = True
+        if not requires_label_filter and not requires_split_filter:
+            if isinstance(training_rows_policy, str) and training_rows_policy in {"only_rows_with_label"}:
+                requires_label_filter = True
+            if isinstance(training_rows_rule, str):
+                rule_lower = training_rows_rule.lower()
+                if any(token in rule_lower for token in ("not missing", "not null", "notna", "non-null")):
+                    requires_label_filter = True
 
         if requires_label_filter and not self._code_mentions_label_filter(code, target):
             split_ok = False
-            if split_column and self._code_mentions_split_usage(code, split_column):
+            allow_split_substitution = True
+            if isinstance(train_filter, dict) and str(train_filter.get("type") or "").strip().lower() == "label_not_null":
+                allow_split_substitution = False
+            if allow_split_substitution and split_column and self._code_mentions_split_usage(code, split_column):
                 evidence = plan.get("evidence_used") if isinstance(plan.get("evidence_used"), dict) else {}
                 split_eval = str(evidence.get("split_evaluation", "")).lower()
                 split_candidates = evidence.get("split_candidates") if isinstance(evidence.get("split_candidates"), list) else []
@@ -587,11 +608,64 @@ class MLEngineerAgent:
             if not split_ok:
                 issues.append("training_rows_filter_missing")
 
+        if requires_split_filter and not self._code_mentions_split_usage(code, split_column):
+            issues.append("training_rows_filter_missing")
+
         requires_split = isinstance(training_rows_policy, str) and training_rows_policy == "use_split_column"
         if requires_split and not self._code_mentions_split_usage(code, split_column):
             issues.append("split_column_filter_missing")
 
         return issues
+
+    def _describe_train_filter(
+        self,
+        train_filter: Dict[str, Any] | None,
+        target_column: str | None,
+        split_column: str | None,
+    ) -> str:
+        if not isinstance(train_filter, dict):
+            return "No explicit train_filter provided."
+        tf_type = str(train_filter.get("type") or "").strip().lower()
+        column = train_filter.get("column") or (target_column if tf_type == "label_not_null" else split_column)
+        value = train_filter.get("value")
+        rule = train_filter.get("rule")
+        if tf_type == "label_not_null":
+            return f"Filter training rows where '{column}' is not null."
+        if tf_type == "split_equals":
+            return f"Filter training rows where '{column}' == '{value or 'train'}'."
+        if tf_type == "custom_rule":
+            return f"Apply custom training rule: {rule}"
+        if tf_type == "none":
+            return "Use all rows for training."
+        return "Train filter is unspecified; infer from plan/contract."
+
+    def _build_training_policy_checklist(
+        self,
+        code: str,
+        execution_contract: Dict[str, Any] | None,
+        ml_view: Dict[str, Any] | None,
+        ml_plan: Dict[str, Any] | None,
+    ) -> Dict[str, Any]:
+        context = self._extract_training_context(execution_contract, ml_view, ml_plan)
+        plan = ml_plan or {}
+        metric_policy = plan.get("metric_policy", {}) if isinstance(plan.get("metric_policy"), dict) else {}
+        cv_policy = plan.get("cv_policy", {}) if isinstance(plan.get("cv_policy"), dict) else {}
+        target = context.get("target_column")
+        split_column = context.get("split_column")
+        return {
+            "target_column": target,
+            "training_rows_policy": context.get("training_rows_policy"),
+            "train_filter": context.get("train_filter"),
+            "code_has_label_filter": self._code_mentions_label_filter(code, target),
+            "code_has_split_filter": self._code_mentions_split_usage(code, split_column),
+            "primary_metric": metric_policy.get("primary_metric"),
+            "cv_policy": {
+                "strategy": cv_policy.get("strategy"),
+                "n_splits": cv_policy.get("n_splits"),
+                "shuffle": cv_policy.get("shuffle"),
+                "stratified": cv_policy.get("stratified"),
+            },
+        }
 
     def _fix_data_path_in_code(self, code: str, correct_path: str) -> str:
         """
@@ -1012,12 +1086,21 @@ $strategy_json
 3. Check contract for primary_metric (validation_requirements.primary_metric or evaluation_spec.primary_metric). Use that exact metric.
 4. DO NOT invent rules. Base every decision on 'evidence' found in the data_profile.
 5. CRITICAL: Populate 'evidence_used' with STRUCTURED facts you used for decisions. This enables QA to verify coherence.
+6. If you choose "only_rows_with_label", set train_filter.type="label_not_null" and train_filter.column=target.
+7. If you choose "use_split_column", set train_filter.type="split_equals", train_filter.column=split_column, and train_filter.value to the training value (e.g., "train").
+8. Avoid ambiguity: select ONE training policy and make it explicit via train_filter.
 
 *** REQUIRED OUTPUT (JSON ONLY, NO MARKDOWN) ***
 {
   "training_rows_policy": "use_all_rows | only_rows_with_label | use_split_column | custom",
   "training_rows_rule": "string rule if custom, or null",
   "split_column": "col_name or null",
+  "train_filter": {
+      "type": "none | label_not_null | split_equals | custom_rule",
+      "column": "column name or null",
+      "value": "value for split_equals or null",
+      "rule": "rule string for custom_rule or null"
+  },
   "metric_policy": {
       "primary_metric": "metric_name",
       "secondary_metrics": [],
@@ -1061,6 +1144,7 @@ $strategy_json
         if not can_execute_llm:
             # Agent not initialized, cannot call LLM
             result = self._normalize_ml_plan(None, source="missing_llm_init")
+            result = self._derive_train_filter(result, profile, contract)
             result["notes"] = ["Agent not initialized; cannot call LLM. Using fallback defaults."]
             return result
 
@@ -1076,6 +1160,7 @@ $strategy_json
             }
         except Exception as render_err:
             result = self._normalize_ml_plan(None, source="render_error")
+            result = self._derive_train_filter(result, profile, contract)
             result["notes"] = [f"Failed to render prompt context: {render_err}"]
             return result
 
@@ -1095,6 +1180,7 @@ $strategy_json
                 self.last_response = response
             parsed = self._parse_json_response(response)
             ml_plan = self._normalize_ml_plan(parsed, source="llm")
+            ml_plan = self._derive_train_filter(ml_plan, profile, contract)
 
             # Check if we got meaningful data
             if ml_plan.get("training_rows_policy") != "unspecified":
@@ -1107,12 +1193,14 @@ $strategy_json
                 self.last_response = response
             parsed = self._parse_json_response(response)
             ml_plan = self._normalize_ml_plan(parsed, source="llm_retry")
+            ml_plan = self._derive_train_filter(ml_plan, profile, contract)
 
             return ml_plan
 
         except Exception as e:
             print(f"ML Engineer Plan Gen Error: {e}")
             result = self._normalize_ml_plan(None, source="llm_error")
+            result = self._derive_train_filter(result, profile, contract)
             result["notes"] = [f"LLM call failed: {e}"]
             return result
 
@@ -1181,6 +1269,19 @@ $strategy_json
         # split_column
         if "split_column" in parsed:
             result["split_column"] = parsed["split_column"]
+
+        # train_filter
+        if "train_filter" in parsed:
+            tf = parsed["train_filter"]
+            if isinstance(tf, dict):
+                result["train_filter"] = tf
+            elif isinstance(tf, str):
+                result["train_filter"] = {
+                    "type": "custom_rule",
+                    "column": None,
+                    "value": None,
+                    "rule": tf,
+                }
 
         # metric_policy
         if "metric_policy" in parsed:
@@ -1285,6 +1386,207 @@ $strategy_json
 
         return result
 
+    def _infer_outcome_column(
+        self,
+        execution_contract: Dict[str, Any] | None,
+        data_profile: Dict[str, Any] | None,
+    ) -> str | None:
+        contract = execution_contract or {}
+        profile = data_profile or {}
+        outcome_columns = contract.get("outcome_columns")
+        if isinstance(outcome_columns, list) and outcome_columns:
+            return str(outcome_columns[0])
+        outcome_analysis = profile.get("outcome_analysis", {})
+        if isinstance(outcome_analysis, dict) and outcome_analysis:
+            for key in outcome_analysis.keys():
+                return str(key)
+        return None
+
+    def _split_candidate_info(
+        self,
+        data_profile: Dict[str, Any] | None,
+        preferred_column: str | None = None,
+    ) -> Dict[str, Any]:
+        profile = data_profile or {}
+        split_candidates = profile.get("split_candidates", [])
+        if not isinstance(split_candidates, list):
+            return {"column": None, "values": [], "has_train_test": False}
+
+        def _candidate_values(candidate: Dict[str, Any]) -> List[str]:
+            values = candidate.get("values")
+            if isinstance(values, list):
+                return [str(v) for v in values]
+            sample = candidate.get("unique_values_sample")
+            if isinstance(sample, list):
+                return [str(v) for v in sample]
+            uniques = candidate.get("unique_values")
+            if isinstance(uniques, list):
+                return [str(v) for v in uniques]
+            return []
+
+        def _has_train_test(values: List[str]) -> bool:
+            lowered = {v.strip().lower() for v in values if isinstance(v, str)}
+            return "train" in lowered and "test" in lowered
+
+        for cand in split_candidates:
+            if not isinstance(cand, dict):
+                continue
+            col = cand.get("column")
+            if preferred_column and str(col) != str(preferred_column):
+                continue
+            values = _candidate_values(cand)
+            return {
+                "column": str(col) if col is not None else None,
+                "values": values,
+                "has_train_test": _has_train_test(values),
+            }
+
+        # Fallback: first candidate
+        for cand in split_candidates:
+            if not isinstance(cand, dict):
+                continue
+            col = cand.get("column")
+            values = _candidate_values(cand)
+            return {
+                "column": str(col) if col is not None else None,
+                "values": values,
+                "has_train_test": _has_train_test(values),
+            }
+
+        return {"column": None, "values": [], "has_train_test": False}
+
+    def _derive_train_filter(
+        self,
+        plan: Dict[str, Any],
+        data_profile: Dict[str, Any],
+        execution_contract: Dict[str, Any] | None,
+    ) -> Dict[str, Any]:
+        import copy
+
+        result = copy.deepcopy(plan)
+        result.setdefault("train_filter", {})
+        train_filter = result.get("train_filter")
+        if not isinstance(train_filter, dict):
+            train_filter = {}
+
+        tf_type = str(train_filter.get("type") or "").strip().lower()
+        if tf_type in {"", "unspecified"}:
+            tf_type = ""
+
+        outcome_col = self._infer_outcome_column(execution_contract, data_profile)
+        outcome_analysis = (data_profile or {}).get("outcome_analysis", {})
+        has_null_labels = False
+        if isinstance(outcome_analysis, dict):
+            for _, analysis in outcome_analysis.items():
+                if isinstance(analysis, dict) and analysis.get("present") and analysis.get("null_frac", 0) > 0:
+                    has_null_labels = True
+                    break
+
+        training_rows_policy = str(result.get("training_rows_policy") or "").strip().lower()
+        training_rows_rule = result.get("training_rows_rule")
+        split_column = result.get("split_column")
+        split_info = self._split_candidate_info(data_profile, split_column)
+        if split_column is None and split_info.get("column"):
+            split_column = split_info["column"]
+
+        evidence_used = result.get("evidence_used") if isinstance(result.get("evidence_used"), dict) else {}
+        split_eval = str(evidence_used.get("split_evaluation", "")).lower()
+        uses_split = "split" in split_eval and "use" in split_eval
+
+        if tf_type == "custom_rule" and not train_filter.get("rule") and isinstance(training_rows_rule, str):
+            train_filter["rule"] = training_rows_rule
+
+        if tf_type:
+            # normalize column/value if missing
+            if tf_type == "label_not_null":
+                train_filter.setdefault("column", outcome_col)
+                train_filter.setdefault("value", None)
+                train_filter.setdefault("rule", None)
+            elif tf_type == "split_equals":
+                train_filter.setdefault("column", split_column)
+                if train_filter.get("value") is None and split_info.get("has_train_test"):
+                    train_filter["value"] = "train"
+                train_filter.setdefault("rule", None)
+            elif tf_type == "custom_rule":
+                train_filter.setdefault("column", outcome_col)
+            elif tf_type == "none":
+                train_filter.setdefault("column", None)
+                train_filter.setdefault("value", None)
+                train_filter.setdefault("rule", None)
+        else:
+            # Derive a deterministic filter to remove ambiguity
+            if isinstance(training_rows_rule, str) and training_rows_rule.strip() and training_rows_policy not in {"use_all_rows", "only_rows_with_label", "use_split_column"}:
+                train_filter = {
+                    "type": "custom_rule",
+                    "column": outcome_col,
+                    "value": None,
+                    "rule": training_rows_rule,
+                }
+            elif training_rows_policy == "custom" and isinstance(training_rows_rule, str):
+                train_filter = {
+                    "type": "custom_rule",
+                    "column": outcome_col,
+                    "value": None,
+                    "rule": training_rows_rule,
+                }
+            elif split_column and split_info.get("has_train_test") and (training_rows_policy == "use_split_column" or uses_split):
+                train_filter = {
+                    "type": "split_equals",
+                    "column": split_column,
+                    "value": "train",
+                    "rule": None,
+                }
+            elif split_column and split_info.get("has_train_test") and has_null_labels:
+                # Avoid ambiguity: split is the explicit training mask when train/test is present
+                train_filter = {
+                    "type": "split_equals",
+                    "column": split_column,
+                    "value": "train",
+                    "rule": None,
+                }
+            elif has_null_labels:
+                train_filter = {
+                    "type": "label_not_null",
+                    "column": outcome_col,
+                    "value": None,
+                    "rule": None,
+                }
+            else:
+                train_filter = {
+                    "type": "none",
+                    "column": None,
+                    "value": None,
+                    "rule": None,
+                }
+
+        result["train_filter"] = train_filter
+
+        # Align training_rows_policy with train_filter to remove ambiguity
+        tf_type = str(train_filter.get("type") or "").strip().lower()
+        known_policies = {"use_all_rows", "only_rows_with_label", "use_split_column", "custom", "unspecified"}
+        policy_is_known = training_rows_policy in known_policies or not training_rows_policy
+        if policy_is_known:
+            if tf_type == "split_equals":
+                result["training_rows_policy"] = "use_split_column"
+                if split_column:
+                    result["split_column"] = split_column
+                if isinstance(training_rows_rule, str):
+                    rule_lower = training_rows_rule.lower()
+                    if any(token in rule_lower for token in ("not missing", "not null", "notna", "non-null")):
+                        result["training_rows_rule"] = f"rows where {split_column} == 'train'"
+                elif split_column:
+                    result["training_rows_rule"] = f"rows where {split_column} == 'train'"
+            elif tf_type == "label_not_null":
+                result["training_rows_policy"] = "only_rows_with_label"
+                if isinstance(training_rows_rule, str) is False and outcome_col:
+                    result["training_rows_rule"] = f"rows where {outcome_col} is not missing"
+            elif tf_type == "none":
+                result["training_rows_policy"] = "use_all_rows"
+            elif tf_type == "custom_rule":
+                result["training_rows_policy"] = "custom"
+
+        return result
+
     def generate_code(
         self,
         strategy: Dict[str, Any],
@@ -1321,7 +1623,7 @@ $strategy_json
          - Produce ONE robust, runnable Python SCRIPT that loads cleaned dataset from $data_path, trains/evaluates according to Execution Contract, and writes required artifacts.
          - Adapt to each dataset and objective. Do not follow a rigid recipe; follow contract + data.
          - If Evaluation Spec says requires_target=false, DO NOT train a supervised model. Produce descriptive/segmentation insights and still write data/metrics.json with model_trained=false.
-         - CRITICAL: If 'ML_PLAN_CONTEXT' is present (in Data Audit), you MUST implement that plan exactly (training_rows_policy, metric_policy, cv_policy). Do not deviate.
+         - CRITICAL: If 'ML_PLAN_CONTEXT' is present (in Data Audit), you MUST implement that plan exactly (training_rows_policy, train_filter, metric_policy, cv_policy). Do not deviate.
 
          TRAINING DATA SELECTION (STEWARD-DRIVEN)
          - Read execution_contract (or contract_min) for outcome_columns and optional fields:
@@ -1330,6 +1632,7 @@ $strategy_json
            * secondary_scoring_subset (optional)
            * data_partitioning_notes
          - If those rules exist, implement them exactly.
+         - If ML_PLAN_CONTEXT provides train_filter, treat it as authoritative and implement it exactly.
          - If training_rows_policy is "only_rows_with_label" or "use_split_column", your code must explicitly filter train_df before fit().
          - Scoring guidance:
            * Always produce scored_rows.csv for the primary scoring_rows_rule.
@@ -2123,11 +2426,19 @@ $strategy_json
                     if not reasons:
                         code = repaired
                         break
-                if reasons:
-                    raise RuntimeError(
-                        "ML guardrail failed: synthetic/fallback patterns still present: "
-                        + "; ".join(reasons)
-                    )
+            if reasons:
+                raise RuntimeError(
+                    "ML guardrail failed: synthetic/fallback patterns still present: "
+                    + "; ".join(reasons)
+                )
+
+            checklist = self._build_training_policy_checklist(
+                code=code,
+                execution_contract=execution_contract,
+                ml_view=ml_view,
+                ml_plan=ml_plan,
+            )
+            print("ML_TRAINING_CHECKLIST: " + json.dumps(checklist))
 
             training_issues = self._check_training_policy_compliance(
                 code=code,
@@ -2137,6 +2448,11 @@ $strategy_json
             )
             if training_issues:
                 context = self._extract_training_context(execution_contract, ml_view, ml_plan)
+                required_filter = self._describe_train_filter(
+                    context.get("train_filter"),
+                    context.get("target_column"),
+                    context.get("split_column"),
+                )
                 compliance_system = (
                     "You are a senior ML engineer. Ensure the script implements the training "
                     "row selection policy from the plan/contract. Return FULL python script only."
@@ -2146,9 +2462,14 @@ $strategy_json
                     + "\n".join([f"- {issue}" for issue in training_issues])
                     + "\n\nTraining context:\n"
                     + json.dumps(context, indent=2)
+                    + "\n\nRequired training filter:\n"
+                    + required_filter
+                    + "\n\nChecklist:\n"
+                    + json.dumps(checklist, indent=2)
                     + "\n\nCODE:\n"
                     + self._truncate_code_for_patch(code)
                     + "\n\nFix the training/scoring row selection so it matches the plan. "
+                    "Only edit the row-selection block (train_df / X_train / y construction). "
                     "Keep outputs and other logic intact."
                 )
                 repaired = call_with_retries(

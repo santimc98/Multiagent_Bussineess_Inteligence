@@ -222,6 +222,70 @@ class TestMLPlanGeneration:
         assert plan["training_rows_policy"] == "use_split_column"
         assert plan["split_column"] == "is_train"
 
+    def test_plan_derives_split_filter_when_evidence_prefers_split(self):
+        """Plan derives train_filter=split_equals to remove ambiguity when evidence says to use split."""
+        engineer = MLEngineerAgent.__new__(MLEngineerAgent)
+
+        data_profile = {
+            "basic_stats": {"n_rows": 200, "n_cols": 5},
+            "outcome_analysis": {
+                "target": {
+                    "present": True,
+                    "null_frac": 0.5,
+                    "non_null_count": 100,
+                    "total_count": 200,
+                }
+            },
+            "split_candidates": [
+                {"column": "__split", "values": ["train", "test"]}
+            ],
+        }
+        contract = {"outcome_columns": ["target"]}
+        strategy = {"analysis_type": "classification"}
+
+        def fake_llm(sys_prompt, usr_prompt):
+            return '''{
+                "training_rows_policy": "only_rows_with_label",
+                "training_rows_rule": null,
+                "split_column": "__split",
+                "metric_policy": {
+                    "primary_metric": "roc_auc",
+                    "secondary_metrics": [],
+                    "report_with_cv": true,
+                    "notes": ""
+                },
+                "cv_policy": {
+                    "strategy": "StratifiedKFold",
+                    "n_splits": 5,
+                    "shuffle": true,
+                    "stratified": true,
+                    "notes": ""
+                },
+                "scoring_policy": {
+                    "generate_scores": true,
+                    "score_rows": "all"
+                },
+                "leakage_policy": {
+                    "action": "none",
+                    "flagged_columns": [],
+                    "notes": ""
+                },
+                "evidence_used": {
+                    "outcome_null_frac": {"column": "target", "null_frac": 0.5},
+                    "split_candidates": [{"column": "__split", "values": ["train", "test"]}],
+                    "split_evaluation": "Used split column __split to separate train/test."
+                },
+                "evidence": [],
+                "assumptions": [],
+                "open_questions": [],
+                "notes": []
+            }'''
+
+        plan = engineer.generate_ml_plan(data_profile, contract, strategy, llm_call=fake_llm)
+
+        assert plan["train_filter"]["type"] == "split_equals"
+        assert plan["training_rows_policy"] == "use_split_column"
+
     def test_plan_uses_contract_training_rule_when_specified(self):
         """Plan respects contract training_rows_rule."""
         engineer = MLEngineerAgent.__new__(MLEngineerAgent)

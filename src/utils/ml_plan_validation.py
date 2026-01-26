@@ -54,7 +54,9 @@ def validate_ml_plan_constraints(
                 has_null_labels = True
 
     policy = plan.get("training_rows_policy", "unspecified")
-    if has_null_labels and policy == "use_all_rows":
+    train_filter = plan.get("train_filter") if isinstance(plan.get("train_filter"), dict) else {}
+    tf_type = str(train_filter.get("type") or "").strip().lower()
+    if has_null_labels and (policy == "use_all_rows" or tf_type == "none"):
         violations.append(
             f"ML_PLAN_CONSTRAINT_VIOLATION: Outcome has missing values "
             f"(null_fracs={outcome_null_fracs}), but policy is 'use_all_rows'. Must filter rows."
@@ -139,9 +141,11 @@ def validate_plan_code_coherence(ml_plan: Dict[str, Any], code: str, data_profil
     violations = []
     policy = ml_plan.get("training_rows_policy", "")
     code_lower = code.lower()
-    
+    train_filter = ml_plan.get("train_filter") if isinstance(ml_plan.get("train_filter"), dict) else {}
+
     # 1. Label Filtering
-    if policy == "only_rows_with_label":
+    tf_type = str(train_filter.get("type") or "").strip().lower()
+    if tf_type == "label_not_null" or policy == "only_rows_with_label":
         # Code must filter for notna() or dropna() on the target
         # Heuristic check
         if "notna()" not in code and "dropna(" not in code and "isnull()" not in code_lower:
@@ -149,7 +153,7 @@ def validate_plan_code_coherence(ml_plan: Dict[str, Any], code: str, data_profil
              violations.append("training_rows_policy mismatch: Plan requires 'only_rows_with_label' but code doesn't seem to filter missings (no notna/dropna)")
     
     # 2. Split Column
-    if policy == "use_split_column":
+    if tf_type == "split_equals" or policy == "use_split_column":
         split_col = ml_plan.get("split_column", "unknown_col")
         if split_col and split_col not in code:
              violations.append(f"split_column mismatch: Plan requires using '{split_col}' but it is not referenced in code.")
@@ -181,9 +185,11 @@ def validate_plan_data_coherence(
 
     # 1. Label Filter vs Missingness
     policy = ml_plan.get("training_rows_policy", "")
+    train_filter = ml_plan.get("train_filter") if isinstance(ml_plan.get("train_filter"), dict) else {}
+    tf_type = str(train_filter.get("type") or "").strip().lower()
     outcome_analysis = data_profile.get("outcome_analysis", {})
 
-    if policy == "only_rows_with_label":
+    if tf_type == "label_not_null" or policy == "only_rows_with_label":
         # Check if missingness actually exists
         has_nulls = False
         for col, analysis in outcome_analysis.items():
@@ -194,7 +200,7 @@ def validate_plan_data_coherence(
             inconsistencies.append("Plan requires 'only_rows_with_label' but data has 0% outcome missingness.")
 
     # Inverse check: if there ARE nulls and policy is use_all_rows
-    if policy == "use_all_rows":
+    if tf_type == "none" or policy == "use_all_rows":
         for col, analysis in outcome_analysis.items():
             if isinstance(analysis, dict) and analysis.get("present") and analysis.get("null_frac", 0) > 0:
                 inconsistencies.append(
@@ -203,7 +209,7 @@ def validate_plan_data_coherence(
                 )
 
     # 2. Split Column vs Candidates
-    if policy == "use_split_column":
+    if tf_type == "split_equals" or policy == "use_split_column":
         split_col = ml_plan.get("split_column")
         if split_col:
             candidates = [c.get("column") for c in data_profile.get("split_candidates", []) if isinstance(c, dict)]

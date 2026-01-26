@@ -9613,6 +9613,7 @@ def run_engineer(state: AgentState) -> AgentState:
                 if run_id:
                     log_run_event(run_id, "ml_plan_generated", {
                         "training_rows_policy": ml_plan.get("training_rows_policy"),
+                        "train_filter": ml_plan.get("train_filter"),
                         "metric_policy": ml_plan.get("metric_policy"),
                         "cv_policy": ml_plan.get("cv_policy"),
                         "plan_source": ml_plan.get("plan_source"),
