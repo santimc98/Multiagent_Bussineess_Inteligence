@@ -373,6 +373,14 @@ def normalize_artifact_requirements(
         "file_schemas": file_schemas
     }
 
+    # Preserve schema_binding and clean_dataset if present (do not drop optional passthrough info)
+    schema_binding = artifact_req.get("schema_binding")
+    if isinstance(schema_binding, dict):
+        artifact_requirements["schema_binding"] = schema_binding
+    clean_dataset = artifact_req.get("clean_dataset")
+    if isinstance(clean_dataset, dict):
+        artifact_requirements["clean_dataset"] = clean_dataset
+
     def _extract_path(item: Any) -> str:
         if not item:
             return ""
