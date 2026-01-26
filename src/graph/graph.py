@@ -7364,6 +7364,18 @@ def run_data_engineer(state: AgentState) -> AgentState:
     input_dialect = {"encoding": csv_encoding, "sep": csv_sep, "decimal": csv_decimal}
     leakage_audit_summary = state.get("leakage_audit_summary", "")
     data_engineer_audit_override = state.get("data_engineer_audit_override", state.get("data_summary", ""))
+    dataset_scale_hints = state.get("dataset_scale_hints")
+    if not isinstance(dataset_scale_hints, dict) or not dataset_scale_hints:
+        dataset_scale_hints = {}
+    if csv_path and os.path.exists(csv_path):
+        if dataset_scale_hints.get("scale") in (None, "", "unknown"):
+            try:
+                size_mb = file_size_mb(csv_path)
+                est_rows = estimate_rows_fast(csv_path, encoding=csv_encoding)
+                dataset_scale_hints = classify_dataset_scale(size_mb, est_rows)
+                state["dataset_scale_hints"] = dataset_scale_hints
+            except Exception:
+                pass
     context_pack = build_context_pack("data_engineer", state if isinstance(state, dict) else {})
     if context_pack:
         data_engineer_audit_override = _merge_de_audit_override(context_pack, data_engineer_audit_override)
@@ -7412,6 +7424,15 @@ def run_data_engineer(state: AgentState) -> AgentState:
         state["csv_path"] = csv_path
     required_cols = _resolve_required_input_columns(state.get("execution_contract", {}), selected)
     header_cols = _read_csv_header(csv_path, csv_encoding, csv_sep) or []
+    n_cols = len(header_cols)
+    memory_guard_active = False
+    if isinstance(dataset_scale_hints, dict):
+        scale_flag = dataset_scale_hints.get("scale")
+        file_mb = dataset_scale_hints.get("file_mb") or 0.0
+        est_rows = dataset_scale_hints.get("est_rows") or 0
+        if scale_flag in {"medium", "large"} or file_mb >= 50 or est_rows >= 200_000 or n_cols >= 500:
+            memory_guard_active = True
+    state["de_memory_guard_active"] = memory_guard_active
     norm_map: Dict[str, str] = {}
     if header_cols:
         for col in header_cols:
@@ -7439,6 +7460,21 @@ def run_data_engineer(state: AgentState) -> AgentState:
             hints = _infer_parsing_hints_from_sample_context(sample_context)
             if hints:
                 data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, hints)
+    if memory_guard_active:
+        scale_text = dataset_scale_hints.get("scale") if isinstance(dataset_scale_hints, dict) else "unknown"
+        file_mb = dataset_scale_hints.get("file_mb") if isinstance(dataset_scale_hints, dict) else None
+        est_rows = dataset_scale_hints.get("est_rows") if isinstance(dataset_scale_hints, dict) else None
+        chunk_size = dataset_scale_hints.get("chunk_size") if isinstance(dataset_scale_hints, dict) else None
+        mem_guidance = (
+            "MEMORY_SAFETY_GUIDANCE:\n"
+            f"- Dataset appears {scale_text} (file_mb={file_mb}, est_rows={est_rows}, cols={n_cols}).\n"
+            "- To avoid sandbox OOM, you MAY use chunked processing:\n"
+            f"  * pd.read_csv(..., chunksize={chunk_size or 'N'}) with dtype=str, low_memory=False\n"
+            "  * write cleaned_data.csv incrementally (header only for first chunk)\n"
+            "  * avoid full-column nunique or per-column stats over entire dataset; compute on sample or per-chunk aggregates\n"
+            "  * keep column order stable across chunks\n"
+        )
+        data_engineer_audit_override = _merge_de_audit_override(data_engineer_audit_override, mem_guidance)
     # Inject Raw Snippet for Dialect Grounding (DISABLED: Causing GLM-4.7 Empty Response / Safety Trigger)
     # try:
     #     raw_lines = []
@@ -8535,6 +8571,20 @@ def run_data_engineer(state: AgentState) -> AgentState:
                         exception_type=type(e).__name__,
                         exception_msg=str(e),
                     )
+                err_msg = str(e)
+                err_lower = err_msg.lower()
+                is_oom_like = any(token in err_lower for token in ["killed", "exit code 137", "oom", "out of memory"])
+                if is_oom_like and not state.get("de_oom_retry_done") and state.get("de_memory_guard_active"):
+                    new_state = dict(state)
+                    new_state["de_oom_retry_done"] = True
+                    base_override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
+                    payload = (
+                        "RUNTIME_ERROR_CONTEXT: Sandbox process was killed (likely OOM / exit code 137). "
+                        "Switch to chunked processing and avoid full-column stats over the entire dataset."
+                    )
+                    new_state["data_engineer_audit_override"] = _merge_de_audit_override(base_override, payload)
+                    print("OOM guard: retrying Data Engineer with chunked processing guidance.")
+                    return run_data_engineer(new_state)
                 if sb_attempt == 0 and is_transient_sandbox_error(e):
                     print(f"SANDBOX_RETRY step=data_engineer attempt={sb_attempt+1} err={e}")
                     continue
