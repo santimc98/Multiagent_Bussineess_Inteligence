@@ -901,20 +901,20 @@ def _resolve_requirement_meta(contract: Dict[str, Any], col: str) -> Dict[str, A
 
     norm_col = _norm_name(col)
 
-    # Check V4.1 canonical columns (Strictly required usually)
+    # Check optional passthrough (override canonical requirement if explicitly set)
     from src.utils.contract_v41 import get_canonical_columns, get_artifact_requirements
-    canonical = get_canonical_columns(contract)
-    for c in canonical:
-        if _norm_name(c) == norm_col:
-            return {"name": c, "required": True, "nullable": False}
-
-    # Check optional passthrough
     artifact_reqs = get_artifact_requirements(contract)
     schema = artifact_reqs.get("schema_binding", {})
     optional = schema.get("optional_passthrough_columns", [])
     for c in optional:
         if _norm_name(c) == norm_col:
             return {"name": c, "required": False, "nullable": True}
+
+    # Check V4.1 canonical columns (Strictly required usually)
+    canonical = get_canonical_columns(contract)
+    for c in canonical:
+        if _norm_name(c) == norm_col:
+            return {"name": c, "required": True, "nullable": False}
 
     # V4.1: No legacy data_requirements fallback
     # Default: if not found in canonical, assume it might be optional or extra
