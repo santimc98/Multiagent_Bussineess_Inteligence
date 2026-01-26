@@ -44,3 +44,19 @@ def test_sparse_optional_preserves_existing_order() -> None:
     optional = schema.get("optional_passthrough_columns", [])
 
     assert optional == ["Existing", "PoolQC"]
+
+
+def test_sparse_optional_uses_available_columns_when_canonical_truncated() -> None:
+    contract = {
+        "canonical_columns": ["SalePrice"],
+        "available_columns": ["SalePrice", "PoolQC"],
+        "column_roles": {"SalePrice": "outcome"},
+        "artifact_requirements": {},
+    }
+    data_profile = {"missingness_top30": {"PoolQC": 0.996}}
+
+    updated = _apply_sparse_optional_columns(contract, data_profile, threshold=0.98)
+    schema = updated.get("artifact_requirements", {}).get("schema_binding", {})
+    optional = schema.get("optional_passthrough_columns", [])
+
+    assert "PoolQC" in optional

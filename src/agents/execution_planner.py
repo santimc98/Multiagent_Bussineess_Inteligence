@@ -741,6 +741,10 @@ def _apply_sparse_optional_columns(
 
     canonical = contract.get("canonical_columns")
     canonical_set = {str(c) for c in canonical} if isinstance(canonical, list) else set()
+    available = contract.get("available_columns")
+    available_set = {str(c) for c in available} if isinstance(available, list) else set()
+
+    allowed_set = available_set or canonical_set
 
     def _norm_name(name: Any) -> str:
         return re.sub(r"[^0-9a-zA-Z]+", "", str(name).lower())
@@ -753,7 +757,7 @@ def _apply_sparse_optional_columns(
             continue
         if frac_val < threshold:
             continue
-        if canonical_set and str(col) not in canonical_set:
+        if allowed_set and str(col) not in allowed_set:
             continue
         if str(col) in outcomes or str(col) in decisions or str(col) in identifiers:
             continue
@@ -5746,7 +5750,6 @@ domain_expert_critique:
         contract = _ensure_benchmark_kpi_gate(contract, strategy, business_objective or "")
         contract["cleaning_gates"] = _apply_cleaning_gate_policy(contract.get("cleaning_gates"))
         contract = _ensure_missing_category_values(contract)
-        contract = _apply_sparse_optional_columns(contract, data_profile)
 
         if column_inventory and not contract.get("available_columns"):
             contract["available_columns"] = column_inventory
@@ -5769,6 +5772,7 @@ domain_expert_critique:
             contract["omitted_columns_policy"] = omitted_columns_policy
 
         contract = _prune_identifier_model_features(contract)
+        contract = _apply_sparse_optional_columns(contract, data_profile)
 
         contract = validate_artifact_requirements(contract)
 
