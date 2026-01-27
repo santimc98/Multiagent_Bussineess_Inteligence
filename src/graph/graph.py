@@ -10748,6 +10748,7 @@ def check_review(state: AgentState):
 def execute_code(state: AgentState) -> AgentState:
     print("--- [5] System: Executing Code (E2B Sandbox) ---")
     run_id = state.get("run_id")
+    contract_min = state.get("execution_contract_min") or state.get("contract_min") or _load_json_safe("data/contract_min.json") or {}
     ok, counters, err_msg = _consume_budget(state, "execution_calls", "max_execution_calls", "Execution")
     state["budget_counters"] = counters
     if not ok:
