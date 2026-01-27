@@ -1,4 +1,5 @@
 import os
+import logging
 from datetime import datetime
 from typing import Dict, Any, List
 from dotenv import load_dotenv
@@ -15,6 +16,7 @@ from src.utils.senior_protocol import (
     SENIOR_ENGINEERING_PROTOCOL,
     SENIOR_REASONING_PROTOCOL_GENERAL,
 )
+from src.utils.llm_fallback import call_chat_with_fallback
 
 # NOTE: scan_code_safety referenced by tests as a required safety mechanism.
 # ML code executes in sandbox; keep the reference for integration checks.
@@ -81,6 +83,7 @@ class MLEngineerAgent:
         """
         Initializes the ML Engineer Agent with the configured provider.
         """
+        self.logger = logging.getLogger(__name__)
         self.provider = (os.getenv("ML_ENGINEER_PROVIDER", "openrouter") or "openrouter").strip().lower()
         self.fallback_model_name = None
         self.last_model_used = None
@@ -120,8 +123,16 @@ class MLEngineerAgent:
             if headers:
                 client_kwargs["default_headers"] = headers
             self.client = OpenAI(**client_kwargs)
-            self.model_name = os.getenv("OPENROUTER_ML_PRIMARY_MODEL") or "z-ai/glm-4.7"
-            self.fallback_model_name = os.getenv("OPENROUTER_ML_FALLBACK_MODEL") or "moonshotai/kimi-k2-thinking"
+            self.model_name = (
+                os.getenv("ML_ENGINEER_PRIMARY_MODEL")
+                or os.getenv("OPENROUTER_ML_PRIMARY_MODEL")
+                or "moonshotai/kimi-k2.5"
+            )
+            self.fallback_model_name = (
+                os.getenv("ML_ENGINEER_FALLBACK_MODEL")
+                or os.getenv("OPENROUTER_ML_FALLBACK_MODEL")
+                or "z-ai/glm-4.7"
+            )
         elif self.provider == "deepseek":
             self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
             if not self.api_key:
@@ -1015,14 +1026,20 @@ class MLEngineerAgent:
                     )
                 return response.choices[0].message.content
             elif self.provider == "openrouter":
-                response = self.client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": usr_prompt}
-                    ],
-                    temperature=temperature,
+                messages = [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": usr_prompt},
+                ]
+                response, model_used = call_chat_with_fallback(
+                    self.client,
+                    messages,
+                    [self.model_name, self.fallback_model_name],
+                    call_kwargs={"temperature": temperature},
+                    logger=self.logger,
+                    context_tag="ml_engineer_plan",
                 )
+                self.last_model_used = model_used
+                self.logger.info("ML_ENGINEER_MODEL_USED: %s", model_used)
                 return response.choices[0].message.content
             elif self.provider in {"google", "gemini"}:
                 full_prompt = sys_prompt + "\n\nUSER INPUT:\n" + usr_prompt
@@ -2408,28 +2425,37 @@ $strategy_json
         try:
             self.last_fallback_reason = None
             if self.provider == "openrouter":
-                primary = self.model_name
-                fallback = self.fallback_model_name
-                try:
-                    content = call_with_retries(
-                        lambda: _call_model_with_prompts(system_prompt, user_message, current_temp, primary),
-                        max_retries=5,
-                        backoff_factor=2,
-                        initial_delay=2,
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ]
+
+                def _call_openrouter():
+                    self.last_prompt = system_prompt + "\n\nUSER:\n" + user_message
+                    response, model_used = call_chat_with_fallback(
+                        self.client,
+                        messages,
+                        [self.model_name, self.fallback_model_name],
+                        call_kwargs={"temperature": current_temp},
+                        logger=self.logger,
+                        context_tag="ml_engineer",
                     )
-                    self.last_model_used = primary
-                except Exception as e:
-                    self.last_fallback_reason = str(e)[:500]
-                    print(
-                        f"WARN: OpenRouter primary failed ({e}); switching to fallback ({fallback})..."
-                    )
-                    content = call_with_retries(
-                        lambda: _call_model_with_prompts(system_prompt, user_message, current_temp, fallback),
-                        max_retries=2,
-                        backoff_factor=2,
-                        initial_delay=1,
-                    )
-                    self.last_model_used = fallback
+                    if model_used != self.model_name:
+                        self.last_fallback_reason = "fallback_used"
+                    self.last_model_used = model_used
+                    self.logger.info("ML_ENGINEER_MODEL_USED: %s", model_used)
+                    content = response.choices[0].message.content
+                    self.last_response = content
+                    if "504 Gateway Time-out" in content or "<html" in content.lower():
+                        raise ConnectionError("LLM Server Timeout (504 Received)")
+                    return content
+
+                content = call_with_retries(
+                    _call_openrouter,
+                    max_retries=5,
+                    backoff_factor=2,
+                    initial_delay=2,
+                )
             else:
                 content = call_with_retries(
                     lambda: _call_model_with_prompts(system_prompt, user_message, current_temp, self.model_name),

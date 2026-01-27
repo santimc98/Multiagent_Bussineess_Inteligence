@@ -2,12 +2,14 @@ import os
 import re
 import ast
 import json
+import logging
 from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 from src.utils.static_safety_scan import scan_code_safety
 from src.utils.code_extract import extract_code_block
 from src.utils.senior_protocol import SENIOR_ENGINEERING_PROTOCOL
 from src.utils.contract_v41 import get_cleaning_gates
+from src.utils.llm_fallback import call_chat_with_fallback
 from openai import OpenAI
 
 load_dotenv()
@@ -16,40 +18,45 @@ load_dotenv()
 class DataEngineerAgent:
     def __init__(self, api_key: str = None):
         """
-        Initializes the Data Engineer Agent with DeepSeek Reasoner (primary) and OpenRouter fallback.
+        Initializes the Data Engineer Agent with OpenRouter primary + fallback.
         """
-        # --- PRIMARY: DeepSeek ---
-        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
+        self.logger = logging.getLogger(__name__)
+        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
         if not self.api_key:
-            raise ValueError("DeepSeek API Key is required.")
+            raise ValueError("OpenRouter API Key is required.")
 
-        # Configurable base_url and timeout
-        # DeepSeek Reasoner is slow by design (chain-of-thought reasoning)
-        # Data cleaning scripts are complex: 300s (5 min) provides adequate margin
-        deepseek_base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-        deepseek_timeout = float(os.getenv("DEEPSEEK_TIMEOUT", "300"))
+        timeout_raw = os.getenv("OPENROUTER_TIMEOUT_SECONDS")
+        try:
+            timeout_seconds = float(timeout_raw) if timeout_raw else 120.0
+        except ValueError:
+            timeout_seconds = 120.0
+        headers = {}
+        referer = os.getenv("OPENROUTER_HTTP_REFERER")
+        if referer:
+            headers["HTTP-Referer"] = referer
+        title = os.getenv("OPENROUTER_X_TITLE")
+        if title:
+            headers["X-Title"] = title
+        client_kwargs = {
+            "api_key": self.api_key,
+            "base_url": "https://openrouter.ai/api/v1",
+            "timeout": timeout_seconds,
+        }
+        if headers:
+            client_kwargs["default_headers"] = headers
+        self.client = OpenAI(**client_kwargs)
 
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url=deepseek_base_url,
-            timeout=deepseek_timeout,
+        self.model_name = (
+            os.getenv("DATA_ENGINEER_PRIMARY_MODEL")
+            or os.getenv("OPENROUTER_DE_PRIMARY_MODEL")
+            or os.getenv("DEEPSEEK_DE_PRIMARY_MODEL")
+            or "moonshotai/kimi-k2.5"
         )
-        # Configurable model name
-        self.model_name = os.getenv("DEEPSEEK_DE_PRIMARY_MODEL", "deepseek-reasoner")
-
-        # --- FALLBACK: OpenRouter ---
-        self.fallback_client = None
-        self.fallback_model_name = None
-        or_key = os.getenv("OPENROUTER_API_KEY")
-        if or_key:
-            fallback_timeout = float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "120"))
-            self.fallback_client = OpenAI(
-                api_key=or_key,
-                base_url="https://openrouter.ai/api/v1",
-                timeout=fallback_timeout,
-                default_headers={"HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", "")},
-            )
-            self.fallback_model_name = os.getenv("OPENROUTER_DE_FALLBACK_MODEL") or os.getenv("OPENROUTER_ML_PRIMARY_MODEL") or "z-ai/glm-4.7"
+        self.fallback_model_name = (
+            os.getenv("DATA_ENGINEER_FALLBACK_MODEL")
+            or os.getenv("OPENROUTER_DE_FALLBACK_MODEL")
+            or "deepseek/deepseek-v3.2"
+        )
 
         self.last_prompt = None
         self.last_response = None
@@ -234,16 +241,20 @@ class DataEngineerAgent:
         from src.utils.retries import call_with_retries
 
         def _call_model():
-            print(f"DEBUG: Data Engineer calling DeepSeek Model ({self.model_name})...")
-            response = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": USER_TEMPLATE}
-                ],
-                temperature=0.1
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": USER_TEMPLATE},
+            ]
+            response, model_used = call_chat_with_fallback(
+                self.client,
+                messages,
+                [self.model_name, self.fallback_model_name],
+                call_kwargs={"temperature": 0.1},
+                logger=self.logger,
+                context_tag="data_engineer",
             )
-            # Use _extract_nonempty to handle EMPTY_COMPLETION (CAUSA RAÍZ 2)
+            self.logger.info("DATA_ENGINEER_MODEL_USED: %s", model_used)
+            # Use _extract_nonempty to handle EMPTY_COMPLETION (CAUSA RA?Z 2)
             content = self._extract_nonempty(response)
             print(f"DEBUG: Primary DE Response Preview: {content[:200]}...")
             self.last_response = content
@@ -269,24 +280,6 @@ class DataEngineerAgent:
             if "error" in content_lower and ("overloaded" in content_lower or "rate limit" in content_lower or "429" in content_lower):
                 raise ConnectionError(f"API Error Detected (Text): {content_stripped}")
 
-            return content
-
-        def _call_fallback():
-            if not self.fallback_client:
-                raise ValueError("No fallback client configured.")
-            print(f"DEBUG: Data Engineer calling Fallback Model ({self.fallback_model_name})...")
-            response = self.fallback_client.chat.completions.create(
-                model=self.fallback_model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": USER_TEMPLATE}
-                ],
-                temperature=0.1
-            )
-            # Use _extract_nonempty to handle EMPTY_COMPLETION (CAUSA RAÍZ 2)
-            content = self._extract_nonempty(response)
-            print(f"DEBUG: Fallback DE Response Preview: {content[:200]}...")
-            self.last_response = content
             return content
 
         injection = "\n".join(
@@ -362,26 +355,14 @@ class DataEngineerAgent:
 
         try:
             content = call_with_retries(_call_model, max_retries=5, backoff_factor=2, initial_delay=2)
-            print("DEBUG: DeepSeek response received.")
+            print("DEBUG: OpenRouter response received.")
 
             code = self._clean_code(content)
 
             return injection + code
 
         except Exception as e:
-            print(f"WARNING: Primary Data Engineer Model (DeepSeek) failed: {str(e)}")
-            if self.fallback_client:
-                print(f"DEBUG: Attempting Fallback to {self.fallback_model_name}...")
-                try:
-                    content = call_with_retries(_call_fallback, max_retries=3, backoff_factor=2, initial_delay=2)
-                    print("DEBUG: Fallback response received.")
-                    code = self._clean_code(content)
-                    return injection + code
-                except Exception as e_bk:
-                    error_msg = f"Data Engineer Failed (Primary & Fallback): {str(e)} | Backup: {str(e_bk)}"
-            else:
-                error_msg = f"Data Engineer Failed (Max Retries, No Fallback): {str(e)}"
-
+            error_msg = f"Data Engineer Failed (Primary & Fallback): {str(e)}"
             print(f"CRITICAL: {error_msg}")
             return f"# Error: {error_msg}"
 
