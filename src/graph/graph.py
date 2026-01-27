@@ -7142,6 +7142,37 @@ def _finalize_heavy_execution(
     return result
 
 
+def _flag_active_for_run(state: Dict[str, Any], flag: str, run_id: Optional[str]) -> bool:
+    if not state.get(flag):
+        return False
+    if not run_id:
+        return bool(state.get(flag))
+    flag_run = state.get(f"{flag}_run_id")
+    return flag_run == run_id
+
+
+def _extract_error_snippet(code: str, error_details: str, *, context_lines: int = 5) -> str:
+    if not code or not error_details:
+        return ""
+    try:
+        matches = re.findall(r'cleaning\\.py", line (\\d+)', error_details)
+        if not matches:
+            matches = re.findall(r'line (\\d+), in', error_details)
+        if not matches:
+            return ""
+        line_num = int(matches[-1])
+        lines = code.splitlines()
+        start = max(line_num - context_lines - 1, 0)
+        end = min(line_num + context_lines, len(lines))
+        snippet_lines = []
+        for idx in range(start, end):
+            prefix = ">>" if (idx + 1) == line_num else "  "
+            snippet_lines.append(f"{prefix} {idx + 1}: {lines[idx]}")
+        return "\n".join(snippet_lines)
+    except Exception:
+        return ""
+
+
 def _filter_scored_rows_required_columns(
     artifact_requirements: Dict[str, Any],
     decisioning_names: List[str],
@@ -8437,20 +8468,29 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                     new_state["data_engineer_audit_override"] = override
                                     print("Duplicate column dtype guard: retrying Data Engineer.")
                                     return run_data_engineer(new_state)
+                        error_snippet = _extract_error_snippet(code, error_details)
                         reviewer_payload = ""
                         reviewer_result = None
                         review_context_payload = None
                         reviewer_done = False
-                        if cleaning_reviewer and not state.get("de_runtime_reviewer_done"):
+                        runtime_reviewer_done = _flag_active_for_run(state, "de_runtime_reviewer_done", run_id)
+                        if cleaning_reviewer and not runtime_reviewer_done:
                                 try:
                                     context_pack = build_context_pack("cleaning_reviewer", state if isinstance(state, dict) else {})
                                     failure_context = {
                                         "error_details": error_details,
                                         "code": code,
+                                        "code_snippet": error_snippet,
                                         "stdout": stdout_text,
                                         "stderr": stderr_text,
                                         "attempt": attempt_id,
                                     }
+                                    if run_id:
+                                        log_run_event(
+                                            run_id,
+                                            "cleaning_reviewer_runtime_start",
+                                            {"attempt": attempt_id, "has_snippet": bool(error_snippet)},
+                                        )
                                     cleaning_view = state.get("cleaning_view") or (state.get("contract_views") or {}).get("cleaning_view")
                                     if cleaning_view:
                                         cleaning_view_copy = dict(cleaning_view)
@@ -8487,6 +8527,12 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                             failure_context=failure_context,
                                         )
                                         review_context_payload = review_context
+                                    if run_id:
+                                        log_run_event(
+                                            run_id,
+                                            "cleaning_reviewer_runtime_complete",
+                                            {"status": reviewer_result.get("status") if isinstance(reviewer_result, dict) else None},
+                                        )
                                     try:
                                         os.makedirs("artifacts", exist_ok=True)
                                         with open(
@@ -8508,6 +8554,12 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                         )
                                 except Exception as review_err:
                                     print(f"Warning: cleaning reviewer runtime audit failed: {review_err}")
+                                    if run_id:
+                                        log_run_event(
+                                            run_id,
+                                            "cleaning_reviewer_runtime_failed",
+                                            {"error": str(review_err)},
+                                        )
                         if isinstance(reviewer_result, dict):
                                 reviewer_done = True
                                 fixes = reviewer_result.get("required_fixes", [])
@@ -8519,11 +8571,15 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                     + str(reviewer_result.get("feedback", "")).strip()
                                     + fixes_text
                                 )
-                        if not state.get("de_runtime_retry_done"):
+                        if not _flag_active_for_run(state, "de_runtime_retry_done", run_id):
                                 new_state = dict(state)
                                 new_state["de_runtime_retry_done"] = True
+                                if run_id:
+                                    new_state["de_runtime_retry_done_run_id"] = run_id
                                 if reviewer_done:
                                     new_state["de_runtime_reviewer_done"] = True
+                                    if run_id:
+                                        new_state["de_runtime_reviewer_done_run_id"] = run_id
                                 override = state.get("data_engineer_audit_override") or state.get("data_summary", "")
                                 try:
                                     override += "\n\nRUNTIME_ERROR_CONTEXT:\n" + error_details[-2000:]
@@ -8550,6 +8606,7 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                             "csv_dialect": input_dialect,
                                             "required_input_columns": required_input,
                                             "required_raw_header_map": required_raw_map,
+                                            "error_snippet": error_snippet,
                                         }
                                         explainer_text = failure_explainer.explain_data_engineer_failure(
                                             code=code,
@@ -8575,6 +8632,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                     pass
                                 new_state["data_engineer_audit_override"] = override
                                 print("Runtime error guard: retrying Data Engineer with error context.")
+                                if run_id:
+                                    log_run_event(run_id, "data_engineer_runtime_retry", {"attempt": attempt_id})
                                 return run_data_engineer(new_state)
                         return {
                             "cleaning_code": code,
