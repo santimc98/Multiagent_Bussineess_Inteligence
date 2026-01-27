@@ -1183,6 +1183,18 @@ def lint_outcome_presence_and_coherence(
             outcome_candidates.append(col)
             notes.append(f"outcome_coherence: inferred outcome '{col}' from validation_requirements/objective_analysis")
 
+    # Source 4: target_candidates (from data_profile compact)
+    if not outcome_candidates:
+        target_candidates = contract.get("target_candidates")
+        if isinstance(target_candidates, list):
+            for item in target_candidates:
+                if isinstance(item, dict):
+                    col = item.get("column") or item.get("name") or item.get("candidate")
+                    if isinstance(col, str) and col.strip():
+                        outcome_candidates.append(col.strip())
+                        notes.append(f"outcome_coherence: inferred outcome '{col.strip()}' from target_candidates")
+                        break
+
     # If still no outcomes → HARD error for supervised contract
     if not outcome_candidates:
         issues.append({

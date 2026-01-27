@@ -1436,6 +1436,7 @@ def build_contract_min(
     strategy: Dict[str, Any] | None,
     column_inventory: List[str] | None,
     relevant_columns: List[str] | None,
+    target_candidates: List[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     """
     Build a compact contract_min that aligns agents on relevant columns and gates.
@@ -1473,7 +1474,21 @@ def build_contract_min(
         canon_set = set(canonical_columns)
         return [col for col in cols if col in canon_set]
 
-    roles = contract.get("column_roles", {}) if isinstance(contract.get("column_roles"), dict) else {}
+    roles_raw = contract.get("column_roles", {}) if isinstance(contract.get("column_roles"), dict) else {}
+    roles = roles_raw
+    if isinstance(roles_raw, dict) and roles_raw:
+        role_keys = {
+            "pre_decision",
+            "decision",
+            "outcome",
+            "post_decision_audit_only",
+            "unknown",
+            "identifiers",
+            "time_columns",
+        }
+        if all(key in role_keys for key in roles_raw.keys()):
+            if all(isinstance(val, str) for val in roles_raw.values()):
+                roles = {}
     if roles and all(isinstance(val, dict) and "role" in val for val in roles.values()):
         role_lists = {
             "pre_decision": [],
@@ -1520,10 +1535,33 @@ def build_contract_min(
     identifiers: List[str] = []
     time_columns: List[str] = []
 
+    def _resolve_candidate_targets() -> List[str]:
+        resolved_targets: List[str] = []
+        if not target_candidates:
+            return resolved_targets
+        for item in target_candidates:
+            if not isinstance(item, dict):
+                continue
+            raw = item.get("column") or item.get("name") or item.get("candidate")
+            if not raw:
+                continue
+            if raw in canonical_columns:
+                resolved_targets.append(raw)
+                continue
+            norm = _normalize_column_identifier(raw)
+            resolved = inventory_norms.get(norm)
+            if resolved:
+                if resolved not in canonical_columns:
+                    canonical_columns.append(resolved)
+                resolved_targets.append(resolved)
+        return list(dict.fromkeys(resolved_targets))
+
     if roles_present:
         outcome_cols = list(role_outcome)
         decision_cols = list(role_decision)
         audit_only_cols = list(role_audit)
+        if not outcome_cols:
+            outcome_cols = _filter_to_canonical(_resolve_candidate_targets())
     else:
         outcome_candidates = []
         decision_candidates = []
@@ -1537,6 +1575,8 @@ def build_contract_min(
         decision_candidates.extend(_coerce_list(contract.get("decision_columns")))
         decision_candidates.extend(_coerce_list(contract.get("decision_variables")))
         audit_candidates.extend(_coerce_list(strategy_dict.get("audit_only_columns")))
+        if not outcome_candidates:
+            outcome_candidates.extend(_resolve_candidate_targets())
         outcome_cols = _filter_to_canonical([col for col in outcome_candidates if col])
         decision_cols = _filter_to_canonical([col for col in decision_candidates if col])
         audit_only_cols = _filter_to_canonical([col for col in audit_candidates if col])
@@ -5583,7 +5623,33 @@ class ExecutionPlannerAgent:
         if not self.client:
             contract = _fallback()
             contract = _attach_reporting_policy(contract)
-            contract_min = build_contract_min(contract, strategy, column_inventory, relevant_columns)
+            target_candidates = []
+            if isinstance(data_profile, dict):
+                try:
+                    from src.utils.data_profile_compact import compact_data_profile_for_llm
+                    compact = compact_data_profile_for_llm(data_profile, contract=contract)
+                    target_candidates = compact.get("target_candidates") if isinstance(compact, dict) else []
+                except Exception:
+                    target_candidates = []
+        if isinstance(target_candidates, list) and target_candidates:
+            contract["target_candidates"] = target_candidates
+        explicit_outcomes = contract.get("outcome_columns")
+        has_outcomes = False
+        if isinstance(explicit_outcomes, list):
+            has_outcomes = any(str(v).strip().lower() != "unknown" for v in explicit_outcomes if v is not None)
+        elif isinstance(explicit_outcomes, str):
+            has_outcomes = explicit_outcomes.strip().lower() != "unknown"
+        if not has_outcomes:
+            inferred = []
+            for item in target_candidates or []:
+                if isinstance(item, dict):
+                    col = item.get("column") or item.get("name") or item.get("candidate")
+                    if col:
+                        inferred.append(col)
+                        break
+            if inferred:
+                contract["outcome_columns"] = inferred
+            contract_min = build_contract_min(contract, strategy, column_inventory, relevant_columns, target_candidates=target_candidates)
             contract = _sync_execution_contract_outputs(contract, contract_min)
             self.last_contract_min = contract_min
             return _finalize_and_persist(contract, contract_min, where="execution_planner:no_client")
@@ -5864,7 +5930,33 @@ domain_expert_critique:
 
         # V4.1: Do NOT write role_runbooks - use direct data_engineer_runbook/ml_engineer_runbook keys
 
-        contract_min = build_contract_min(contract, strategy, column_inventory, relevant_columns)
+        target_candidates = []
+        if isinstance(data_profile, dict):
+            try:
+                from src.utils.data_profile_compact import compact_data_profile_for_llm
+                compact = compact_data_profile_for_llm(data_profile, contract=contract)
+                target_candidates = compact.get("target_candidates") if isinstance(compact, dict) else []
+            except Exception:
+                target_candidates = []
+        if isinstance(target_candidates, list) and target_candidates:
+            contract["target_candidates"] = target_candidates
+        explicit_outcomes = contract.get("outcome_columns")
+        has_outcomes = False
+        if isinstance(explicit_outcomes, list):
+            has_outcomes = any(str(v).strip().lower() != "unknown" for v in explicit_outcomes if v is not None)
+        elif isinstance(explicit_outcomes, str):
+            has_outcomes = explicit_outcomes.strip().lower() != "unknown"
+        if not has_outcomes:
+            inferred = []
+            for item in target_candidates or []:
+                if isinstance(item, dict):
+                    col = item.get("column") or item.get("name") or item.get("candidate")
+                    if col:
+                        inferred.append(col)
+                        break
+            if inferred:
+                contract["outcome_columns"] = inferred
+        contract_min = build_contract_min(contract, strategy, column_inventory, relevant_columns, target_candidates=target_candidates)
         contract = _sync_execution_contract_outputs(contract, contract_min)
         self.last_contract_min = contract_min
 
