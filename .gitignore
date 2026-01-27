@@ -17,6 +17,7 @@ venv/
 .env
 .env.*
 !.env.example
+cloudrun/heavy_runner/ping.json
 
 # OS / editor noise
 .DS_Store

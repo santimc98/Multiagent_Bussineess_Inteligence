@@ -635,10 +635,7 @@ class MLEngineerAgent:
 
         if requires_label_filter and not self._code_mentions_label_filter(code, target):
             split_ok = False
-            allow_split_substitution = True
-            if isinstance(train_filter, dict) and str(train_filter.get("type") or "").strip().lower() == "label_not_null":
-                allow_split_substitution = False
-            if allow_split_substitution and split_column and self._code_mentions_split_usage(code, split_column):
+            if split_column and self._code_mentions_split_usage(code, split_column):
                 evidence = plan.get("evidence_used") if isinstance(plan.get("evidence_used"), dict) else {}
                 split_eval = str(evidence.get("split_evaluation", "")).lower()
                 split_candidates = evidence.get("split_candidates") if isinstance(evidence.get("split_candidates"), list) else []
