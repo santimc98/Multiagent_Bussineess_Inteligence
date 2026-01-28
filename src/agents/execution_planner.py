@@ -5620,10 +5620,10 @@ class ExecutionPlannerAgent:
             _persist_contracts(contract, contract_min)
             return contract
 
+        target_candidates: List[Dict[str, Any]] = []
         if not self.client:
             contract = _fallback()
             contract = _attach_reporting_policy(contract)
-            target_candidates = []
             if isinstance(data_profile, dict):
                 try:
                     from src.utils.data_profile_compact import compact_data_profile_for_llm
@@ -5631,24 +5631,24 @@ class ExecutionPlannerAgent:
                     target_candidates = compact.get("target_candidates") if isinstance(compact, dict) else []
                 except Exception:
                     target_candidates = []
-        if isinstance(target_candidates, list) and target_candidates:
-            contract["target_candidates"] = target_candidates
-        explicit_outcomes = contract.get("outcome_columns")
-        has_outcomes = False
-        if isinstance(explicit_outcomes, list):
-            has_outcomes = any(str(v).strip().lower() != "unknown" for v in explicit_outcomes if v is not None)
-        elif isinstance(explicit_outcomes, str):
-            has_outcomes = explicit_outcomes.strip().lower() != "unknown"
-        if not has_outcomes:
-            inferred = []
-            for item in target_candidates or []:
-                if isinstance(item, dict):
-                    col = item.get("column") or item.get("name") or item.get("candidate")
-                    if col:
-                        inferred.append(col)
-                        break
-            if inferred:
-                contract["outcome_columns"] = inferred
+            if isinstance(target_candidates, list) and target_candidates:
+                contract["target_candidates"] = target_candidates
+            explicit_outcomes = contract.get("outcome_columns")
+            has_outcomes = False
+            if isinstance(explicit_outcomes, list):
+                has_outcomes = any(str(v).strip().lower() != "unknown" for v in explicit_outcomes if v is not None)
+            elif isinstance(explicit_outcomes, str):
+                has_outcomes = explicit_outcomes.strip().lower() != "unknown"
+            if not has_outcomes:
+                inferred = []
+                for item in target_candidates or []:
+                    if isinstance(item, dict):
+                        col = item.get("column") or item.get("name") or item.get("candidate")
+                        if col:
+                            inferred.append(col)
+                            break
+                if inferred:
+                    contract["outcome_columns"] = inferred
             contract_min = build_contract_min(contract, strategy, column_inventory, relevant_columns, target_candidates=target_candidates)
             contract = _sync_execution_contract_outputs(contract, contract_min)
             self.last_contract_min = contract_min
