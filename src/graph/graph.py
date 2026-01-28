@@ -10941,11 +10941,24 @@ def execute_code(state: AgentState) -> AgentState:
                 "model.joblib": os.path.join("artifacts", "heavy_model.joblib"),
                 "error.json": os.path.join("artifacts", "heavy_error.json"),
             }
+            support_files = []
+            for rel_path in [
+                "data/cleaning_manifest.json",
+                "data/column_sets.json",
+                "data/column_inventory.json",
+                "data/contract_min.json",
+                "data/execution_contract.json",
+                "data/ml_plan.json",
+                "data/evaluation_spec.json",
+            ]:
+                if os.path.exists(rel_path):
+                    support_files.append({"local_path": rel_path, "path": rel_path})
             if run_id:
                 log_run_event(
                     run_id,
                     "heavy_runner_request",
                     {
+                        "mode": "execute_code",
                         "gcloud_bin": os.getenv("HEAVY_RUNNER_GCLOUD_BIN") or "PATH",
                         "gsutil_bin": os.getenv("HEAVY_RUNNER_GSUTIL_BIN") or "PATH",
                         "target_col": target_col,
@@ -10957,6 +10970,7 @@ def execute_code(state: AgentState) -> AgentState:
                         "model_type": model_type,
                         "model_params_keys": list(model_params.keys()) if isinstance(model_params, dict) else [],
                         "download_keys": list(download_map.keys()),
+                        "support_files": [item.get("path") for item in support_files],
                     },
                 )
             if run_id:
@@ -10974,6 +10988,9 @@ def execute_code(state: AgentState) -> AgentState:
                     output_prefix=heavy_cfg.get("output_prefix", "outputs"),
                     dataset_prefix=heavy_cfg.get("dataset_prefix", "datasets"),
                     download_map=download_map,
+                    code_text=code,
+                    support_files=support_files,
+                    data_path="data/cleaned_data.csv",
                 )
             except CloudRunLaunchError as exc:
                 if run_id:

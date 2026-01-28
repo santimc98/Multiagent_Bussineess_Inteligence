@@ -122,6 +122,19 @@ def _upload_json_to_gcs(payload: Dict[str, Any], uri: str, gsutil_bin: str) -> N
             pass
 
 
+def _upload_text_to_gcs(text: str, uri: str, gsutil_bin: str) -> None:
+    with tempfile.NamedTemporaryFile("w", delete=False, suffix=".py", encoding="utf-8") as tmp:
+        tmp.write(text or "")
+        tmp_path = tmp.name
+    try:
+        _gsutil_cp(tmp_path, uri, gsutil_bin)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
 def _normalize_prefix(prefix: str) -> str:
     prefix = str(prefix or "").strip().strip("/")
     return prefix
@@ -141,6 +154,9 @@ def launch_heavy_runner_job(
     project: Optional[str] = None,
     download_map: Optional[Dict[str, str]] = None,
     wait: bool = True,
+    code_text: Optional[str] = None,
+    support_files: Optional[list[Dict[str, str]]] = None,
+    data_path: str = "data/cleaned_data.csv",
 ) -> Dict[str, Any]:
     gcloud_bin = _resolve_cli_override("gcloud", "HEAVY_RUNNER_GCLOUD_BIN")
     gsutil_bin = _resolve_cli_override("gsutil", "HEAVY_RUNNER_GSUTIL_BIN")
@@ -159,6 +175,30 @@ def launch_heavy_runner_job(
         dataset_uri = f"gs://{bucket}/{dataset_prefix}/{run_id}/{dataset_name}"
         _gsutil_cp(dataset_path, dataset_uri, gsutil_bin)
     request["dataset_uri"] = dataset_uri
+
+    if code_text is not None:
+        code_uri = f"gs://{bucket}/{input_prefix}/{run_id}/ml_script.py"
+        _upload_text_to_gcs(code_text, code_uri, gsutil_bin)
+        request["code_uri"] = code_uri
+        request["data_path"] = data_path
+
+        uploaded_support = []
+        if support_files:
+            for item in support_files:
+                if not isinstance(item, dict):
+                    continue
+                local_path = item.get("local_path")
+                rel_path = item.get("path")
+                if not local_path or not rel_path:
+                    continue
+                if not os.path.exists(local_path):
+                    continue
+                rel_path = str(rel_path).lstrip("/").replace("\\", "/")
+                support_uri = f"gs://{bucket}/{input_prefix}/{run_id}/support/{rel_path}"
+                _gsutil_cp(local_path, support_uri, gsutil_bin)
+                uploaded_support.append({"uri": support_uri, "path": rel_path})
+        if uploaded_support:
+            request["support_files"] = uploaded_support
 
     input_uri = f"gs://{bucket}/{input_prefix}/{run_id}.json"
     output_uri = f"gs://{bucket}/{output_prefix}/{run_id}/"

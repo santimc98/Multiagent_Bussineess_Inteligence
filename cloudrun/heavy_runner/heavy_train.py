@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -88,6 +89,46 @@ def _load_input_json(input_uri: str) -> Dict[str, Any]:
         return json.loads(text)
     with open(input_uri, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _download_to_path(uri: str, local_path: str) -> None:
+    if uri.startswith("gs://"):
+        _download_gcs_to_path(uri, local_path)
+        return
+    if os.path.exists(uri):
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(uri, "rb") as src, open(local_path, "wb") as dst:
+            dst.write(src.read())
+        return
+    raise ValueError(f"Unsupported URI for download: {uri}")
+
+
+def _download_support_files(items: Any, base_dir: str) -> None:
+    if not items:
+        return
+    if not isinstance(items, list):
+        raise ValueError("support_files must be a list")
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        uri = item.get("uri")
+        rel_path = item.get("path")
+        if not uri or not rel_path:
+            continue
+        dest_path = os.path.join(base_dir, rel_path)
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        _download_to_path(uri, dest_path)
+
+
+def _run_script(script_path: str, work_dir: str) -> Tuple[int, str, str]:
+    proc = subprocess.run(
+        [sys.executable, script_path],
+        cwd=work_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
 
 
 def _read_dataset(dataset_uri: str, read_cfg: Dict[str, Any]) -> pd.DataFrame:
@@ -194,6 +235,55 @@ def main() -> int:
         if not isinstance(decisioning_required, list):
             decisioning_required = []
 
+        code_uri = payload.get("code_uri")
+        if code_uri:
+            work_dir = "/tmp/run"
+            os.makedirs(work_dir, exist_ok=True)
+            data_path = payload.get("data_path") or "data/cleaned_data.csv"
+            data_path = os.path.join(work_dir, data_path)
+            os.makedirs(os.path.dirname(data_path), exist_ok=True)
+            log(f"Downloading dataset for code execution from {dataset_uri}")
+            _download_to_path(dataset_uri, data_path)
+            support_files = payload.get("support_files")
+            _download_support_files(support_files, work_dir)
+            script_path = os.path.join(work_dir, "ml_script.py")
+            log(f"Downloading ML script from {code_uri}")
+            _download_to_path(code_uri, script_path)
+            os.makedirs(os.path.join(work_dir, "static", "plots"), exist_ok=True)
+            log("Executing ML script in heavy runner.")
+            exit_code, stdout, stderr = _run_script(script_path, work_dir)
+            log_path = os.path.join("/tmp", "execution_log.txt")
+            with open(log_path, "w", encoding="utf-8") as log_file:
+                log_file.write(stdout or "")
+                if stderr:
+                    log_file.write("\n[stderr]\n")
+                    log_file.write(stderr)
+            _write_file_output(log_path, output_uri, "execution_log.txt")
+            if exit_code != 0:
+                raise RuntimeError(
+                    f"ML script failed with exit code {exit_code}. See execution_log.txt for details."
+                )
+            expected_outputs = payload.get("expected_outputs") or [
+                "data/metrics.json",
+                "data/scored_rows.csv",
+                "data/alignment_check.json",
+            ]
+            uploaded = []
+            for rel_path in expected_outputs:
+                local_path = os.path.join(work_dir, rel_path)
+                if os.path.exists(local_path):
+                    _write_file_output(local_path, output_uri, os.path.basename(rel_path))
+                    uploaded.append(rel_path)
+            status_payload = {
+                "ok": True,
+                "run_id": run_id,
+                "mode": "execute_code",
+                "uploaded_outputs": uploaded,
+            }
+            _write_json_output(status_payload, output_uri, "status.json")
+            log("ML script execution completed successfully.")
+            return 0
+
         log(f"Loading dataset from {dataset_uri}")
         df = _read_dataset(dataset_uri, read_cfg)
         if target_col not in df.columns:
@@ -210,6 +300,10 @@ def main() -> int:
         else:
             X = df.drop(columns=drop_cols)
         y = df[target_col]
+        train_mask = y.notna()
+        missing_target = int((~train_mask).sum())
+        if missing_target:
+            log(f"Detected {missing_target} rows with NaN target; excluding from training/CV.")
 
         if float32:
             X = X.astype(np.float32)
@@ -218,6 +312,13 @@ def main() -> int:
             non_numeric = [c for c in X.columns if not pd.api.types.is_numeric_dtype(X[c])]
             if non_numeric:
                 raise ValueError(f"Non-numeric feature columns present: {non_numeric[:10]}")
+
+        X_train = X[train_mask]
+        y_train = y[train_mask]
+        if len(y_train) == 0:
+            raise ValueError("No non-null target rows available for training.")
+        if problem_type == "classification" and pd.api.types.is_numeric_dtype(y_train):
+            y_train = y_train.astype(int)
 
         model, model_type, model_params = _resolve_model(problem_type, model_cfg, safe_mode)
         cv_obj, metric_name, folds, cv_n_jobs = _resolve_cv(problem_type, cv_cfg, safe_mode)
@@ -230,6 +331,8 @@ def main() -> int:
                 "n_rows": int(len(df)),
                 "n_cols": int(df.shape[1]),
                 "n_features": int(X.shape[1]),
+                "n_train_rows": int(len(y_train)),
+                "n_missing_target": int(missing_target),
                 "target_col": target_col,
                 "feature_cols": feature_cols if feature_cols else "all_except_target",
                 "float32": float32,
@@ -239,11 +342,11 @@ def main() -> int:
             "cv": {"enabled": False},
         }
 
-        if cv_obj is not None:
+        if cv_obj is not None and len(y_train) >= (folds or 0):
             log(f"Running cross-validation: folds={folds}, metric={metric_name}")
             cv_start = time.perf_counter()
             if problem_type == "classification":
-                scores = cross_val_score(model, X, y, cv=cv_obj, scoring="accuracy", n_jobs=cv_n_jobs)
+                scores = cross_val_score(model, X_train, y_train, cv=cv_obj, scoring="accuracy", n_jobs=cv_n_jobs)
                 scores_list = [float(s) for s in scores]
                 metrics["cv"] = {
                     "enabled": True,
@@ -255,7 +358,7 @@ def main() -> int:
                 }
             else:
                 scores = cross_val_score(
-                    model, X, y, cv=cv_obj, scoring="neg_root_mean_squared_error", n_jobs=cv_n_jobs
+                    model, X_train, y_train, cv=cv_obj, scoring="neg_root_mean_squared_error", n_jobs=cv_n_jobs
                 )
                 rmse_scores = [-float(s) for s in scores]
                 metrics["cv"] = {
@@ -267,10 +370,17 @@ def main() -> int:
                     "std": float(np.std(rmse_scores)),
                 }
             metrics["timing_seconds"]["cv"] = round(time.perf_counter() - cv_start, 6)
+        elif cv_obj is not None:
+            metrics["cv"] = {
+                "enabled": False,
+                "note": "insufficient labeled rows for requested cv folds",
+                "folds_requested": folds,
+                "n_train_rows": int(len(y_train)),
+            }
 
         log("Fitting final model on full dataset.")
         train_start = time.perf_counter()
-        model.fit(X, y)
+        model.fit(X_train, y_train)
         metrics["timing_seconds"]["train"] = round(time.perf_counter() - train_start, 6)
 
         log("Generating predictions for scored rows.")
@@ -283,10 +393,10 @@ def main() -> int:
             max_prob = np.max(probs, axis=1)
             scored_df["probability"] = max_prob
             scored_df["confidence_score"] = max_prob
-            train_metrics["accuracy"] = float(np.mean(preds == y))
+            train_metrics["accuracy"] = float(np.mean(preds[train_mask] == y_train.values))
         else:
             scored_df["predicted_value"] = preds
-            rmse = float(np.sqrt(np.mean((preds - y) ** 2)))
+            rmse = float(np.sqrt(np.mean((preds[train_mask] - y_train.values) ** 2)))
             train_metrics["rmse"] = rmse
 
         if decisioning_required:
