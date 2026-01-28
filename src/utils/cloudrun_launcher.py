@@ -109,6 +109,25 @@ def _gsutil_cat(uri: str, gsutil_bin: str) -> str:
     return stdout
 
 
+def _gsutil_ls(uri: str, gsutil_bin: str) -> list[str]:
+    """List files at a GCS URI. Returns empty list on error or if nothing found."""
+    _ensure_cli(gsutil_bin)
+    try:
+        proc = subprocess.run(
+            [gsutil_bin, "ls", uri],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return []
+        return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    except Exception:
+        return []
+
+
 def _upload_json_to_gcs(payload: Dict[str, Any], uri: str, gsutil_bin: str) -> None:
     with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json", encoding="utf-8") as tmp:
         json.dump(payload, tmp, indent=2, ensure_ascii=True)
@@ -157,6 +176,7 @@ def launch_heavy_runner_job(
     code_text: Optional[str] = None,
     support_files: Optional[list[Dict[str, str]]] = None,
     data_path: str = "data/cleaned_data.csv",
+    required_artifacts: Optional[list[str]] = None,
 ) -> Dict[str, Any]:
     gcloud_bin = _resolve_cli_override("gcloud", "HEAVY_RUNNER_GCLOUD_BIN")
     gsutil_bin = _resolve_cli_override("gsutil", "HEAVY_RUNNER_GSUTIL_BIN")
@@ -235,12 +255,33 @@ def launch_heavy_runner_job(
         except Exception:
             error_payload = {"error": "Failed to parse error.json", "raw": _gsutil_cat(error_uri, gsutil_bin)}
 
+    # Check for missing required artifacts
+    missing_artifacts: list[str] = []
+    if required_artifacts:
+        for artifact in required_artifacts:
+            if artifact not in downloaded:
+                missing_artifacts.append(artifact)
+
+    # Build diagnostic info if artifacts are missing
+    gcs_listing: list[str] = []
+    if missing_artifacts and not error_payload:
+        gcs_listing = _gsutil_ls(output_uri, gsutil_bin)
+        error_payload = {
+            "error": "missing_required_artifacts",
+            "missing": missing_artifacts,
+            "downloaded": list(downloaded.keys()),
+            "gcs_listing": gcs_listing,
+            "message": f"Heavy runner job completed but required artifacts missing: {missing_artifacts}",
+        }
+
     return {
         "status": "error" if error_payload else "success",
         "input_uri": input_uri,
         "output_uri": output_uri,
         "dataset_uri": dataset_uri,
         "downloaded": downloaded,
+        "missing_artifacts": missing_artifacts,
+        "gcs_listing": gcs_listing,
         "job_stdout": stdout,
         "job_stderr": stderr,
         "gcloud_flag": flag_used,

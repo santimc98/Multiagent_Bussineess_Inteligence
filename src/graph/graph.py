@@ -9783,7 +9783,10 @@ def run_engineer(state: AgentState) -> AgentState:
             except Exception:
                 pass
         if "ml_plan" in sig.parameters:
-            kwargs["ml_plan"] = state.get("ml_plan") or {}
+            ml_plan_for_gen = state.get("ml_plan")
+            if not ml_plan_for_gen:
+                ml_plan_for_gen = _load_json_safe("data/ml_plan.json")
+            kwargs["ml_plan"] = ml_plan_for_gen or {}
         aliasing = {}
         derived_present = []
         sample_context = ""
@@ -10345,7 +10348,10 @@ def run_qa_reviewer(state: AgentState) -> AgentState:
         # Wire ML Plan for QA coherence check (Senior Reasoning)
         qa_context.setdefault("evaluation_spec", {})
         if isinstance(qa_context["evaluation_spec"], dict):
-             qa_context["evaluation_spec"]["ml_plan"] = state.get("ml_plan") or {}
+             ml_plan_for_qa = state.get("ml_plan")
+             if not ml_plan_for_qa:
+                 ml_plan_for_qa = _load_json_safe("data/ml_plan.json")
+             qa_context["evaluation_spec"]["ml_plan"] = ml_plan_for_qa or {}
              qa_context["evaluation_spec"]["data_profile"] = state.get("data_profile") or {}
              qa_context["evaluation_spec"]["ml_training_policy_warnings"] = state.get("ml_training_policy_warnings") or {}
         dataset_semantics_summary = state.get("dataset_semantics_summary")
@@ -10807,7 +10813,7 @@ def check_review(state: AgentState):
         return "rejected"
 
 def execute_code(state: AgentState) -> AgentState:
-    print("--- [5] System: Executing Code (E2B Sandbox) ---")
+    print("--- [5] System: Executing Code ---")
     run_id = state.get("run_id")
     contract_min = state.get("execution_contract_min") or state.get("contract_min") or _load_json_safe("data/contract_min.json") or {}
     ok, counters, err_msg = _consume_budget(state, "execution_calls", "max_execution_calls", "Execution")
@@ -10826,7 +10832,10 @@ def execute_code(state: AgentState) -> AgentState:
     # Optional heavy runner path (Cloud Run Job) for large workloads
     heavy_cfg = _get_heavy_runner_config()
     if heavy_cfg:
-        ml_plan = state.get("ml_plan") or {}
+        ml_plan = state.get("ml_plan")
+        if not ml_plan:
+            ml_plan = _load_json_safe("data/ml_plan.json")
+        ml_plan = ml_plan or {}
         data_profile = state.get("data_profile") or {}
         use_heavy, heavy_reason = _should_use_heavy_runner(state, data_profile, ml_plan)
         if run_id:
@@ -10848,6 +10857,7 @@ def execute_code(state: AgentState) -> AgentState:
                 },
             )
         if use_heavy:
+            print(f"    Backend: Cloud Run Heavy Runner (reason={heavy_reason})")
             contract = state.get("execution_contract", {}) or {}
             dialect = _resolve_artifact_gate_dialect(state, contract)
             csv_sep = dialect["sep"]
@@ -10975,6 +10985,8 @@ def execute_code(state: AgentState) -> AgentState:
                 )
             if run_id:
                 log_run_event(run_id, "heavy_runner_start", {"reason": heavy_reason})
+            # Required artifacts for output contract compliance
+            required_artifacts = ["metrics.json", "scored_rows.csv", "alignment_check.json"]
             try:
                 heavy_result = launch_heavy_runner_job(
                     run_id=run_id or "unknown",
@@ -10991,6 +11003,7 @@ def execute_code(state: AgentState) -> AgentState:
                     code_text=code,
                     support_files=support_files,
                     data_path="data/cleaned_data.csv",
+                    required_artifacts=required_artifacts,
                 )
             except CloudRunLaunchError as exc:
                 if run_id:
@@ -11027,6 +11040,8 @@ def execute_code(state: AgentState) -> AgentState:
                             "output_uri": heavy_result.get("output_uri"),
                             "dataset_uri": heavy_result.get("dataset_uri"),
                             "downloaded": list((heavy_result.get("downloaded") or {}).keys()),
+                            "missing_artifacts": heavy_result.get("missing_artifacts") or [],
+                            "gcs_listing": heavy_result.get("gcs_listing") or [],
                             "error_present": bool(heavy_result.get("error")),
                             "gcloud_flag": heavy_result.get("gcloud_flag"),
                         },
@@ -11057,6 +11072,9 @@ def execute_code(state: AgentState) -> AgentState:
                     attempt_id=attempt_id,
                     visuals_missing=visuals_missing,
                 )
+
+    # E2B Sandbox execution path
+    print("    Backend: E2B Sandbox")
 
     # Prevent stale metrics from previous iterations
     try:
