@@ -75,7 +75,8 @@ def _run_gcloud_job_execute(
         stdout, stderr = _run_cmd(cmd)
         return stdout, stderr, "update-env-vars"
     except CloudRunLaunchError as exc:
-        if "--update-env-vars" not in str(exc):
+        err_text = str(exc)
+        if "unrecognized arguments" not in err_text or "--update-env-vars" not in err_text:
             raise
     cmd = [gcloud_bin, "run", "jobs", "execute", job, "--region", region, "--set-env-vars", env_vars]
     if project:
