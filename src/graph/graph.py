@@ -10944,12 +10944,16 @@ def execute_code(state: AgentState) -> AgentState:
             if not os.path.exists(local_csv):
                 return {"error_message": "HEAVY_RUNNER: cleaned_data.csv missing", "execution_output": "HEAVY_RUNNER_ERROR: cleaned_data.csv missing", "budget_counters": counters}
 
+            # Download map: GCS filename -> local path
+            # Heavy runner uploads with full relative paths (data/metrics.json)
             download_map = {
-                "metrics.json": "data/metrics.json",
-                "scored_rows.csv": "data/scored_rows.csv",
-                "alignment_check.json": "data/alignment_check.json",
+                "data/metrics.json": "data/metrics.json",
+                "data/scored_rows.csv": "data/scored_rows.csv",
+                "data/alignment_check.json": "data/alignment_check.json",
                 "model.joblib": os.path.join("artifacts", "heavy_model.joblib"),
                 "error.json": os.path.join("artifacts", "heavy_error.json"),
+                "status.json": os.path.join("artifacts", "heavy_status.json"),
+                "artifacts/execution_log.txt": os.path.join("artifacts", "heavy_execution_log.txt"),
             }
             support_files = []
             for rel_path in [
@@ -10985,8 +10989,8 @@ def execute_code(state: AgentState) -> AgentState:
                 )
             if run_id:
                 log_run_event(run_id, "heavy_runner_start", {"reason": heavy_reason})
-            # Required artifacts for output contract compliance
-            required_artifacts = ["metrics.json", "scored_rows.csv", "alignment_check.json"]
+            # Required artifacts for output contract compliance (with full paths as uploaded by heavy runner)
+            required_artifacts = ["data/metrics.json", "data/scored_rows.csv", "data/alignment_check.json"]
             try:
                 heavy_result = launch_heavy_runner_job(
                     run_id=run_id or "unknown",
