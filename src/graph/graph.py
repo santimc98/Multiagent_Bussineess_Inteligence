@@ -7371,6 +7371,7 @@ def run_execution_planner(state: AgentState) -> AgentState:
                 strategy,
                 column_inventory,
                 contract.get("canonical_columns", []) if isinstance(contract, dict) else [],
+                data_profile=planner_data_profile,
             )
         except Exception:
             contract_min = None
@@ -8527,12 +8528,23 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                             {"attempt": attempt_id, "has_snippet": bool(error_snippet)},
                                         )
                                     cleaning_view = state.get("cleaning_view") or (state.get("contract_views") or {}).get("cleaning_view")
+                                    # Load cleaning code for intent verification by reviewer
+                                    cleaning_code_for_reviewer = None
+                                    try:
+                                        de_code_path = os.path.join("artifacts", "data_engineer_last.py")
+                                        if os.path.exists(de_code_path):
+                                            with open(de_code_path, "r", encoding="utf-8") as f_code:
+                                                cleaning_code_for_reviewer = f_code.read()
+                                    except Exception:
+                                        cleaning_code_for_reviewer = None
                                     if cleaning_view:
                                         cleaning_view_copy = dict(cleaning_view)
                                         if context_pack:
                                             cleaning_view_copy["context_pack"] = context_pack
                                         if isinstance(input_dialect, dict):
                                             cleaning_view_copy["input_dialect"] = input_dialect
+                                        if cleaning_code_for_reviewer:
+                                            cleaning_view_copy["cleaning_code"] = cleaning_code_for_reviewer
                                         cleaning_view_copy = compress_long_lists(cleaning_view_copy)[0]
                                         reviewer_result = cleaning_reviewer.review_cleaning(
                                             cleaning_view_copy,
@@ -8556,6 +8568,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
                                         }
                                         if context_pack:
                                             review_context["context_pack"] = context_pack
+                                        if cleaning_code_for_reviewer:
+                                            review_context["cleaning_code"] = cleaning_code_for_reviewer
                                         review_context = compress_long_lists(review_context)[0]
                                         reviewer_result = cleaning_reviewer.review_cleaning(
                                             review_context,
@@ -9261,6 +9275,15 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             "encoding": output_payload.get("encoding") or csv_encoding,
                         }
                     cleaning_view = state.get("cleaning_view") or (state.get("contract_views") or {}).get("cleaning_view")
+                    # Load cleaning code for intent verification by reviewer
+                    cleaning_code_for_normal_review = None
+                    try:
+                        de_code_path = os.path.join("artifacts", "data_engineer_last.py")
+                        if os.path.exists(de_code_path):
+                            with open(de_code_path, "r", encoding="utf-8") as f_code:
+                                cleaning_code_for_normal_review = f_code.read()
+                    except Exception:
+                        cleaning_code_for_normal_review = None
                     if cleaning_view:
                         cleaning_view_copy = dict(cleaning_view)
                         if context_pack:
@@ -9269,6 +9292,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             cleaning_view_copy["output_dialect"] = output_dialect
                         if isinstance(input_dialect, dict):
                             cleaning_view_copy["input_dialect"] = input_dialect
+                        if cleaning_code_for_normal_review:
+                            cleaning_view_copy["cleaning_code"] = cleaning_code_for_normal_review
                         cleaning_view_copy = compress_long_lists(cleaning_view_copy)[0]
                         review_result = cleaning_reviewer.review_cleaning(
                             cleaning_view_copy,
@@ -9298,6 +9323,8 @@ def run_data_engineer(state: AgentState) -> AgentState:
                             review_context["input_dialect"] = input_dialect
                         if context_pack:
                             review_context["context_pack"] = context_pack
+                        if cleaning_code_for_normal_review:
+                            review_context["cleaning_code"] = cleaning_code_for_normal_review
                         review_context = compress_long_lists(review_context)[0]
                         review_result = cleaning_reviewer.review_cleaning(review_context)
                         review_context_payload = review_context

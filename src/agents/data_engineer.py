@@ -148,6 +148,15 @@ class DataEngineerAgent:
         - MUST NOT: compute scores, case assignment, weight fitting, regression/optimization, correlations, rank checks.
         - MUST: parse types, normalize numeric formats, preserve canonical column names.
         - Manifest MUST include: output_dialect, row_counts, conversions.
+
+        *** COLUMN SYNCHRONIZATION RULE (CRITICAL) ***
+        - Your output CSV MUST contain EXACTLY the columns listed in "Required Columns (DE View)" - no more, no less.
+        - If a column exists in raw data but is NOT in required_columns, DISCARD it (do not include in output).
+        - Constant columns (single unique value) have been PRE-EXCLUDED from required_columns by the contract.
+        - Do NOT second-guess the required_columns list; it represents the FINAL schema after cleaning.
+        - If a required column is missing from the input, raise an error (no fabrication).
+        - Optional passthrough columns: include ONLY if present in input AND listed in optional_passthrough.
+
         - Do NOT impute outcome/target columns. Use data/dataset_semantics.json + data/dataset_training_mask.json (Steward-decided); if partial labels exist, preserve missingness. Do not invent targets.
         - Preserve partition/split columns if they exist or are detected in the Dataset Semantics Summary.
         - If you create a partition column (split/fold/bucket), document it in the manifest and do not drop it.
@@ -155,7 +164,6 @@ class DataEngineerAgent:
         - Do NOT drop columns just because they are missing from a truncated list; use selectors + explicit columns from column_sets.json when available.
         - If column_sets.json is present, preserve all columns matched by its selectors plus explicit_columns unless the contract explicitly forbids them.
         - Never assume canonical_columns is the full inventory on wide datasets. Use data/column_inventory.json + data/column_sets.json as source of truth when present.
-        - cleaned_data.csv should retain nearly all feature columns; only drop columns if they are explicitly forbidden, constant, or 100% missing and the contract allows it.
 
         *** PYTHON SYNTAX GOTCHAS (CRITICAL) ***
         - Column names starting with a digit (e.g., '1stYearAmount') are NOT valid Python identifiers.

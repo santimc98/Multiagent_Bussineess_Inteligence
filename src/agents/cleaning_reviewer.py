@@ -345,6 +345,9 @@ def _review_cleaning_impl(
     if not isinstance(dataset_profile, dict):
         dataset_profile = _load_json("data/dataset_profile.json")
 
+    # Extract cleaning code from view for intent verification in rescale checks
+    cleaning_code = view.get("cleaning_code")
+
     deterministic = _evaluate_gates_deterministic(
         gates=gates,
         required_columns=required_columns,
@@ -357,6 +360,7 @@ def _review_cleaning_impl(
         column_roles=column_roles,
         allowed_feature_sets=view.get("allowed_feature_sets") or {},
         dataset_profile=dataset_profile,
+        cleaning_code=cleaning_code,
     )
     warnings.extend(dialect_warnings)
     deterministic_result = _assemble_result(
@@ -882,6 +886,7 @@ def _evaluate_gates_deterministic(
     column_roles: Dict[str, List[str]],
     allowed_feature_sets: Dict[str, Any],
     dataset_profile: Optional[Dict[str, Any]] = None,
+    cleaning_code: Optional[str] = None,
 ) -> Dict[str, Any]:
     hard_failures: List[str] = []
     soft_failures: List[str] = []
@@ -923,9 +928,10 @@ def _evaluate_gates_deterministic(
                 raw_sample,
                 sample_infer if sample_infer is not None else sample_str,
                 dataset_profile=dataset_profile,
+                cleaning_code=cleaning_code,
             )
         elif gate_key == "no_synthetic_data":
-            issues = _check_no_synthetic_data(manifest)
+            issues = _check_no_synthetic_data(manifest, cleaning_code=cleaning_code)
         elif gate_key == "row_count_sanity":
             issues = _check_row_count_sanity(manifest, params)
             evidence["row_counts"] = (manifest.get("row_counts") or {})
@@ -1398,7 +1404,20 @@ def _check_no_semantic_rescale(
     raw_sample: Optional[pd.DataFrame],
     cleaned_sample: Optional[pd.DataFrame],
     dataset_profile: Optional[Dict[str, Any]] = None,
+    cleaning_code: Optional[str] = None,
 ) -> List[str]:
+    """
+    Check for semantic rescaling in cleaned data.
+
+    Uses code context (if provided) to verify INTENT rather than guessing from
+    data samples. This prevents false positives on columns with naturally low
+    values (e.g., pixel data that was already normalized in the source).
+
+    Args:
+        cleaning_code: Optional DE Python code for intent verification. When provided,
+                      rescale operations are detected from actual code (/255, /100, etc.)
+                      rather than inferring from data sample ranges alone.
+    """
     allow_percent_only = bool(params.get("allow_percent_like_only", True))
     regex = params.get("percent_like_name_regex") or _DEFAULT_PERCENT_REGEX
     try:
@@ -1428,7 +1447,11 @@ def _check_no_semantic_rescale(
         if meta.get("normalized") or meta.get("scale_factor") or meta.get("scaled_by"):
             rescaled_cols.append(col)
 
-    rescaled_cols.extend(_scan_code_for_rescale_ops())
+    # IMPROVED: Use provided cleaning_code if available, else fall back to file scan
+    if cleaning_code:
+        rescaled_cols.extend(_scan_code_for_rescale_ops_from_code(cleaning_code))
+    else:
+        rescaled_cols.extend(_scan_code_for_rescale_ops())
     rescaled_cols = [col for col in rescaled_cols if col]
     if not rescaled_cols:
         return _check_semantic_rescale_from_raw(
@@ -1438,6 +1461,7 @@ def _check_no_semantic_rescale(
             percent_like,
             allow_percent_only,
             dataset_profile=dataset_profile,
+            cleaning_code=cleaning_code,
         )
 
     issues: List[str] = []
@@ -1457,13 +1481,19 @@ def _check_semantic_rescale_from_raw(
     percent_like: set[str],
     allow_percent_only: bool,
     dataset_profile: Optional[Dict[str, Any]] = None,
+    cleaning_code: Optional[str] = None,
 ) -> List[str]:
     """
     Check for semantic rescaling by comparing raw vs cleaned samples.
 
-    DYNAMIC BEHAVIOR: Instead of assuming raw_max >= 80 means 0-100/0-255 scale,
-    we check if the DATA PROFILE indicates the column was ALREADY normalized.
-    This prevents false positives when data arrives pre-normalized.
+    DYNAMIC BEHAVIOR: Uses CODE CONTEXT (if available) to verify actual rescaling
+    operations rather than guessing from data ranges. This prevents false positives
+    when data has naturally low values (e.g., pixel data already normalized).
+
+    The check follows this priority:
+    1. If cleaning_code is provided, verify actual /255, /100, etc. operations exist
+    2. If data profile shows column was already normalized, skip flagging
+    3. Only flag if raw_max >= 80, cleaned_max <= 1.5, AND code shows rescaling
 
     Args:
         raw_sample: Sample of raw data
@@ -1472,12 +1502,18 @@ def _check_semantic_rescale_from_raw(
         percent_like: Columns that match percent regex (allowed to rescale)
         allow_percent_only: Whether to enforce percent-only rescaling
         dataset_profile: Optional data profile with numeric_summary for context
+        cleaning_code: Optional DE Python code for intent verification
 
     Returns:
         List of issues found (informative, not hard failures)
     """
     if raw_sample is None or raw_sample.empty or cleaned_sample is None or cleaned_sample.empty:
         return []
+
+    # IMPROVED: Scan code for actual rescale operations to verify intent
+    code_rescaled_cols: set[str] = set()
+    if cleaning_code:
+        code_rescaled_cols = set(_scan_code_for_rescale_ops_from_code(cleaning_code))
 
     # Extract numeric_summary from profile for context
     numeric_summary = {}
@@ -1511,17 +1547,25 @@ def _check_semantic_rescale_from_raw(
         # Determine if data was ALREADY normalized in the original dataset
         already_normalized = original_min >= -1.01 and original_max <= 1.01
 
-        # Only flag rescaling if:
-        # 1. Original data was NOT already normalized (original_max >= 80)
-        # 2. Cleaned data IS normalized (cleaned_max <= 1.5)
-        # 3. There's significant difference (not just rounding)
-        # 4. Column is not allowed to rescale
-        if not already_normalized and original_max >= 80 and cleaned_max <= 1.5 and allow_percent_only:
-            # This looks like actual rescaling from 0-100/0-255 to 0-1
-            issues.append(f"{col} appears scaled from 0-{int(original_max)} to 0-1 but is not percent-like")
-        elif already_normalized and original_max <= 1.01 and cleaned_max <= 1.5:
-            # Data was already normalized - this is fine, no issue
-            pass
+        # CODE-VERIFIED RESCALING: Only flag if we have evidence from code context
+        # This prevents false positives on columns with naturally low values (e.g., pre-normalized data)
+        col_in_code_rescale = col in code_rescaled_cols or "__MINMAX__" in code_rescaled_cols
+
+        # IMPROVED LOGIC: Flag rescaling only if:
+        # 1. Code context confirms rescaling operation on this column, OR
+        # 2. No code context AND data ranges suggest rescaling (fallback heuristic)
+        if code_rescaled_cols:
+            # We have code context - only flag if code shows rescaling for this column
+            if col_in_code_rescale and allow_percent_only and col not in percent_like:
+                issues.append(f"{col} appears rescaled in code but is not percent-like")
+        else:
+            # Fallback: No code context, use data range heuristics with profile check
+            if not already_normalized and original_max >= 80 and cleaned_max <= 1.5 and allow_percent_only:
+                # This looks like actual rescaling from 0-100/0-255 to 0-1
+                issues.append(f"{col} appears scaled from 0-{int(original_max)} to 0-1 but is not percent-like (verify code)")
+            elif already_normalized and original_max <= 1.01 and cleaned_max <= 1.5:
+                # Data was already normalized - this is fine, no issue
+                pass
 
     return issues
 
@@ -1554,7 +1598,66 @@ def _scan_code_for_rescale_ops() -> List[str]:
     return matches
 
 
-def _check_no_synthetic_data(manifest: Dict[str, Any]) -> List[str]:
+def _scan_code_for_rescale_ops_from_code(code: str) -> List[str]:
+    """
+    Scan provided code string for rescaling operations.
+
+    This function extracts column names that are being rescaled by detecting
+    patterns like /255, /100, *0.01, MinMaxScaler, etc.
+
+    Args:
+        code: Python code string to scan
+
+    Returns:
+        List of column names that have rescaling operations applied
+    """
+    if not code or not isinstance(code, str):
+        return []
+    stripped = extract_code_block(code)
+    text = stripped if stripped.strip() else code
+    matches: List[str] = []
+
+    # Patterns for common rescaling operations
+    patterns = [
+        # Division by 255 (pixel normalization)
+        r"df\[['\"](?P<col>[^'\"]+)['\"]\]\s*=\s*df\[['\"](?P=col)['\"]\]\s*/\s*255",
+        r"df\[['\"](?P<col>[^'\"]+)['\"]\]\s*=\s*df\[['\"](?P=col)['\"]\]\.div\(\s*255",
+        # Division by 100 (percentage normalization)
+        r"df\[['\"](?P<col>[^'\"]+)['\"]\]\s*=\s*df\[['\"](?P=col)['\"]\]\s*/\s*100",
+        r"df\[['\"](?P<col>[^'\"]+)['\"]\]\s*=\s*df\[['\"](?P=col)['\"]\]\.div\(\s*100",
+        # Multiplication by 0.01 or 0.00392 (1/255)
+        r"df\[['\"](?P<col>[^'\"]+)['\"]\]\s*=\s*df\[['\"](?P=col)['\"]\]\s*\*\s*0\.01",
+        r"df\[['\"](?P<col>[^'\"]+)['\"]\]\s*=\s*df\[['\"](?P=col)['\"]\]\s*\*\s*0\.00392",
+        r"df\[['\"](?P<col>[^'\"]+)['\"]\]\s*=\s*df\[['\"](?P=col)['\"]\]\.mul\(\s*0\.01",
+        # Division by any large number (generic normalization)
+        r"df\[['\"](?P<col>[^'\"]+)['\"]\]\s*=\s*df\[['\"](?P=col)['\"]\]\s*/\s*[0-9]{3,}",
+    ]
+
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            col = match.group("col")
+            if col:
+                matches.append(col)
+
+    # Check for MinMaxScaler usage
+    if "MinMaxScaler" in text:
+        matches.append("__MINMAX__")
+
+    # Check for StandardScaler usage
+    if "StandardScaler" in text:
+        matches.append("__STANDARDSCALER__")
+
+    return list(set(matches))  # Deduplicate
+
+
+def _check_no_synthetic_data(manifest: Dict[str, Any], cleaning_code: Optional[str] = None) -> List[str]:
+    """
+    Check for synthetic data generation in the cleaning process.
+
+    Args:
+        manifest: Cleaning manifest with warnings
+        cleaning_code: Optional DE Python code for direct inspection (avoids file read)
+    """
     issues: List[str] = []
     warnings = manifest.get("warnings") if isinstance(manifest, dict) else []
     if isinstance(warnings, list):
@@ -1563,15 +1666,20 @@ def _check_no_synthetic_data(manifest: Dict[str, Any]) -> List[str]:
                 issues.append("Manifest reports synthetic data usage")
                 break
 
-    path = os.path.join("artifacts", "data_engineer_last.py")
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                code = handle.read()
-        except Exception:
-            code = ""
-        stripped = extract_code_block(code)
-        text = stripped if stripped.strip() else code
+    # Use provided cleaning_code if available, else fall back to file
+    code_to_check = cleaning_code
+    if not code_to_check:
+        path = os.path.join("artifacts", "data_engineer_last.py")
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    code_to_check = handle.read()
+            except Exception:
+                code_to_check = ""
+
+    if code_to_check:
+        stripped = extract_code_block(code_to_check)
+        text = stripped if stripped.strip() else code_to_check
         if _detect_synthetic_patterns(text):
             issues.append("Cleaning script appears to generate synthetic data")
     return issues

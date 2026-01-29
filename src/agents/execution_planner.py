@@ -1437,9 +1437,15 @@ def build_contract_min(
     column_inventory: List[str] | None,
     relevant_columns: List[str] | None,
     target_candidates: List[Dict[str, Any]] | None = None,
+    data_profile: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """
     Build a compact contract_min that aligns agents on relevant columns and gates.
+
+    Args:
+        data_profile: Optional data profile containing constant_columns to exclude from
+                     clean_dataset.required_columns. Columns marked as constant are
+                     excluded from required_columns since they provide no information.
     """
     contract = full_contract_or_partial if isinstance(full_contract_or_partial, dict) else {}
     strategy_dict = strategy if isinstance(strategy, dict) else {}
@@ -1801,10 +1807,32 @@ def build_contract_min(
             continue
         required_files.append({"path": str(path), "description": ""})
 
+    # SYNC FIX: Filter out constant columns from clean_dataset.required_columns
+    # Constant columns provide no information and should be excluded from the final schema
+    constant_columns_set: set[str] = set()
+    dropped_constant_columns: List[str] = []
+    if isinstance(data_profile, dict):
+        constant_cols_raw = data_profile.get("constant_columns")
+        if isinstance(constant_cols_raw, list):
+            constant_columns_set = {str(c) for c in constant_cols_raw if c}
+            # Normalize to match canonical_columns
+            constant_norms = {_normalize_column_identifier(c): c for c in constant_columns_set}
+            for col in canonical_columns:
+                col_norm = _normalize_column_identifier(col)
+                if col_norm in constant_norms or col in constant_columns_set:
+                    dropped_constant_columns.append(col)
+
+    # Compute clean_dataset_required_columns excluding constant columns
+    clean_dataset_required_columns = [
+        col for col in canonical_columns
+        if col not in dropped_constant_columns
+    ]
+
     artifact_requirements = {
         "clean_dataset": {
-            "required_columns": canonical_columns,
+            "required_columns": clean_dataset_required_columns,
             "output_path": "data/cleaned_data.csv",
+            "excluded_constant_columns": dropped_constant_columns if dropped_constant_columns else [],
         },
         "metrics": {"required": True, "path": "data/metrics.json"},
         "alignment_check": {"required": True, "path": "data/alignment_check.json"},
@@ -1814,18 +1842,21 @@ def build_contract_min(
         "scored_rows_schema": scored_rows_schema,
         "file_schemas": full_artifact_requirements.get("file_schemas", {}) if isinstance(full_artifact_requirements.get("file_schemas"), dict) else {},
         "schema_binding": {
-            "required_columns": canonical_columns,
+            "required_columns": clean_dataset_required_columns,
             "optional_passthrough_columns": [],
         },
     }
 
     data_engineer_runbook = "\n".join(
         [
-            "Produce data/cleaned_data.csv using canonical_columns only.",
+            "Produce data/cleaned_data.csv containing ONLY the columns listed in required_columns.",
+            "Your output CSV must match EXACTLY the required_columns list - no more, no less.",
+            "If a column exists in raw data but is NOT in required_columns, DISCARD it (do not include in output).",
+            "Constant columns (single unique value) have been pre-excluded from required_columns.",
             "Preserve column names; do not invent or rename columns.",
             "Load using output_dialect from cleaning_manifest.json when available.",
             "Parse numeric/date fields conservatively; document conversions.",
-            "If a canonical column is missing, report and stop (no fabrication).",
+            "If a required column is missing from input, report and stop (no fabrication).",
             "Do not derive targets or train models.",
             "Avoid advanced validation metrics (MAE/correlation); report only dtype and null counts.",
             "Write cleaning_manifest.json with input/output dialect details.",
@@ -5649,7 +5680,7 @@ class ExecutionPlannerAgent:
                             break
                 if inferred:
                     contract["outcome_columns"] = inferred
-            contract_min = build_contract_min(contract, strategy, column_inventory, relevant_columns, target_candidates=target_candidates)
+            contract_min = build_contract_min(contract, strategy, column_inventory, relevant_columns, target_candidates=target_candidates, data_profile=data_profile)
             contract = _sync_execution_contract_outputs(contract, contract_min)
             self.last_contract_min = contract_min
             return _finalize_and_persist(contract, contract_min, where="execution_planner:no_client")
@@ -5956,7 +5987,7 @@ domain_expert_critique:
                         break
             if inferred:
                 contract["outcome_columns"] = inferred
-        contract_min = build_contract_min(contract, strategy, column_inventory, relevant_columns, target_candidates=target_candidates)
+        contract_min = build_contract_min(contract, strategy, column_inventory, relevant_columns, target_candidates=target_candidates, data_profile=data_profile)
         contract = _sync_execution_contract_outputs(contract, contract_min)
         self.last_contract_min = contract_min
 
