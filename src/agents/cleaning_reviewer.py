@@ -340,6 +340,11 @@ def _review_cleaning_impl(
         raw_sample=raw_sample,
     )
 
+    # Load dataset_profile for dynamic rescaling checks (avoids hardcoded assumptions)
+    dataset_profile = view.get("dataset_profile")
+    if not isinstance(dataset_profile, dict):
+        dataset_profile = _load_json("data/dataset_profile.json")
+
     deterministic = _evaluate_gates_deterministic(
         gates=gates,
         required_columns=required_columns,
@@ -351,6 +356,7 @@ def _review_cleaning_impl(
         raw_sample=raw_sample,
         column_roles=column_roles,
         allowed_feature_sets=view.get("allowed_feature_sets") or {},
+        dataset_profile=dataset_profile,
     )
     warnings.extend(dialect_warnings)
     deterministic_result = _assemble_result(
@@ -875,6 +881,7 @@ def _evaluate_gates_deterministic(
     raw_sample: Optional[pd.DataFrame],
     column_roles: Dict[str, List[str]],
     allowed_feature_sets: Dict[str, Any],
+    dataset_profile: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     hard_failures: List[str] = []
     soft_failures: List[str] = []
@@ -915,6 +922,7 @@ def _evaluate_gates_deterministic(
                 column_roles,
                 raw_sample,
                 sample_infer if sample_infer is not None else sample_str,
+                dataset_profile=dataset_profile,
             )
         elif gate_key == "no_synthetic_data":
             issues = _check_no_synthetic_data(manifest)
@@ -1389,6 +1397,7 @@ def _check_no_semantic_rescale(
     column_roles: Dict[str, List[str]],
     raw_sample: Optional[pd.DataFrame],
     cleaned_sample: Optional[pd.DataFrame],
+    dataset_profile: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     allow_percent_only = bool(params.get("allow_percent_like_only", True))
     regex = params.get("percent_like_name_regex") or _DEFAULT_PERCENT_REGEX
@@ -1428,6 +1437,7 @@ def _check_no_semantic_rescale(
             cleaned_header,
             percent_like,
             allow_percent_only,
+            dataset_profile=dataset_profile,
         )
 
     issues: List[str] = []
@@ -1446,9 +1456,34 @@ def _check_semantic_rescale_from_raw(
     cleaned_header: List[str],
     percent_like: set[str],
     allow_percent_only: bool,
+    dataset_profile: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
+    """
+    Check for semantic rescaling by comparing raw vs cleaned samples.
+
+    DYNAMIC BEHAVIOR: Instead of assuming raw_max >= 80 means 0-100/0-255 scale,
+    we check if the DATA PROFILE indicates the column was ALREADY normalized.
+    This prevents false positives when data arrives pre-normalized.
+
+    Args:
+        raw_sample: Sample of raw data
+        cleaned_sample: Sample of cleaned data
+        cleaned_header: Column names in cleaned data
+        percent_like: Columns that match percent regex (allowed to rescale)
+        allow_percent_only: Whether to enforce percent-only rescaling
+        dataset_profile: Optional data profile with numeric_summary for context
+
+    Returns:
+        List of issues found (informative, not hard failures)
+    """
     if raw_sample is None or raw_sample.empty or cleaned_sample is None or cleaned_sample.empty:
         return []
+
+    # Extract numeric_summary from profile for context
+    numeric_summary = {}
+    if isinstance(dataset_profile, dict):
+        numeric_summary = dataset_profile.get("numeric_summary", {})
+
     issues: List[str] = []
     for col in cleaned_header:
         if col not in raw_sample.columns or col in percent_like:
@@ -1459,10 +1494,35 @@ def _check_semantic_rescale_from_raw(
         cleaned_vals = pd.to_numeric(cleaned_sample[col], errors="coerce")
         if raw_vals.dropna().empty or cleaned_vals.dropna().empty:
             continue
+
         raw_max = float(raw_vals.max())
         cleaned_max = float(cleaned_vals.max())
-        if raw_max >= 80 and cleaned_max <= 1.5 and allow_percent_only:
-            issues.append(f"{col} appears scaled from 0-100 to 0-1 but is not percent-like")
+        raw_min = float(raw_vals.min())
+
+        # Check profile for original column range (from full dataset, not just sample)
+        profile_stats = numeric_summary.get(col, {})
+        profile_max = profile_stats.get("max")
+        profile_min = profile_stats.get("min")
+
+        # DYNAMIC CHECK: Use profile if available, otherwise use sample
+        original_max = float(profile_max) if profile_max is not None else raw_max
+        original_min = float(profile_min) if profile_min is not None else raw_min
+
+        # Determine if data was ALREADY normalized in the original dataset
+        already_normalized = original_min >= -1.01 and original_max <= 1.01
+
+        # Only flag rescaling if:
+        # 1. Original data was NOT already normalized (original_max >= 80)
+        # 2. Cleaned data IS normalized (cleaned_max <= 1.5)
+        # 3. There's significant difference (not just rounding)
+        # 4. Column is not allowed to rescale
+        if not already_normalized and original_max >= 80 and cleaned_max <= 1.5 and allow_percent_only:
+            # This looks like actual rescaling from 0-100/0-255 to 0-1
+            issues.append(f"{col} appears scaled from 0-{int(original_max)} to 0-1 but is not percent-like")
+        elif already_normalized and original_max <= 1.01 and cleaned_max <= 1.5:
+            # Data was already normalized - this is fine, no issue
+            pass
+
     return issues
 
 

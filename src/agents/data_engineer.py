@@ -162,9 +162,12 @@ class DataEngineerAgent:
         - NEVER use: df.assign(1stYearAmount=...) - This causes SyntaxError!
         - ALWAYS use: df.assign(**{'1stYearAmount': ...}) or df['1stYearAmount'] = ...
         - np.where returns a NumPy array. If you need pandas .str operations, keep a Series (use Series.where/mask or wrap back into a Series before .str).
-        - DO NOT rescale numeric columns (e.g., divide/multiply by 100) to "normalize ranges" in cleaning.
-          Only parse. Rescaling is allowed ONLY if the column is percent-like with evidence:
-          (name contains '%' OR raw samples contain '%'). "score" does NOT imply percent.
+        - DO NOT rescale numeric columns in cleaning. Only parse formats (e.g., remove thousand separators).
+          CRITICAL: Check NUMERIC_RANGES_SUMMARY in DATA AUDIT to understand actual data scales:
+          * If columns show [0, 1] range → data is ALREADY normalized, do NOT assume it needs 0-255 conversion
+          * If columns show [0, 255] range → data may be pixel values, do NOT normalize to 0-1 in cleaning
+          * If columns show [0, 100] range → may be percentages, check for '%' in name/values
+          Rescaling is the ML Engineer's responsibility, not cleaning. Only parse and preserve original scale.
         - For numeric parsing: ALWAYS sanitize symbols first (strip currency/letters; keep digits, sign, separators, parentheses, and %) and handle repeated thousands separators like '23.351.746'.
         
         *** INPUT PARAMETERS ***

@@ -421,3 +421,115 @@ def _build_target_candidates(profile: Dict[str, Any], max_candidates: int = 8) -
 
     candidates.sort(key=lambda x: (x.get("score") or 0), reverse=True)
     return candidates[:max_candidates]
+
+
+def build_numeric_ranges_summary(dataset_profile: Dict[str, Any], max_examples: int = 10) -> str:
+    """
+    Build a compact summary of numeric column ranges for Data Engineer context.
+
+    This helps the DE understand the actual scale of the data without making
+    assumptions (e.g., pixels could be 0-255 OR already normalized 0-1).
+
+    Groups columns by similar range patterns to keep output concise.
+
+    Args:
+        dataset_profile: The dataset_profile.json content (with numeric_summary)
+        max_examples: Max example columns to show per range group
+
+    Returns:
+        A formatted string summary for LLM context
+    """
+    numeric_summary = dataset_profile.get("numeric_summary", {})
+    if not numeric_summary:
+        return ""
+
+    # Categorize columns by their range patterns
+    range_groups: Dict[str, List[Dict[str, Any]]] = {
+        "normalized_0_1": [],      # min >= 0, max <= 1
+        "normalized_neg1_1": [],   # min >= -1, max <= 1
+        "percent_0_100": [],       # min >= 0, max <= 100
+        "pixel_0_255": [],         # min >= 0, max <= 255 (typical image)
+        "unbounded_positive": [],  # min >= 0, no clear upper bound
+        "unbounded_mixed": [],     # negative and positive values
+        "constant": [],            # min == max
+        "other": [],
+    }
+
+    for col, stats in numeric_summary.items():
+        if not isinstance(stats, dict):
+            continue
+
+        min_val = stats.get("min")
+        max_val = stats.get("max")
+
+        if min_val is None or max_val is None:
+            continue
+
+        try:
+            min_val = float(min_val)
+            max_val = float(max_val)
+        except (TypeError, ValueError):
+            continue
+
+        col_info = {
+            "col": col,
+            "min": min_val,
+            "max": max_val,
+            "mean": stats.get("mean"),
+            "std": stats.get("std"),
+        }
+
+        # Categorize based on range
+        if min_val == max_val:
+            range_groups["constant"].append(col_info)
+        elif min_val >= 0 and max_val <= 1.01:
+            range_groups["normalized_0_1"].append(col_info)
+        elif min_val >= -1.01 and max_val <= 1.01:
+            range_groups["normalized_neg1_1"].append(col_info)
+        elif min_val >= 0 and max_val <= 100.5:
+            range_groups["percent_0_100"].append(col_info)
+        elif min_val >= 0 and max_val <= 255.5:
+            range_groups["pixel_0_255"].append(col_info)
+        elif min_val >= 0:
+            range_groups["unbounded_positive"].append(col_info)
+        else:
+            range_groups["unbounded_mixed"].append(col_info)
+
+    # Build summary text
+    lines = ["NUMERIC_RANGES_SUMMARY (from data profile):"]
+
+    # Define friendly descriptions for each group
+    group_descriptions = {
+        "normalized_0_1": "Already normalized [0, 1]",
+        "normalized_neg1_1": "Already normalized [-1, 1]",
+        "percent_0_100": "Percent-like scale [0, 100]",
+        "pixel_0_255": "Pixel/byte scale [0, 255]",
+        "unbounded_positive": "Positive values (unbounded)",
+        "unbounded_mixed": "Mixed sign values",
+        "constant": "Constant columns (min=max)",
+    }
+
+    for group_key, description in group_descriptions.items():
+        cols = range_groups.get(group_key, [])
+        if not cols:
+            continue
+
+        count = len(cols)
+        lines.append(f"\n  {description}: {count} columns")
+
+        # Show example columns with their actual ranges
+        examples = cols[:max_examples]
+        for c in examples:
+            mean_str = f", mean={c['mean']:.3f}" if c.get('mean') is not None else ""
+            lines.append(f"    - {c['col']}: [{c['min']:.2f}, {c['max']:.2f}]{mean_str}")
+
+        if count > max_examples:
+            lines.append(f"    ... and {count - max_examples} more")
+
+    # Add important note for the Data Engineer
+    if range_groups["normalized_0_1"]:
+        lines.append("\n  NOTE: Some columns are ALREADY in [0,1] range - DO NOT rescale these.")
+    if range_groups["pixel_0_255"]:
+        lines.append("\n  NOTE: Some columns appear to be in [0,255] range - check if normalization is needed.")
+
+    return "\n".join(lines)

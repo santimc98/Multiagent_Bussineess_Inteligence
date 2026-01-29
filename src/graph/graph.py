@@ -7696,6 +7696,21 @@ def run_data_engineer(state: AgentState) -> AgentState:
             data_engineer_audit_override,
             dataset_semantics_summary,
         )
+
+    # Add numeric ranges summary for Data Engineer to understand actual data scales
+    try:
+        from src.utils.data_profile_compact import build_numeric_ranges_summary
+        dataset_profile = state.get("dataset_profile") or _load_json_safe("data/dataset_profile.json")
+        if isinstance(dataset_profile, dict) and dataset_profile.get("numeric_summary"):
+            numeric_ranges_summary = build_numeric_ranges_summary(dataset_profile)
+            if numeric_ranges_summary:
+                data_engineer_audit_override = _merge_de_audit_override(
+                    data_engineer_audit_override,
+                    numeric_ranges_summary,
+                )
+    except Exception as nr_err:
+        print(f"Warning: failed to build numeric_ranges_summary: {nr_err}")
+
     required_cols = []
     required_raw_map = {}
     sample_context = ""
