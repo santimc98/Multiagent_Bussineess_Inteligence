@@ -473,18 +473,16 @@ class MLEngineerAgent:
         return self._truncate_prompt_text(code or "", max_len=max_len, head_len=7000, tail_len=4000)
 
     def _check_script_completeness(self, code: str, required_paths: List[str]) -> List[str]:
-        if not code:
-            return ["code_empty"]
-        issues: List[str] = []
-        lower = code.lower()
-        if "read_csv" not in lower:
-            issues.append("data_load_missing")
-        if not any(token in lower for token in ["to_csv", "json.dump", "plt.savefig", "savefig("]):
-            issues.append("artifact_write_missing")
-        missing_outputs = [out for out in (required_paths or []) if out and out not in code]
-        if missing_outputs:
-            issues.append(f"required_outputs_missing: {missing_outputs}")
-        return issues
+        """
+        DEPRECATED: Static syntax checks are no longer enforced.
+
+        Validation Philosophy Change (v5.0):
+        - Instead of checking if code SAYS .read_csv, we let code RUN and check RESULTS.
+        - The Reviewer/QA Agent validates outputs exist and are correct.
+        - This method returns empty list to maintain API compatibility.
+        """
+        # Static checks removed - trust execution-based validation
+        return []
 
     def _extract_training_context(
         self,
@@ -578,28 +576,26 @@ class MLEngineerAgent:
         }
 
     def _code_mentions_label_filter(self, code: str, target: str | None) -> bool:
-        if not code or not target:
-            return False
-        lower = code.lower()
-        target_lower = target.lower()
-        if f"{target_lower}.notna" in lower or f"{target_lower}.isna" in lower:
-            return True
-        if f"dropna(subset=['{target_lower}'" in lower or f'dropna(subset=["{target_lower}"' in lower:
-            return True
-        if f"dropna(subset=[{target_lower}" in lower:
-            return True
-        if "y = y.dropna" in lower or "y=y.dropna" in lower:
-            return True
-        if "np.isnan(y" in lower or "numpy.isnan(y" in lower or "pd.isna(y" in lower:
-            return True
-        if "train_mask" in lower and target_lower in lower:
-            return True
-        return False
+        """
+        DEPRECATED: Static regex-based code analysis is no longer enforced.
+
+        Validation Philosophy Change (v5.0):
+        - We no longer parse code looking for .dropna/.notna patterns.
+        - Execution-based validation: run the code, check if output has nulls.
+        - Always returns True to avoid blocking valid implementations.
+        """
+        return True  # Trust the LLM; validate results, not syntax
 
     def _code_mentions_split_usage(self, code: str, split_column: str | None) -> bool:
-        if not code or not split_column:
-            return False
-        return split_column.lower() in code.lower()
+        """
+        DEPRECATED: Static regex-based code analysis is no longer enforced.
+
+        Validation Philosophy Change (v5.0):
+        - We no longer parse code looking for split column references.
+        - Execution-based validation: run the code, check train/test split in results.
+        - Always returns True to avoid blocking valid implementations.
+        """
+        return True  # Trust the LLM; validate results, not syntax
 
     def _check_training_policy_compliance(
         self,
@@ -608,63 +604,29 @@ class MLEngineerAgent:
         ml_view: Dict[str, Any] | None,
         ml_plan: Dict[str, Any] | None,
     ) -> List[str]:
-        issues: List[str] = []
-        context = self._extract_training_context(execution_contract, ml_view, ml_plan)
-        target = context.get("target_column")
-        training_rows_rule = context.get("training_rows_rule")
-        training_rows_policy = context.get("training_rows_policy")
-        split_column = context.get("split_column")
-        train_filter = context.get("train_filter")
-        plan = ml_plan or {}
+        """
+        DEPRECATED: Static AST/regex-based policy compliance checks are no longer enforced.
 
-        requires_label_filter = False
-        requires_split_filter = False
-        if isinstance(train_filter, dict):
-            tf_type = str(train_filter.get("type") or "").strip().lower()
-            if tf_type == "label_not_null":
-                requires_label_filter = True
-            elif tf_type == "split_equals":
-                requires_split_filter = True
-        if not requires_label_filter and not requires_split_filter:
-            if isinstance(training_rows_policy, str) and training_rows_policy in {"only_rows_with_label"}:
-                requires_label_filter = True
-            if isinstance(training_rows_rule, str):
-                rule_lower = training_rows_rule.lower()
-                if any(token in rule_lower for token in ("not missing", "not null", "notna", "non-null")):
-                    requires_label_filter = True
+        Validation Philosophy Change (v5.0):
+        =====================================
+        OLD: Parse code text looking for .dropna(), split column references, etc.
+             Flag code as invalid if specific patterns weren't found.
+             Problem: Brittle - flags valid implementations that use different syntax.
 
-        if requires_label_filter and not self._code_mentions_label_filter(code, target):
-            split_ok = False
-            if split_column and self._code_mentions_split_usage(code, split_column):
-                evidence = plan.get("evidence_used") if isinstance(plan.get("evidence_used"), dict) else {}
-                split_eval = str(evidence.get("split_evaluation", "")).lower()
-                split_candidates = evidence.get("split_candidates") if isinstance(evidence.get("split_candidates"), list) else []
-                uses_split = "split" in split_eval and "use" in split_eval
-                has_train_test = False
-                for cand in split_candidates:
-                    if not isinstance(cand, dict):
-                        continue
-                    if str(cand.get("column") or "") != str(split_column):
-                        continue
-                    values = cand.get("values")
-                    if isinstance(values, list):
-                        lowered = {str(v).lower() for v in values}
-                        if "train" in lowered and "test" in lowered:
-                            has_train_test = True
-                            break
-                if uses_split or has_train_test:
-                    split_ok = True
-            if not split_ok:
-                issues.append("training_rows_filter_missing")
+        NEW: Execution-based validation.
+             - Let the code RUN in the sandbox.
+             - Reviewer/QA Agent checks if RESULTS are correct:
+               * Does the output have nulls where it shouldn't?
+               * Was train/test split done correctly?
+               * Are metrics reasonable?
+             - Self-correction: ML Engineer receives stderr/traceback and fixes errors.
 
-        if requires_split_filter and not self._code_mentions_split_usage(code, split_column):
-            issues.append("training_rows_filter_missing")
-
-        requires_split = isinstance(training_rows_policy, str) and training_rows_policy == "use_split_column"
-        if requires_split and not self._code_mentions_split_usage(code, split_column):
-            issues.append("split_column_filter_missing")
-
-        return issues
+        This method returns empty list to maintain API compatibility while
+        removing the static linting that blocked valid code.
+        """
+        # Static checks removed - execution-based validation is now the standard
+        # The Reviewer and QA agents validate results, not code syntax
+        return []
 
     def _describe_train_filter(
         self,
@@ -2018,6 +1980,69 @@ $strategy_json
         - Utilities: dateutil, pytz, tqdm, yaml
         - Extended deps (rapidfuzz, pydantic, pandera, networkx) ONLY if listed in execution_contract.required_dependencies.
         - Do not import deep learning frameworks (tensorflow, keras, torch) unless explicitly required by contract.
+
+        COMPUTE CONTEXT (HARDWARE-AWARE OPTIMIZATION)
+        =============================================
+        You have access to TWO execution environments. Choose hyperparameters accordingly:
+
+        1. DEFAULT ENVIRONMENT (E2B Sandbox):
+           - Resources: 2 vCPU, 8GB RAM
+           - Best for: Standard workflows, small-medium datasets (<100k rows)
+           - Recommendations:
+             * n_jobs=2 (match vCPU count)
+             * Prefer sklearn over heavy frameworks
+             * Use chunked processing for >50k rows
+             * Avoid large GridSearchCV (use RandomizedSearchCV or optuna with n_trials<50)
+             * batch_size: 1000-5000 for iterative operations
+
+        2. HEAVY ENVIRONMENT (Cloud Run):
+           - Resources: 4-8 vCPU, 32GB RAM
+           - Best for: Large datasets, deep ensembles, memory-intensive operations
+           - Recommendations:
+             * n_jobs=4 to n_jobs=8 (scale with vCPU)
+             * Can use full GridSearchCV with moderate param grids
+             * LightGBM/XGBoost with larger num_leaves, more trees
+             * batch_size: 10000-50000 for iterative operations
+             * Can load entire dataset into memory for most tabular tasks
+
+        ENVIRONMENT SELECTION HEURISTICS:
+        - Dataset > 500MB or > 500k rows → Heavy environment recommended
+        - Ensemble with > 100 estimators → Heavy environment recommended
+        - Deep hyperparameter search (> 100 combinations) → Heavy environment recommended
+        - Simple baseline or EDA → Default environment is sufficient
+
+        ADAPTIVE CODING PATTERNS:
+        ```python
+        # Pattern: Detect environment and adapt
+        import os
+        N_CPUS = int(os.environ.get('N_CPUS', 2))  # Injected by orchestrator
+        IS_HEAVY = N_CPUS >= 4
+
+        # Adapt hyperparameters
+        n_jobs = N_CPUS
+        n_estimators = 200 if IS_HEAVY else 50
+        cv_folds = 10 if IS_HEAVY else 5
+        ```
+
+        SELF-CORRECTION PROTOCOL (EXECUTION-BASED VALIDATION)
+        =====================================================
+        You will receive execution feedback (stdout/stderr/traceback) after each run.
+        When you see runtime errors:
+
+        1. READ THE TRACEBACK CAREFULLY - identify the exact line and error type
+        2. COMMON FIXES:
+           - MemoryError → Reduce batch_size, use chunked processing, or request Heavy env
+           - ValueError (NaN) → Add SimpleImputer before model.fit()
+           - KeyError → Check column names against canonical_columns
+           - FileNotFoundError → Use exact paths from context ($data_path)
+        3. REGENERATE THE FULL SCRIPT with the fix applied
+        4. DO NOT add defensive try/except that swallows errors - let them surface
+
+        You are judged on RESULTS, not syntax. The Reviewer validates:
+        - Output files exist and contain valid data
+        - Metrics are reasonable for the task
+        - No data leakage in train/test split
+        - Predictions align with business requirements
 
         CAUSAL REASONING FOR OPTIMIZATION
         - Consultation: check column_roles in contract. Variables marked 'decision' or 'post-decision' CANNOT be features.
