@@ -19,6 +19,54 @@ from src.utils.csv_dialect import (
 )
 
 
+def _detect_primary_language(text: str) -> str:
+    """
+    Detect primary language using stopword heuristics.
+    Returns 'es' for Spanish, 'en' for English (default).
+
+    Uses common stopwords and articles that differ between languages:
+    - Spanish: el, la, los, las, un, una, de, que, y, en, para, con, por
+    - English: the, a, an, of, to, and, in, for, with, is, are, that
+    """
+    if not text:
+        return "en"
+
+    text_lower = text.lower()
+    words = set(re.findall(r'\b\w+\b', text_lower))
+
+    # Spanish stopwords (high-frequency, distinctive)
+    spanish_markers = {
+        'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas',
+        'de', 'del', 'que', 'qué', 'en', 'para', 'con', 'por',
+        'como', 'cómo', 'pero', 'más', 'este', 'esta', 'esto',
+        'ese', 'esa', 'eso', 'aquel', 'aquella', 'hay', 'ser',
+        'está', 'están', 'son', 'tiene', 'tienen', 'puede',
+        'sobre', 'entre', 'cuando', 'donde', 'sin', 'según',
+        'precio', 'cliente', 'datos', 'modelo', 'resultado',
+        'optimización', 'análisis', 'negocio', 'valor',
+    }
+
+    # English stopwords (high-frequency, distinctive)
+    english_markers = {
+        'the', 'a', 'an', 'of', 'to', 'and', 'in', 'for', 'with',
+        'is', 'are', 'was', 'were', 'be', 'been', 'being',
+        'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+        'could', 'should', 'may', 'might', 'must', 'shall',
+        'this', 'that', 'these', 'those', 'it', 'its',
+        'from', 'by', 'on', 'at', 'or', 'but', 'not', 'as',
+        'price', 'customer', 'data', 'model', 'result',
+        'optimization', 'analysis', 'business', 'value',
+    }
+
+    spanish_count = len(words & spanish_markers)
+    english_count = len(words & english_markers)
+
+    # Require significant difference to switch from default (English)
+    if spanish_count > english_count + 2:
+        return "es"
+    return "en"
+
+
 def _safe_load_json(path: str):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -120,15 +168,31 @@ def _truncate_cell(text: str, max_len: int) -> str:
     return cleaned[: max(0, max_len - len(suffix))] + suffix
 
 def render_table_text(headers: List[str], rows: List[List[str]], max_rows: int = 8, max_cell_len: int = 28) -> str:
+    """
+    Render a professional ASCII table suitable for PDF monospaced fonts.
+
+    Uses a clean grid format inspired by tabulate's "simple" style:
+    +------------+------------+------------+
+    | Header 1   | Header 2   | Header 3   |
+    +============+============+============+
+    | Value 1    | Value 2    | Value 3    |
+    +------------+------------+------------+
+
+    This looks professional in executive reports while avoiding markdown tables
+    that break PDF generators.
+    """
     if not headers or not rows:
-        return "No data available."
+        return "(No data available)"
+
     safe_rows = []
     for row in rows[:max_rows]:
         if not isinstance(row, list):
             continue
         safe_rows.append([_truncate_cell(cell, max_cell_len) for cell in row])
     if not safe_rows:
-        return "No data available."
+        return "(No data available)"
+
+    # Calculate column widths
     widths = []
     for idx, header in enumerate(headers):
         header_text = _truncate_cell(header, max_cell_len)
@@ -136,19 +200,41 @@ def render_table_text(headers: List[str], rows: List[List[str]], max_rows: int =
         for row in safe_rows:
             if idx < len(row):
                 col_width = max(col_width, len(row[idx]))
-        widths.append(min(col_width, max_cell_len))
-    header_line = "  ".join(
-        _truncate_cell(header, max_cell_len).ljust(widths[idx]) for idx, header in enumerate(headers)
-    )
-    sep_line = "  ".join("-" * widths[idx] for idx in range(len(widths)))
-    data_lines = []
-    for row in safe_rows:
-        padded = []
+        widths.append(min(col_width + 2, max_cell_len))  # Add padding
+
+    # Build grid lines
+    def _build_separator(char: str = "-", corner: str = "+") -> str:
+        parts = [corner]
+        for width in widths:
+            parts.append(char * (width + 2))
+            parts.append(corner)
+        return "".join(parts)
+
+    def _build_row(cells: List[str]) -> str:
+        parts = ["|"]
         for idx, width in enumerate(widths):
-            cell = row[idx] if idx < len(row) else ""
-            padded.append(_truncate_cell(cell, max_cell_len).ljust(width))
-        data_lines.append("  ".join(padded))
-    return "\n".join([header_line, sep_line] + data_lines)
+            cell = cells[idx] if idx < len(cells) else ""
+            cell_text = _truncate_cell(cell, max_cell_len)
+            parts.append(f" {cell_text.ljust(width)} ")
+            parts.append("|")
+        return "".join(parts)
+
+    # Assemble table
+    lines = []
+    lines.append(_build_separator("-", "+"))
+    lines.append(_build_row([_truncate_cell(h, max_cell_len) for h in headers]))
+    lines.append(_build_separator("=", "+"))  # Double line under header
+
+    for row in safe_rows:
+        lines.append(_build_row(row))
+
+    lines.append(_build_separator("-", "+"))
+
+    # Add row count footer if truncated
+    if len(rows) > max_rows:
+        lines.append(f"  ... ({len(rows) - max_rows} more rows)")
+
+    return "\n".join(lines)
 
 def _flatten_metrics(metrics: Dict[str, Any], prefix: str = "") -> List[tuple[str, Any]]:
     items: List[tuple[str, Any]] = []
@@ -985,13 +1071,33 @@ class BusinessTranslatorAgent:
         $senior_evidence_rule
         
         *** FORMATTING CONSTRAINTS (CRITICAL) ***
-        1. **LANGUAGE:** DETECT the language of the 'Business Objective' in the state. GENERATE THE REPORT IN THAT SAME LANGUAGE. (If objective is Spanish, output Spanish).
-        2. **NO MARKDOWN TABLES:** The PDF generator breaks on tables. DO NOT use table syntax. Use bulleted lists, key-value pairs, or the provided fixed-width text tables (no pipes).
-           - Bad: | Metric | Value |
-           - Good: 
-             * Metric: Value
+        1. **LANGUAGE:** The target language is: $target_language_name ($target_language_code).
+           GENERATE THE ENTIRE REPORT IN THIS LANGUAGE. Do not mix languages.
+        2. **NO MARKDOWN TABLES:** The PDF generator breaks on markdown table syntax.
+           DO NOT use pipe-based tables (| col | col |).
+           INSTEAD, use the professional ASCII grid tables provided in the context (they use + and - characters).
+           These render beautifully in monospaced PDF fonts.
         3. **NO ELLIPSIS:** Never output the literal sequence "..." anywhere in the report.
         4. **NO TRUNCATED SENTENCES:** Do not leave sentences hanging; rewrite as complete, concise sentences.
+
+        *** SENIOR CONSULTANT NARRATIVE STYLE (CRITICAL) ***
+        You are writing like a TOP-TIER MANAGEMENT CONSULTANT, not filling out a form.
+
+        FLUID NARRATIVE PRINCIPLES:
+        1. **NO "SLOT-FILLING":** The reporting_policy is a STRATEGIC GUIDE, not a template to fill.
+           Adapt the narrative structure to what the evidence supports.
+        2. **NEVER WRITE "Not available", "No disponible", "N/A", or similar placeholders.**
+           If evidence for a section is missing:
+           - OPTION A: Merge the content into another section where it fits naturally.
+           - OPTION B: Briefly explain WHY it's missing and what it would take to obtain it.
+           - OPTION C: Omit the section entirely if it adds no value.
+        3. **COHERENT FLOW:** Each section should flow logically into the next.
+           Use transition sentences. The reader should feel like reading a narrative, not a checklist.
+        4. **EXECUTIVE BREVITY:** Say more with less. Every sentence should earn its place.
+           Cut filler phrases like "It is worth noting that..." or "As mentioned previously..."
+        5. **CONFIDENT TONE:** Write decisively. Avoid hedging unless the data truly warrants it.
+           Bad: "It appears that there might be some indication..."
+           Good: "The data shows a clear pattern of..."
         
         CONTEXT:
         - Business Objective: $business_objective
@@ -1047,11 +1153,14 @@ class BusinessTranslatorAgent:
         - Data Adequacy must be reported verbatim: status, up to 3 reason tags, and up to 3 recommendations from data_adequacy_report_json. Do not rephrase status (e.g., keep "sufficient_signal" as-is).
         - If data_adequacy_report_json reasons include classification_baseline_missing or regression_baseline_missing, call it out as a limitation and advise adding Dummy baselines.
         - Plot paths must use forward slashes. If VISUALS CONTEXT plot_reference_mode is "figure_only", reference plots as "Figure: <filename>" instead of inline markdown images.
-        - Slot-driven reporting:
+        - Slot-driven reporting (STRATEGIC GUIDE, not rigid template):
           For each slot in reporting_policy.slots:
-            * if mode == "required": include it using evidence (payload or artifact); if missing => write "No disponible" and cite missing sources.
-            * if mode == "conditional" or "optional": include only if payload exists; otherwise omit without inventing.
-          Structure the report using reporting_policy.sections order; do not add top-level sections outside that list, EXCEPT the final mandatory section titled "Evidencia usada".
+            * if mode == "required": include it using evidence; if evidence is missing, ADAPT:
+              - Merge the content into a related section, OR
+              - Briefly explain what data would be needed, OR
+              - Omit if it adds no value to the narrative.
+            * if mode == "conditional" or "optional": include only if payload exists; otherwise omit.
+          Structure the report using reporting_policy.sections as a GUIDE; adapt the structure to tell a coherent story.
         - Decision Policy / Actions:
           If DECISIONING REQUIREMENTS (json) indicates enabled=true, add a dedicated section titled "Decision Policy / Actions" after "Evidence & Metrics".
           Describe each required decision column (name, type, role, derivation logic) using the JSON context and mention how the column supports prioritized actions or flags.
@@ -1078,7 +1187,7 @@ class BusinessTranslatorAgent:
            - If plot_reference_mode is "figure_only", reference as "Figure: <filename>" instead of inline images.
            - Otherwise embed each plot using forward slashes:
              ![<filename>](<exact_path_from_plots_list>)
-           - Under each plot add 1 bullet: what it suggests (or "No disponible" if unknown).
+           - Under each plot add 1 bullet: what it suggests based on context and visual inspection.
            - Do NOT claim "no visualizations" when plots_list is non-empty.
         6. Close with 2-4 "Next actions" that would unblock the pipeline (data / pipeline / validation).
 
@@ -1117,7 +1226,7 @@ class BusinessTranslatorAgent:
         - Evidence & Metrics:
           * Cite at least 3 concrete numbers (metrics, counts, segment sizes, ranges) from facts_context, metrics.json summary, scored_rows snapshot, or alignment_check.
           * For each number: include the source artifact name/path.
-          * If a required number is unavailable: write "No disponible" + which artifact is missing.
+          * If a metric is unavailable: DO NOT write "No disponible". Instead, explain what would be needed to obtain it, or omit if not critical.
           * Include required/available slots from reporting_policy.slots (respect mode).
         - Business Impact:
           * Translate the evidence into business implications (pricing decision logic, expected value, risk/return).
@@ -1137,7 +1246,8 @@ class BusinessTranslatorAgent:
             - Use forward slashes in paths. If plot_reference_mode is "figure_only", reference as "Figure: <filename>" instead of inline images.
             - Otherwise embed the plot using the exact path string:
               ![<filename>](<exact_path_from_plots_list>)
-            - Add 1-3 bullets with concrete takeaways, grounded in plot_insights_json/facts/metrics. If not available, write "No disponible".
+            - Add 1-3 bullets with concrete takeaways, grounded in plot_insights_json/facts/metrics.
+            - If no quantitative insights exist for a plot, describe what the visualization suggests qualitatively.
           * Do NOT describe only the chart type; state what it implies for the business decision.
           * Do NOT claim "no visualizations" when plots_list is non-empty.
 
@@ -1165,7 +1275,13 @@ class BusinessTranslatorAgent:
         
         error_condition_str = f"CRITICAL ERROR ENCOUNTERED: {error_message}" if error_message else "No critical errors."
 
+        # Detect language from business objective using stopword heuristics
+        target_language_code = _detect_primary_language(business_objective)
+        target_language_name = "Spanish" if target_language_code == "es" else "English"
+
         system_prompt = SYSTEM_PROMPT_TEMPLATE.substitute(
+            target_language_code=target_language_code,
+            target_language_name=target_language_name,
             business_objective=business_objective,
             strategy_title=strategy_title,
             hypothesis=hypothesis,
@@ -1223,9 +1339,11 @@ class BusinessTranslatorAgent:
         *** INSTRUCTIONS ***
         Use ONLY the structured context provided in the system prompt above.
         Do NOT invent numbers or claims not supported by the artifacts.
-        Follow reporting_policy.slots. If a required slot is missing, write "No disponible" and cite missing sources.
-        Cite source artifact names for all metrics (e.g., "Fuente: metrics.json").
+        Use reporting_policy.slots as a GUIDE, not a rigid template. Adapt the narrative structure to the evidence.
+        NEVER write placeholder text like "Not available" or "No disponible" - adapt or omit instead.
+        Cite source artifact names for all metrics (e.g., "Source: metrics.json" or "Fuente: metrics.json").
         Include the "Evidencia usada" section with the required mini-section labeled "evidence" and {claim, source} items.
+        Write like a senior management consultant: confident, concise, and coherent.
         """
 
         user_message = render_prompt(
