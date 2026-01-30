@@ -1415,13 +1415,18 @@ def select_relevant_columns(
     for col in audit_only_cols + text_matches + heuristic_cols:
         _add_unique(ordered, col)
 
-    max_columns = 30
-    if len(ordered) > max_columns and len(required_cols) < max_columns:
-        ordered = ordered[:max_columns]
-        ordered = list(dict.fromkeys(ordered))
+    # REMOVED: max_columns = 30 limit
+    # High-dimensional datasets (e.g., MNIST with 784 pixels) must pass through.
+    # The Steward's column_sets.json handles grouping for wide datasets.
+    # Downstream agents (ML Engineer) use column_sets.expand_column_sets() at runtime.
+    ordered = list(dict.fromkeys(ordered))
 
+    # For high-dimensional datasets, note that column_sets.json provides grouped access
+    is_high_dimensional = len(inventory) > 100
     omitted_policy = (
-        "Ignored by default unless promoted by strategy/explicit mention; available via column_inventory."
+        "High-dimensional dataset: use column_sets.json for grouped feature access."
+        if is_high_dimensional
+        else "Ignored by default unless promoted by strategy/explicit mention; available via column_inventory."
     )
 
     return {
@@ -1587,16 +1592,57 @@ def build_contract_min(
         decision_cols = _filter_to_canonical([col for col in decision_candidates if col])
         audit_only_cols = _filter_to_canonical([col for col in audit_candidates if col])
 
-    token_patterns = {
-        "id_like": re.compile(r"\b(id|uuid|key)\b"),
-        "time_like": re.compile(r"\b(date|time|timestamp)\b"),
-    }
-    for col in canonical_columns:
-        tokenized = _tokenize_name(col)
-        if token_patterns["id_like"].search(tokenized):
-            identifiers.append(col)
-        if token_patterns["time_like"].search(tokenized):
-            time_columns.append(col)
+    # STEWARD-FIRST ROLE INFERENCE
+    # Trust the Steward's dataset_semantics.json over regex heuristics.
+    # Only fall back to regex if Steward didn't provide the information.
+    steward_semantics = {}
+    if isinstance(data_profile, dict):
+        steward_semantics = data_profile.get("dataset_semantics", {})
+        if not isinstance(steward_semantics, dict):
+            steward_semantics = {}
+
+    # Extract Steward-identified roles
+    steward_identifiers = _coerce_list(steward_semantics.get("identifier_columns"))
+    steward_time_cols = _coerce_list(steward_semantics.get("time_columns"))
+    steward_categorical = _coerce_list(steward_semantics.get("categorical_columns"))
+
+    # Also check data_profile top-level for backward compatibility
+    if not steward_identifiers:
+        steward_identifiers = _coerce_list(data_profile.get("identifier_columns")) if data_profile else []
+    if not steward_time_cols:
+        steward_time_cols = _coerce_list(data_profile.get("time_columns")) if data_profile else []
+
+    # Use Steward's analysis if available
+    if steward_identifiers:
+        for col in steward_identifiers:
+            if col in canonical_columns and col not in identifiers:
+                identifiers.append(col)
+        print(f"STEWARD_IDENTIFIERS: Using Steward-provided identifiers: {identifiers}")
+
+    if steward_time_cols:
+        for col in steward_time_cols:
+            if col in canonical_columns and col not in time_columns:
+                time_columns.append(col)
+        print(f"STEWARD_TIME_COLUMNS: Using Steward-provided time columns: {time_columns}")
+
+    # FALLBACK: Only use regex heuristics if Steward didn't provide role information
+    if not steward_identifiers or not steward_time_cols:
+        token_patterns = {
+            "id_like": re.compile(r"\b(id|uuid|key)\b"),
+            "time_like": re.compile(r"\b(date|time|timestamp)\b"),
+        }
+        for col in canonical_columns:
+            tokenized = _tokenize_name(col)
+            if not steward_identifiers and token_patterns["id_like"].search(tokenized):
+                if col not in identifiers:
+                    identifiers.append(col)
+            if not steward_time_cols and token_patterns["time_like"].search(tokenized):
+                if col not in time_columns:
+                    time_columns.append(col)
+        if not steward_identifiers and identifiers:
+            print(f"REGEX_FALLBACK_IDENTIFIERS: {identifiers}")
+        if not steward_time_cols and time_columns:
+            print(f"REGEX_FALLBACK_TIME_COLUMNS: {time_columns}")
 
     outcome_cols = list(dict.fromkeys(outcome_cols))
     decision_cols = list(dict.fromkeys(decision_cols))
@@ -4239,6 +4285,14 @@ class ExecutionPlannerAgent:
             strategy_obj: Dict[str, Any],
             spec_obj: Dict[str, Any],
         ) -> List[Dict[str, Any]]:
+            """
+            Context-aware deliverable derivation based on objective_type.
+
+            DYNAMIC DELIVERABLES POLICY:
+            - descriptive: metrics.json and scored_rows.csv are OPTIONAL (no model training)
+            - predictive/causal: metrics.json REQUIRED, scored_rows.csv REQUIRED
+            - prescriptive: metrics.json REQUIRED, scored_rows.csv REQUIRED, plus optimization artifacts
+            """
             deliverables: List[Dict[str, Any]] = []
 
             def _add(path: str, required: bool = True, kind: str | None = None, description: str | None = None) -> None:
@@ -4246,8 +4300,18 @@ class ExecutionPlannerAgent:
                 if item:
                     deliverables.append(item)
 
-            _add("data/cleaned_data.csv", True, "dataset", "Cleaned dataset used for downstream modeling.")
-            _add("data/metrics.json", True, "metrics", "Model metrics and validation summary.")
+            # Determine if this objective involves model training
+            involves_model_training = objective_type in ("predictive", "prescriptive", "causal")
+
+            # Core deliverable: cleaned_data.csv is always required
+            _add("data/cleaned_data.csv", True, "dataset", "Cleaned dataset used for downstream analysis.")
+
+            # CONTEXT-AWARE: metrics.json only required if model training is involved
+            if involves_model_training:
+                _add("data/metrics.json", True, "metrics", "Model metrics and validation summary.")
+            else:
+                _add("data/metrics.json", False, "metrics", "Optional metrics for descriptive analysis.")
+
             _add("static/plots/*.png", False, "plot", "Optional diagnostic plots.")
             _add("data/predictions.csv", False, "predictions", "Optional predictions output.")
             _add("data/feature_importances.json", False, "feature_importances", "Optional feature importance output.")
@@ -4264,11 +4328,21 @@ class ExecutionPlannerAgent:
             analysis_type = str(strategy_obj.get("analysis_type") or "").lower()
             techniques_text = " ".join([str(t) for t in (strategy_obj.get("techniques") or [])]).lower()
             signal_text = " ".join([analysis_type, techniques_text, target_type, str(scoring_formula or "").lower()])
+
+            # CONTEXT-AWARE: scored_rows.csv only required for scoring/optimization objectives
             if any(tok in signal_text for tok in ["ranking", "scoring", "weight", "weights", "optimization", "optimiz", "priorit"]):
                 _add("data/weights.json", False, "weights", "Optional weights artifact for legacy consumers.")
                 _add("data/case_summary.csv", False, "dataset", "Optional legacy case summary output.")
-                _add("data/scored_rows.csv", False, "predictions", "Optional legacy scored rows output.")
+                # scored_rows required for prescriptive, optional for descriptive
+                _add("data/scored_rows.csv", involves_model_training, "predictions", "Scored rows output.")
                 _add("data/case_alignment_report.json", False, "report", "Optional legacy alignment report.")
+            elif involves_model_training:
+                # Predictive/causal without explicit scoring: scored_rows still required
+                _add("data/scored_rows.csv", True, "predictions", "Model predictions output.")
+            else:
+                # Descriptive: scored_rows is optional
+                _add("data/scored_rows.csv", False, "predictions", "Optional scored rows for descriptive analysis.")
+
             return deliverables
 
         def _apply_deliverables(contract: Dict[str, Any]) -> Dict[str, Any]:
@@ -4289,12 +4363,24 @@ class ExecutionPlannerAgent:
             
             # Build required_outputs from deliverables
             req_outputs = [item["path"] for item in deliverables if item.get("required")]
-            
-            # Ensure core ML outputs are always included (V4.1 completeness)
-            core_outputs = ["data/scored_rows.csv", "data/metrics.json", "data/alignment_check.json"]
-            for core in core_outputs:
-                if core not in req_outputs:
-                    req_outputs.append(core)
+
+            # CONTEXT-AWARE: Only force core ML outputs for objectives that involve model training
+            # For descriptive objectives, scored_rows.csv and metrics.json are optional
+            objective_type = _infer_objective_type()
+            involves_model_training = objective_type in ("predictive", "prescriptive", "causal")
+
+            # alignment_check.json is always required (documents what was done)
+            if "data/alignment_check.json" not in req_outputs:
+                req_outputs.append("data/alignment_check.json")
+
+            # scored_rows.csv and metrics.json only forced for model-training objectives
+            if involves_model_training:
+                if "data/scored_rows.csv" not in req_outputs:
+                    req_outputs.append("data/scored_rows.csv")
+                if "data/metrics.json" not in req_outputs:
+                    req_outputs.append("data/metrics.json")
+            else:
+                print(f"DYNAMIC_DELIVERABLES: objective_type={objective_type}, scored_rows.csv and metrics.json are OPTIONAL")
             
             # Normalize paths: ensure data/ prefix
             def _normalize_path(p: str) -> str:
